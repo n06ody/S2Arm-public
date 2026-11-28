@@ -1,0 +1,17 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : enable
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// std430 紧凑 UBO：float[8] 的 ArrayStride = 4（非 std140 的 16），vec2[2] 的 ArrayStride = 8，总长 48B（12 个 float）。
+// 仅需 VK_KHR_uniform_buffer_standard_layout（无需 scalarBlockLayout，所有成员均满足 std430 自然对齐）。
+layout(set = 0, binding = 0, std430) uniform Ubo {
+    float a[8];
+    vec2 b[2];
+} u;
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float vals[];
+} dst;
+void main() {
+    for (int i = 0; i < 8; i++) dst.vals[i] = u.a[i];
+    dst.vals[8]  = u.b[0].x; dst.vals[9]  = u.b[0].y;
+    dst.vals[10] = u.b[1].x; dst.vals[11] = u.b[1].y;
+}

@@ -39,7 +39,7 @@
 extern "C" {
 #endif
 
-#define NVN_GPU_CONTRACT_VERSION 26   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
+#define NVN_GPU_CONTRACT_VERSION 30   // 改任何签名或语义 +1；两个后端与核心同批改，t_nvn_backend.c 的签名表同批改
 /* 定稿 #1（调用形式）：链接期直接调用 nvn_gpu_*。每个平台构建只链一个后端，Metal 3 / 4 的选择留在 Metal 后端内部。
    理由：零间接、可内联；同进程 A/B 对照没有真实消费者，不为它新增注册实体（vickwv 同意）。 */
 
@@ -114,7 +114,12 @@ enum {
                                                //   其余视图剥掉存储用途）。Vulkan（1.1+）置位；Metal 不置位，核心照旧按「不可写」跳过
     NVN_GPU_CAP_DRAW_TEX          = 1u << 24,  // v20：通道内画贴图矩形（NVN DrawTexture，nvn_gpu_draw_tex，#1452）。Vulkan 置位；
                                                //   Metal 后端不置位（iOS 由 nvn_mtl.m draw_tex 自己画），核心照旧记「未接 op OP_DRAW_TEX」跳过
+    NVN_GPU_CAP_TEX_SPARSE        = 1u << 27,  // v27：页驻留稀疏纹理；第 26 位留给网格计算模拟
     NVN_GPU_CAP_BC1_SNAPSHOT      = 1u << 25,  // v22：后端接收整图 CPU 快照，决定 BC1 存储或记录透明度诊断
+    NVN_GPU_CAP_MESH_EMU          = 1u << 26,  // v27：任务 / 网格计算模拟辅助核（nvn_gpu_mesh_emu_op，对齐 iOS mesh_emu）。Vulkan 1.1 置位；Metal 后端不置位
+    NVN_GPU_CAP_PROVOKING_LAST    = 1u << 28,  // 图形管线可在同一渲染遍内切换平直插值主顶点
+    NVN_GPU_CAP_LIST_RESTART      = 1u << 29,  // 点 / 线 / 三角列表的原生索引重启已启用
+    NVN_GPU_CAP_BC7_PACK          = 1u << 30,  // v30：接受 BC7 快照预转与诊断。
 };
 // 绑定资源类别（布局项 cls；描述符上限按它分）
 enum { NVN_GPU_RES_UBO = 0, NVN_GPU_RES_SSBO, NVN_GPU_RES_TEX, NVN_GPU_RES_SAMP, NVN_GPU_RES_TEX_SAMP, NVN_GPU_RES_IMAGE,
@@ -142,8 +147,9 @@ typedef struct {
     uint32_t storage_stages;       // 允许存储缓冲 / 存储图像写的 NVN 阶段位（1 << nvn_gpu_stage）(vertexPipelineStoresAndAtomics / fragmentStoresAndAtomics)
     uint32_t atomic_stages;        // 允许图像原子的 NVN 阶段位；具体格式再看 NVN_GPU_FMT_ATOMIC
     uint32_t display_max_hz;       // 有窗口时屏幕最高刷新率，没窗口 0（来自平台层的窗口；nvn_be_display_hz 的来源）
+    uint32_t max_patch_size;       // v27：曲面细分每片控制点数上限 (maxTessellationPatchSize；未启用 NVN_GPU_CAP_TESSELLATION 时为 0)
 } nvn_gpu_caps;
-// 每个 NVN 格式在本设备上的用法位（来源：格式属性 optimalTilingFeatures / Metal 格式能力表）
+// 每个 NVN 格式在本设备上的用法位（Vulkan 图像查 optimalTilingFeatures，顶点查 bufferFeatures）。
 enum {
     NVN_GPU_FMT_SAMPLE = 1u << 0, NVN_GPU_FMT_FILTER = 1u << 1, NVN_GPU_FMT_RENDER = 1u << 2, NVN_GPU_FMT_BLEND = 1u << 3,
     NVN_GPU_FMT_STORAGE = 1u << 4, NVN_GPU_FMT_DEPTH = 1u << 5, NVN_GPU_FMT_ATOMIC = 1u << 6, NVN_GPU_FMT_VERTEX = 1u << 7,
@@ -151,6 +157,7 @@ enum {
     NVN_GPU_FMT_SUBST = 1u << 9,      // 有对应但不是同一种存储（BGRA 换 RGBA、D24 换 D32）：读写语义同，逐字节拷贝要核心换算
     NVN_GPU_FMT_READBACK = 1u << 10,  // nvn_gpu_copy_tex_buf 拷出来的就是 NVN 的逐字节内容（ReadTexels 读 GPU 内容的前提）。不含：SUBST 的、深度模板合一的
                                       //   （只拷得出深度面）、D24（深度面高 8 位未定义）。后端 copy_tex_buf 拒收的格式一定没有这一位（两处用同一个判断）
+    NVN_GPU_FMT_VERTEX_CPU = 1u << 11, // 仅有 CPU 字节转 float4 的路径，回放确认源可读且 GPU 无挂起写后再绑定 RGBA32F。
 };
 typedef struct {
     void *host_device;       // 平台层已建好的设备（定稿 A2：后端不另建设备）。Apple：平台给的 MTLDevice 指针；安卓：Prepare 按 profile 建好的设备上下文（含 enabled 记录）
@@ -173,7 +180,8 @@ void nvn_gpu_caps_get(nvn_gpu_caps *out);   // 打开后不变（display_max_hz 
 uint32_t nvn_gpu_format_caps(uint32_t nvn_format);   // NVN_GPU_FMT_*。线程：[任意]。不认识的格式返回 0，不猜
 
 // ---------- 缓冲与内存池（定稿 #2：脏页 / 内容身份在核心，后端只给同步原语） ----------
-enum { NVN_GPU_MEM_SHARED = 0, NVN_GPU_MEM_DEVICE = 1 };   // SHARED：CPU 可写、一致；DEVICE：只给 GPU
+enum { NVN_GPU_MEM_SHARED = 0, NVN_GPU_MEM_DEVICE = 1, NVN_GPU_MEM_POOL_MIRROR = 2 };
+// SHARED 是一致的 CPU 可写缓冲。POOL_MIRROR 允许后端选择非一致映射，由下方可见性接口管理。
 typedef struct { nvn_gpu_buf buf; uint64_t off; uint8_t *cpu; uint64_t va; } nvn_gpu_slice;   // cpu：DEVICE 内存为 NULL；va：无 CAP_GPU_VA 为 0
 // 最后一次使用结束时的通知（只调一次，在 [回调]）：核心在这之后才允许宿主解除 / 复用这段 backing。
 typedef void (*nvn_gpu_retired_fn)(void *user);
@@ -187,6 +195,19 @@ nvn_gpu_rc nvn_gpu_buf_wrap(void *host, uint64_t bytes, nvn_gpu_buf *out, nvn_gp
 nvn_gpu_rc nvn_gpu_buf_create(uint64_t bytes, int mem, const void *init, nvn_gpu_buf *out, nvn_gpu_err *err);
 uint64_t nvn_gpu_buf_va(nvn_gpu_buf b);    // GPU 地址（无 CAP_GPU_VA 为 0）。线程：[任意]
 uint8_t *nvn_gpu_buf_cpu(nvn_gpu_buf b);   // CPU 地址（DEVICE 为 NULL）。线程：[任意]
+typedef struct { nvn_gpu_buf src; uint64_t offset, bytes, readback_offset; } nvn_gpu_readback_span;
+enum { NVN_GPU_MIRROR_COHERENT, NVN_GPU_MIRROR_CPU_IDLE, NVN_GPU_MIRROR_GPU_BUSY };
+// 可选镜像接口。IDLE 状态下提交线程才可直写非一致映射，写后立即 flush。
+// GPU 写后的镜像映射由完成回调读取。flush 或可见性记录失败使本段失败，不发布成功。
+int nvn_gpu_mirror_state(nvn_gpu_buf b);
+int nvn_gpu_mirror_flush(nvn_gpu_buf b, uint64_t off, uint64_t bytes);
+int nvn_gpu_mirror_memory_cached(nvn_gpu_buf b);
+int nvn_gpu_mirror_visibility_enabled(void);
+// 使用回写跨度的 src/offset/bytes，忽略暂存 offset。count 非零、spans 为空表示快照失败。
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_readback_span *spans, uint32_t count);
+// 非零表示该缓冲允许在提交边界分代。继承拷贝按 GPU 顺序持有两代，保留原偏移及长度。
+uint64_t nvn_gpu_mirror_version_atom(nvn_gpu_buf b);
+void nvn_gpu_mirror_copy_span(nvn_gpu_cmd c, nvn_gpu_buf src, nvn_gpu_buf dst, uint64_t off, uint64_t bytes);
 // 释放。retired 可为 NULL；非 NULL 时在最后一次使用（总则 ①–④）结束后恰好调一次。线程：[任意]。NULL 句柄无操作。
 void nvn_gpu_buf_release(nvn_gpu_buf b, nvn_gpu_retired_fn retired, void *user);
 // 本 cmd 会经 GPU 地址间接用到 b（总则 ④）：后端保活到该 cmd 完成，并保证执行时驻留（Metal 驻留集 / useResource；Vulkan 只保活）。线程：[提交]。
@@ -226,12 +247,32 @@ typedef struct { uint32_t w, h, depth, levels, layers, samples; uint32_t nvn_for
 // 建贴图存储。内容未定义。身份（serial、别名、同池同偏移复用）全在核心，后端不缓存贴图。线程：[任意]。
 // 出错：NVN_GPU_E_UNSUPPORTED（格式 / 用途组合不支持，why 写格式号与用途位）、NVN_GPU_E_OOM。
 nvn_gpu_rc nvn_gpu_tex_create(const nvn_gpu_tex_desc *d, nvn_gpu_tex *out, nvn_gpu_err *err);
+// 可选稀疏快照接口。每项覆盖一个客体页或一个客体尾级，两者都用像素区域表示。
+// resident 为 0 的项默认不上传。后端若将它落在物理尾级，设置 upload，调用方写零。
+// 后端负责建立绑定和初始化共享零块。其余 upload 项由调用方录制。写入范围取自快照的驻留区域。
+typedef struct {
+    NVNcopyRegion region;
+    uint32_t level, layer;
+    uint8_t resident, upload;
+    uint8_t write_fully_mapped; // 客体范围的所有 4 KiB 页都有存储，才能用整块附件 / 存储写入。
+} nvn_gpu_sparse_region;
+nvn_gpu_rc nvn_gpu_tex_sparse_create(nvn_gpu_cmd c, const nvn_gpu_tex_desc *d,
+    nvn_gpu_sparse_region *regions, uint32_t count, int native, nvn_gpu_tex *out, nvn_gpu_err *err);
+nvn_gpu_rc nvn_gpu_tex_sparse_upload(nvn_gpu_cmd c, nvn_gpu_tex t, const nvn_gpu_sparse_region *region,
+    const void *bytes, uint64_t pitch, uint64_t size);
+// 可选诊断元数据：普通上传是否送计算解码。只读贴图自身属性，不查驱动。
+int nvn_gpu_tex_upload_decodes_bc(nvn_gpu_tex t);
 void nvn_gpu_tex_info_get(nvn_gpu_tex t, nvn_gpu_tex_info *out);   // 实际尺寸与格式（宽屏挂点读宿主宽高）。线程：[任意]
 // 可选：整张 CPU 块线性快照上传时为已证不透明的 BC1 选宿主压缩存储。
 // 返回 1 = 已录完整上传，0 = 沿用普通上传，-1 = 失败（命令段报错）。
 // 替换存储时 *replacement 为新句柄，由回放更新视图和释放旧句柄。
 int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size, uint64_t serial, nvn_gpu_tex *replacement);
-// 可选：从原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
+// 完整快照交真实源，PLAIN 只诊断。PARTIAL／SPARSE 只记分因，不读源。
+typedef enum { NVN_GPU_BC7_FULL, NVN_GPU_BC7_PLAIN, NVN_GPU_BC7_PARTIAL, NVN_GPU_BC7_SPARSE } nvn_gpu_bc7_source;
+// 可选：用同一份完整 BC7 快照核对预转包，返回与 BC1 快照同义。
+int nvn_gpu_tex_bc7_snapshot(nvn_gpu_cmd c, nvn_gpu_tex t, const void *bytes, uint64_t size,
+                            nvn_gpu_bc7_source source, nvn_gpu_tex *replacement);
+// 可选：从 BC1／BC7 的原始压缩影子重建普通解码存储，让后续写入 / 异格式拷贝沿用原行为。
 // 返回 1 = 重建已录，0 = 当前已是普通存储，-1 = 命令段失败。
 int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd c, nvn_gpu_tex t, nvn_gpu_tex *replacement);
 
@@ -254,6 +295,9 @@ nvn_gpu_tex nvn_gpu_view_texture(nvn_gpu_view v);
 nvn_gpu_rc nvn_gpu_samp_create(const samp_par *p, nvn_gpu_samp *out, nvn_gpu_err *err);
 void nvn_gpu_samp_release(nvn_gpu_samp s);
 // 线性内容上传（解排布 / 解压已由核心做完）：在本 cmd 的 GPU 顺序里生效，src 调用返回后即可释放。线程：[提交]，通道外。出错：粘滞 ORDER / ARG。
+int nvn_gpu_cmd_record_ok(nvn_gpu_cmd c);
+// Keep the segment for cleanup, but reject submission if a required attachment definition cannot be recorded.
+void nvn_gpu_cmd_reject(nvn_gpu_cmd c, const char *reason);
 void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const NVNcopyRegion *r,
                         const void *src, uint64_t row_bytes, uint64_t image_bytes);
 // 块线性原始字节上传，由后端在 GPU 上解排布（要 CAP_GPU_DESWIZZLE）；L 为 NVN 排布（nvn_tex_layout 的结果）。
@@ -263,6 +307,10 @@ void nvn_gpu_tex_upload(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t l
    （nvn_deswizzle_gpu.h），不许借抽离退成 CPU 而改变行为或性能（判据：D1 基准的上传时长读数不变）。 */
 nvn_gpu_rc nvn_gpu_tex_upload_blocklinear(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer, const nvn_texlayout *L,
                                           const void *src, uint64_t bytes);
+// 可选诊断入口：子资源实际走计算解排或 CPU 回退。调用方可跨 mip/层积累两种位。
+enum { NVN_GPU_DESWIZZLE_COMPUTE = 1u, NVN_GPU_DESWIZZLE_CPU = 2u };
+nvn_gpu_rc nvn_gpu_tex_upload_blocklinear_report(nvn_gpu_cmd c, nvn_gpu_tex t, uint32_t level, uint32_t layer,
+    const nvn_texlayout *layout, const void *src, uint64_t bytes, unsigned *routes);
 
 // ---------- 着色器布局（定稿 A1：完整反射过下沿） ----------
 typedef enum { NVN_GPU_SH_VS = 0, NVN_GPU_SH_FS = 1, NVN_GPU_SH_GS = 2, NVN_GPU_SH_TCS = 3, NVN_GPU_SH_TES = 4, NVN_GPU_SH_CS = 5 } nvn_gpu_stage;   // = NVN 阶段号
@@ -315,6 +363,7 @@ void nvn_gpu_shader_release(nvn_gpu_shader s);
 enum { NVN_GPU_SPEC_BOOL = 0, NVN_GPU_SPEC_INT = 1, NVN_GPU_SPEC_UINT = 2, NVN_GPU_SPEC_FLOAT = 3, NVN_GPU_SPEC_MAX = 48 };
 typedef struct { uint16_t id; uint8_t type, _rsv; uint32_t bits; } nvn_gpu_spec;   // 特化常量（function constant / VkSpecializationInfo）
 typedef struct { nvn_gpu_shader sh; uint32_t nspec; nvn_gpu_spec spec[NVN_GPU_SPEC_MAX]; } nvn_gpu_stage_desc;   // sh = NULL：该阶段不用
+enum { NVN_GPU_VP_SWIZZLE_MASK = 0xfff, NVN_GPU_VP_SWIZZLE_Z_REMAP = 1u << 12 };
 // 图形管线描述 = pso_key 去掉 Metal 痕迹（格式改 NVNformat、着色器改句柄）。核心负责规范化（同 pso_key_norm），后端按自己的键去重缓存。
 // 管线布局由后端按各阶段布局确定性合并（同 set / binding 的项类别与数量必须一致，否则 NVN_GPU_E_LAYOUT）。
 typedef struct {
@@ -324,9 +373,12 @@ typedef struct {
     uint8_t lmap[8];                 // 合并通道的颜色槽重映射
     uint32_t prim, patch_size;
     uint8_t prim_restart;            // NVN 条带重启；重启值 = 索引类型的最大值（u8 0xFF / u16 0xFFFF / u32 0xFFFFFFFF）
-    uint8_t _rsv_prim[3];
+    uint8_t provoking_last;          // 0 = FIRST，1 = LAST（须 NVN_GPU_CAP_PROVOKING_LAST）
+    uint16_t vp_swizzle;             // viewport 0: 4 packed 3-bit selectors XOR identity, possibly a Z remap
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms;
+    uint8_t sample_shading;          // 片元程序模式：0 默认、1 强制逐样本、2 不强制逐样本。占用 attr 前的对齐空位
     va_st attr[16]; vs_st stream[16];
+    uint16_t disabled_samples;       // 样本掩码取反的低 16 位，复用深度模板前的对齐空位。零即全部样本可写。
     /* 定稿 #4：静态状态一直带在 desc 里；只在实际启用了对应动态能力（CAP_DYN_DEPTH_STENCIL / CAP_DYN_RASTER）时后端才从自己的键里省略。
        不把变体查找推迟到 draw（预测预编要看得到这些状态）。没有对应能力时 dyn 里的同名字段必须与这里相同，否则粘滞 NVN_GPU_E_ARG。 */
     ds_st ds; poly_st poly;
@@ -336,6 +388,7 @@ typedef struct {
        origin_ll 必须与绘制时 nvn_gpu_dyn.origin_ll 相同，不同则粘滞 NVN_GPU_E_ARG。 */
     uint8_t origin_ll;
     uint8_t depth_clamp;             // v6：深度夹取（NVN SetDepthClamp）：1 = 超出近远面的片元夹到范围内而不是裁掉。必须与 nvn_gpu_dyn.depth_clamp 相同
+    uint8_t depth_bounds_enable;     // 作用于已存深度；区间是逐笔动态状态。
 } nvn_gpu_pipe_desc;
 enum {
     NVN_GPU_PIPE_SYNC = 0,         // 现在就建，阻塞到出结果
@@ -361,12 +414,30 @@ nvn_gpu_rc nvn_gpu_cmd_begin(const nvn_gpu_cmd_desc *d, nvn_gpu_cmd *out, nvn_gp
 void nvn_gpu_cmd_abort(nvn_gpu_cmd c);
 
 enum { NVN_GPU_LOAD_LOAD = 0, NVN_GPU_LOAD_CLEAR = 1, NVN_GPU_LOAD_DONTCARE = 2 };
-enum { NVN_GPU_STORE_STORE = 0, NVN_GPU_STORE_DONTCARE = 1, NVN_GPU_STORE_RESOLVE = 2, NVN_GPU_STORE_STORE_RESOLVE = 3 };
+enum { NVN_GPU_STORE_STORE = 0, NVN_GPU_STORE_DONTCARE = 1, NVN_GPU_STORE_RESOLVE = 2, NVN_GPU_STORE_STORE_RESOLVE = 3,
+       // Replay has proved that neither an internal continuation nor a subsequent command needs this attachment aspect.
+       NVN_GPU_STORE_DISCARD_PROVEN = 4 };
 typedef struct {
     nvn_gpu_view view, resolve;
     uint8_t load, store, _rsv[2];
     union { float f[4]; uint32_t u[4]; int32_t i[4]; } clear;
 } nvn_gpu_att;
+enum { NVN_GPU_PASS_TRACE_DRAW, NVN_GPU_PASS_TRACE_CLEAR, NVN_GPU_PASS_TRACE_XFER,
+       NVN_GPU_PASS_TRACE_IDLE_DS, NVN_GPU_PASS_TRACE_FEEDBACK_COPY, NVN_GPU_PASS_TRACE_FEEDBACK_READ,
+       NVN_GPU_PASS_TRACE_CLEAR_RECT, NVN_GPU_PASS_TRACE_AREA_REOPEN, NVN_GPU_PASS_TRACE_DEPTH_BLIT };
+#define NVN_GPU_DS_DEPTH 1u
+#define NVN_GPU_DS_STENCIL 2u
+
+// 只看可写的模板位与操作，不从实际通过的像素数推断可写性。
+static inline uint8_t nvn_gpu_ds_writes(const ds_st *ds, uint32_t front, uint32_t back) {
+    const int fw = (front & 255) && ((ds->fail_f >= 2 && ds->fail_f <= 8) ||
+                                  (ds->zfail_f >= 2 && ds->zfail_f <= 8) || (ds->zpass_f >= 2 && ds->zpass_f <= 8));
+    const int bw = (back & 255) && ((ds->fail_b >= 2 && ds->fail_b <= 8) ||
+                                 (ds->zfail_b >= 2 && ds->zfail_b <= 8) || (ds->zpass_b >= 2 && ds->zpass_b <= 8));
+    return (ds->dt && ds->dw ? NVN_GPU_DS_DEPTH : 0) |
+           (ds->st && (fw || bw) ? NVN_GPU_DS_STENCIL : 0);
+}
+
 typedef struct {
     nvn_gpu_att color[8]; uint32_t ncolor;
     nvn_gpu_att depth, stencil;
@@ -378,7 +449,9 @@ typedef struct {
     int32_t area_x, area_y; uint32_t area_w, area_h;
     uint8_t occlusion;    // 本通道会计数遮挡查询
     uint8_t fb_fetch;     // 本通道有片元读本像素颜色（各颜色附件格式须有 NVN_GPU_FMT_FB_FETCH）
-    uint8_t _rsv[2];
+    uint8_t trace_origin;  // Optional label for diagnostics, never affects Vulkan compatibility.
+    uint8_t ds_read_only; // 开遍提示；后端在遇到对此面的写入前恢复可写布局
+    uint16_t terminal_discard; // Bits 0..7 color, 8 depth, 9 stencil. This pass must never reopen.
 } nvn_gpu_pass_desc;
 // 一个附件都不挂（ncolor 个槽全空、无深度模板）只在 caps 有 NVN_GPU_CAP_NO_ATTACH_PASS 时合法，此时 w / h 就是帧缓冲尺寸（核心按视口给）。
 // 开 / 关渲染通道。load / store 全由核心定（TBDR 策略在核心）。通道内只许状态 / 绑定 / 绘制 / 遮挡查询。线程：[提交]。出错：粘滞 ORDER / ARG。
@@ -395,6 +468,8 @@ typedef struct {
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     float blend_color[4];
     ds_st ds; poly_st poly;          // 见定稿 #4
+    float line_width;                // 像素；零初始化采用默认一像素
+    float depth_bounds_min, depth_bounds_max;
 } nvn_gpu_dyn;
 void nvn_gpu_set_pipe(nvn_gpu_cmd c, nvn_gpu_pipe p);       // 线程：[提交]，通道内
 void nvn_gpu_set_dyn(nvn_gpu_cmd c, const nvn_gpu_dyn *d);   // 线程：[提交]，通道内
@@ -468,7 +543,6 @@ typedef struct { nvn_gpu_buf src; uint64_t soff; nvn_gpu_buf dst; uint64_t doff;
 void nvn_gpu_copy_bufs_uniform(nvn_gpu_cmd c, const nvn_gpu_buf_copy *v, uint32_t n, uint32_t stages);
 // 可选的后端自管回写暂存。只对不适合直接 CPU 回读的源录拷贝，未暂存项返回 offset=UINT64_MAX。
 // [提交]，在通道外调用，最后一段里所有源写之后。返回 0 表示未录复制，仍可走原镜像回写；已录制的副作用只通过 done 交付。
-typedef struct { nvn_gpu_buf src; uint64_t offset, bytes, readback_offset; } nvn_gpu_readback_span;
 int nvn_gpu_readback_enabled(void);
 // 本段是否需要候选范围；auto 在 R0 同样观察负载，实际模式在开段时锁存。
 int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c);
@@ -553,6 +627,25 @@ struct nvn_gpu_cold_domain {
 // 通道外：此前计算写入对后续间接参数 / 索引 / 顶点 / 图形着色器读取可见；不包含附件载入、计算或传输，不分段、不等待。
 // 由核心仅在图形实际读到计算写过的范围时调用；全体计算写对这些读阶段发布，所以核心可一起撤掉待发布表。
 void nvn_gpu_compute_to_graphics(nvn_gpu_cmd c);
+
+// v27：任务 / 网格计算模拟辅助核（对齐 iOS nvn_geometry.inc mxe_tclamp / mxe_scan / mxe_monly）。要 NVN_GPU_CAP_MESH_EMU。
+// 交换缓冲头部 32 字（128 字节，与 iOS MXE_HEAD 逐字对齐）：
+//   [0] counts_off [1] payload_off [2] table_off [3] capT [4] capM [5] pw [6] direct_task_count [7] maxp*3
+//   [8..10] 网格派发间接参数 {x,y,z}  [11] vbo_off [12] ibo_off
+//   [13..17] 索引绘制间接参数 {indexCount,instanceCount,firstIndex,vertexOffset,firstInstance}
+//   [18] raw_mesh_groups [19] raw_task_groups  [20..22] 钳制后任务派发间接参数 {x,y,z}
+//   [23] slice_off（中转载荷片区）  [24..27] 视口  [28] cull_flags  [29] first_wg  [30] first_aligned_off
+enum {
+    NVN_GPU_MESH_EMU_HEAD   = 32,
+    NVN_GPU_MESH_EMU_TCLAMP = 0,   // 读 ind[0..1] {count,first} → h[20..22]={min(count,capT),1,1}、h[29]=first、h[h[30]]=first
+    NVN_GPU_MESH_EMU_SCAN   = 1,   // 前缀和排表：展开 (t<<10)|j 到 h[h[2]+o]，写 h[8..10]、h[13..19]
+    NVN_GPU_MESH_EMU_MONLY  = 2,   // 无任务间接：读 ind[0..1] {count,first} → h[8..10]={min(count,capM),1,1}、h[13..19]、h[29]=first、h[h[30]]=first
+};
+// 通道外执行一次网格模拟辅助计算核，并在前后自动维护本段计算 / 间接同步屏障。
+// exchange：[xoff, xoff+xbytes) 须满足 min_ssbo_align 且 xbytes >= 128；ind 为 NULL 仅允许 SCAN，TCLAMP/MONLY 须非空且 4 字节对齐可读 8 字节。
+// 线程：[提交]，通道外。出错：粘滞 ORDER / ARG / UNSUPPORTED。
+void nvn_gpu_mesh_emu_op(nvn_gpu_cmd c, uint32_t op, nvn_gpu_buf exchange, uint64_t xoff, uint64_t xbytes,
+                         nvn_gpu_buf ind, uint64_t ind_off);
 
 void nvn_gpu_occlusion(nvn_gpu_cmd c, int32_t slot);   // 之后的绘制计入 slot，-1 停止。通道内且 pass_desc.occlusion = 1
 void nvn_gpu_label(nvn_gpu_cmd c, const char *text);   // 调试标签压栈，NULL 出栈

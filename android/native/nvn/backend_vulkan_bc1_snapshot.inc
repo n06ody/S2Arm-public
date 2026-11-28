@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 S2Arm contributors
 
-static nvn_gpu_rc bc1_new_storage(struct nvn_gpu_tex_s *old, int opaque, nvn_gpu_tex *tex, nvn_gpu_err *err) {
+static nvn_gpu_rc bc_new_storage(struct nvn_gpu_tex_s *old, int opaque, nvn_gpu_tex *tex, nvn_gpu_err *err) {
     nvn_gpu_tex_desc desc = {
         .d = old->original_desc, .usage = old->original_usage & ~NVN_GPU_TEX_BC1_OPAQUE, .swz = old->swz,
     };
@@ -71,10 +71,10 @@ int nvn_gpu_tex_bc1_snapshot(nvn_gpu_cmd ch, nvn_gpu_tex tex, const void *src, u
     nvn_gpu_tex target = t;
     if (opaque != bc1_astc_image(t)) {
         nvn_gpu_err err = {0};
-        if (!rc_is(bc1_new_storage(t, opaque, &target, &err), NVN_GPU_OK)) {
+        if (!rc_is(bc_new_storage(t, opaque, &target, &err), NVN_GPU_OK)) {
             free(snapshot);
             if (!bc1_astc_image(t)) return 0;
-            set_sticky(c, err.rc.code, "BC1 恢复 RGBA8 失败：%s", err.why);
+            set_sticky(c, err.rc.code, "BC 恢复 RGBA8 失败：%s", err.why);
             return -1;
         }
         if (opaque && !bc1_astc_image(target)) {
@@ -102,29 +102,30 @@ int nvn_gpu_tex_bc1_unwrap(nvn_gpu_cmd ch, nvn_gpu_tex tex, nvn_gpu_tex *replace
     struct nvn_gpu_cmd_s *c = ch;
     struct nvn_gpu_tex_s *t = tex;
     *replacement = NULL;
-    if (!t || !bc1_astc_image(t)) return 0;
+    if (!t || (!bc1_astc_image(t) && !t->bc7_packed)) return 0;
     if (!c || !rc_is(c->sticky, NVN_GPU_OK)) return -1;
     if (c->in_pass || !t->bc_sbuf) {
-        set_sticky(c, NVN_GPU_E_ORDER, "BC1 恢复 RGBA8 缺少已录制的压缩影子或仍在通道内");
+        set_sticky(c, NVN_GPU_E_ORDER, "BC 恢复 RGBA8 缺少已录制的压缩影子或仍在通道内");
         return -1;
     }
     nvn_gpu_tex target = NULL;
     nvn_gpu_err err = {0};
-    if (!rc_is(bc1_new_storage(t, 0, &target, &err), NVN_GPU_OK)) {
-        set_sticky(c, err.rc.code, "BC1 恢复 RGBA8 失败：%s", err.why);
+    if (!rc_is(bc_new_storage(t, 0, &target, &err), NVN_GPU_OK)) {
+        set_sticky(c, err.rc.code, "BC 恢复 RGBA8 失败：%s", err.why);
         return -1;
     }
     cmd_ref(c, t, REF_TEX);
+    const unsigned block = t->bc7_packed ? 16u : 8u;
     if (bc_decoder_ready(c)) for (uint32_t l = 0; l < t->levels && rc_is(c->sticky, NVN_GPU_OK); l++) {
         const uint32_t w = t->w >> l ? t->w >> l : 1;
         const uint32_t h = t->h >> l ? t->h >> l : 1;
         uint64_t offset, row, plane, total;
         uint32_t layers;
-        if (!bc_shadow_layout(t, 8, l, &offset, &row, &plane, &layers, &total)) {
-            set_sticky(c, NVN_GPU_E_ARG, "BC1 恢复 RGBA8：压缩影子布局越界");
+        if (!bc_shadow_layout(t, block, l, &offset, &row, &plane, &layers, &total)) {
+            set_sticky(c, NVN_GPU_E_ARG, "BC 恢复 RGBA8：压缩影子布局越界");
             break;
         }
-        if (!bc_shadow_ensure(c, target, total)) break;
+        if (!raw_shadow_ensure(c, target, total)) break;
         for (uint32_t layer = 0; layer < layers && rc_is(c->sticky, NVN_GPU_OK); layer++) {
             const uint64_t at = offset + (uint64_t)layer * plane;
             bc_record_slice(c, target, t->bc_sbuf, at, ((uint64_t)h + 3) / 4, row, at, row,

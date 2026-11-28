@@ -9,6 +9,7 @@
  *
  * 只管 2D / 2D 数组 / 立方体（深度 1、GobBlocksInZ 1、GobBlocksInTileX 1：BNTX 里 BC 贴图都是这种）。
  */
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -83,7 +84,10 @@ int b2a_deswizzle(const uint8_t *src, uint64_t src_len, uint32_t bpp, uint32_t w
 }
 
 /* ASTC 4x4 编码上下文（LDR、单线程；Python 每个工作线程一份） */
-typedef struct { struct astcenc_context *ctx; } b2a_ctx;
+typedef struct {
+    struct astcenc_context *ctx;
+    struct astcenc_context *verify[2];
+} b2a_ctx;
 void *b2a_ctx_new(float quality) {
     struct astcenc_config cfg;
     if (astcenc_config_init(ASTCENC_PRF_LDR, 4, 4, 1, quality, 0, &cfg) != ASTCENC_SUCCESS) return NULL;
@@ -91,7 +95,13 @@ void *b2a_ctx_new(float quality) {
     if (!c || astcenc_context_alloc(&cfg, 1, &c->ctx, NULL) != ASTCENC_SUCCESS) { free(c); return NULL; }
     return c;
 }
-void b2a_ctx_free(void *p) { b2a_ctx *c = p; if (!c) return; astcenc_context_free(c->ctx); free(c); }
+void b2a_ctx_free(void *p) {
+    b2a_ctx *c = p;
+    if (!c) return;
+    for (unsigned i = 0; i < 2; i++) if (c->verify[i]) astcenc_context_free(c->verify[i]);
+    astcenc_context_free(c->ctx);
+    free(c);
+}
 
 /* 族（gal_astc.h GAL_ASTC_FAM_*）的每块字节 */
 static int fam_bpp(uint32_t f) { return f == 1 ? 8 : f == 2 || f == 3 || f == 5 || f == 7 ? 16 : 0; }
@@ -126,4 +136,85 @@ int b2a_encode(void *p, uint32_t fam, uint32_t w, uint32_t h, const uint8_t *bc,
     astcenc_compress_reset(c->ctx);
     free(rgba);
     return e == ASTCENC_SUCCESS ? 0 : -2;
+}
+
+static double srgb_linear(double x) {
+    return x <= 0.04045 ? x / 12.92 : pow((x + 0.055) / 1.055, 2.4);
+}
+
+static int verify_bc7_pixels(const uint8_t *original, const float *decoded,
+                             unsigned w, unsigned h, unsigned pitch, int srgb) {
+    const double peak = 8.0 / 255.0;
+    const double block_mse = (3.0 / 255.0) * (3.0 / 255.0);
+    const double plane_mse = 0.0000630957344480193;  // 10^(-42/10)
+    double linear[256], plane_error = 0;
+    for (unsigned i = 0; i < 256; i++) linear[i] = srgb ? srgb_linear(i / 255.0) : i / 255.0;
+    for (unsigned by = 0; by < h; by += 4) for (unsigned bx = 0; bx < w; bx += 4) {
+        double error = 0;
+        unsigned rgb_samples = 0;
+        for (unsigned y = by; y < by + 4 && y < h; y++) for (unsigned x = bx; x < bx + 4 && x < w; x++) {
+            const size_t at = ((size_t)y * pitch + x) * 4;
+            const unsigned alpha = original[at + 3];
+            const double a = decoded[at + 3];
+            if (!(a >= 0.0 && a <= 1.0) || (unsigned)(a * 255.0 + 0.5) != alpha ||
+                (alpha == 0 && a != 0.0) || (alpha == 255 && a != 1.0) ||
+                ((a >= 0.5) != (alpha >= 128))) return 1;
+            for (unsigned ch = 0; ch < 3; ch++) {
+                const double v = decoded[at + ch];
+                if (!(v >= 0.0 && v <= 1.0)) return 1;
+                const double diff = (srgb ? srgb_linear(v) : v) - linear[original[at + ch]];
+                if (fabs(diff) > peak) return 1;
+                error += diff * diff;
+            }
+            rgb_samples += 3;
+        }
+        if (error > rgb_samples * block_mse) return 1;
+        plane_error += error;
+    }
+    return plane_error > (double)w * h * 3 * plane_mse;
+}
+
+// 按 Vulkan 的两种 LDR 解码解释检查同一 ASTC 负载。只量尺寸内 texel；块尾填充不可取样。
+int b2a_bc7_verify(void *p, uint32_t w, uint32_t h, const uint8_t *bc, uint64_t bc_len,
+                   const uint8_t *astc, uint64_t astc_len) {
+    b2a_ctx *c = p;
+    if (!c || !bc || !astc || !w || !h || w > 16384 || h > 16384) return -1;
+    const uint32_t wb = div_up(w, 4), hb = div_up(h, 4), pw = wb * 4, ph = hb * 4;
+    const uint64_t size = (uint64_t)wb * hb * 16;
+    if (bc_len != size || astc_len != size || size > SIZE_MAX / 64) return -1;
+    // 全零模式前缀为保留编码。它没有可审定的颜色语义。
+    for (size_t i = 0; i < (size_t)size; i += 16) if (!bc[i]) return 1;
+    uint8_t *ref = malloc((size_t)size * 4);
+    float *decoded = malloc((size_t)size * 4 * sizeof *decoded);
+    int result = -1;
+    if (!ref || !decoded) goto done;
+    for (unsigned y = 0; y < hb; y++) for (unsigned x = 0; x < wb; x++) {
+        bcdec_bc7(bc + ((size_t)y * wb + x) * 16, ref + ((size_t)y * pw + x) * 16, (int)pw * 4);
+    }
+    void *slices[] = {decoded};
+    struct astcenc_image image = {pw, ph, 1, ASTCENC_TYPE_F32, slices};
+    const struct astcenc_swizzle rgba = {ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A};
+    for (unsigned i = 0; i < 2; i++) {
+        struct astcenc_context **ctx = &c->verify[i];
+        if (!*ctx) {
+            struct astcenc_config cfg;
+            enum astcenc_profile profile = i ? ASTCENC_PRF_LDR_SRGB : ASTCENC_PRF_LDR;
+            if (astcenc_config_init(profile, 4, 4, 1, ASTCENC_PRE_FASTEST, ASTCENC_FLG_DECOMPRESS_ONLY, &cfg) ||
+                astcenc_context_alloc(&cfg, 1, ctx, NULL)) goto done;
+        }
+        if (astcenc_decompress_image(*ctx, astc, (size_t)size, &image, &rgba, 0)) {
+            result = 1;
+            goto done;
+        }
+        astcenc_decompress_reset(*ctx);
+        if (verify_bc7_pixels(ref, decoded, w, h, pw, (int)i)) {
+            result = 1;
+            goto done;
+        }
+    }
+    result = 0;
+done:
+    free(decoded);
+    free(ref);
+    return result;
 }

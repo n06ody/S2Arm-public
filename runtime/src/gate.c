@@ -324,6 +324,15 @@ static uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig) {
         atomic_fetch_add(&g_cs_inflight, 1);
         if (atomic_load(&g_park)) { atomic_fetch_sub(&g_cs_inflight, 1); park_forever(); }   // 与 park_all 的先后：先登记在途再复查，收局方要么等到它、要么它停住
         s2a_svc_ctx c; s2a_svc_ctx_fill(&c, num, regs);
+#if defined(__ANDROID__)
+        // The raw user-buffer IPC path bypasses GuestMemory. Publish the
+        // export before native tracing or the managed dispatcher reads it.
+        extern void nvn_dirty_read_probe_pin_export(const void *, size_t, int) __attribute__((weak));
+        if (nvn_dirty_read_probe_pin_export) {
+            if (num == 0x22) nvn_dirty_read_probe_pin_export((const void *)(uintptr_t)regs[0], (size_t)regs[1], 1);
+            else if (num == 0x1f) nvn_dirty_read_probe_pin_export((const void *)(uintptr_t)regs[1], 12, 0);
+        }
+#endif
         const uint32_t *ipcmsg = num == 0x21 || num == 0x22 ? (const uint32_t *)(num == 0x21 ? c.tlr : (void *)regs[0]) : NULL;
         const uint32_t *msg = trace_on() ? ipcmsg : NULL;
         char ipcname[9] = ""; if (num == 0x21 || num == 0x22) ipc_note_before(num, regs, ipcmsg, ipcname);   // 崩溃现场的最近 IPC（上面）

@@ -270,6 +270,9 @@ namespace Ryujinx.Graphics.Shader
             return false;
         }
 
+        /// <summary>Emit the storage-window mask for Vulkan library loading to specialize.</summary>
+        bool QueryS2ALateStorageBufferAlignment() => false;
+
         /// <summary>
         /// Queries host's gather operation precision bits for biasing their coordinates. Zero means no bias.
         /// </summary>

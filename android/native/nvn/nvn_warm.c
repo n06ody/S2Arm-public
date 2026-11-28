@@ -208,6 +208,25 @@ static int qretry_push(const struct nvk_pipe_rec *r) {
     return -1;
 }
 
+static void warm_build_pipe(const struct nvk_pipe_rec *rec) {
+    int rc = nvk_pipe_warm_build(rec);
+    if (rc == 0) atomic_fetch_add(&g_pipe_built, 1);
+    else if (rc != 1 || qretry_push(rec)) atomic_fetch_add(&g_pipe_failed, 1);
+}
+
+static int warm_build_program(const struct nvk_prog_rec *rec, int reactive, int *pipe_budget) {
+    int rc = nvk_prog_warm_build(rec);
+    // 成功包括已由需求路径发布的同身份。每次只插入一条热点，给后续程序保留进展。
+    if (rc == 0 && reactive && *pipe_budget > 0 && !warm_stopping()) {
+        struct nvk_pipe_rec pipe;
+        if (nvk_pipe_warm_take_program(rec->identity, &pipe)) {
+            (*pipe_budget)--;
+            warm_build_pipe(&pipe);   // 正式借用与 in-flight 去重仍由原 build 路径负责
+        }
+    }
+    return rc;
+}
+
 // 清单加载：本局 profile / 编译闭包可能还没冻结（provider activate 的顺序），最多重试约 10 秒。
 // 之后仍拿不到按「本局没有清单」处理：拿不到上下文不是清单坏了，不拿它当失败重试到底。
 static int warm_load(void) {
@@ -277,6 +296,7 @@ static void *warm_main(void *unused) {
     // 跟它抢核（真机第二次启动：预热到 105 秒还在跑，帧率 22.6 → 18.0）。
     int prog_budget = loaded < 0 ? 0 : nvk_prog_warm_pending();
     int pipe_budget = loaded < 0 ? 0 : nvk_pipe_warm_pending();
+    const int reactive = nvn_plat_flag("nvk_warm_reactive", 0);
     int prog_done = loaded < 0 ? 1 : 0, idle_rounds = 0, drained = 0;
     int64_t last_log = warm_now_ms(), next_save = g_t0 + WARM_FIRST_SAVE_MS;
     for (;;) {
@@ -290,7 +310,7 @@ static void *warm_main(void *unused) {
             if (prog_budget <= 0) prog_done = 1;   // 本局预热集做完（本局新记录不再扩集）
             else if (nvk_prog_warm_take(&pr)) {
                 prog_budget--;
-                int rc = nvk_prog_warm_build(&pr);
+                int rc = warm_build_program(&pr, reactive, &pipe_budget);
                 did = 1;
                 if (rc == 0) atomic_fetch_add(&g_prog_built, 1);
                 else if (rc == 1) { if (pretry_push(&pr)) atomic_fetch_add(&g_prog_failed, 1); }
@@ -303,7 +323,7 @@ static void *warm_main(void *unused) {
         if (!did && prog_done) {
             for (int i = 0; i < WARM_RETRY; i++) {
                 if (!g_pretry[i].used) continue;
-                int rc = nvk_prog_warm_build(&g_pretry[i].rec);
+                int rc = warm_build_program(&g_pretry[i].rec, reactive, &pipe_budget);
                 if (rc == 0) { g_pretry[i].used = 0; atomic_fetch_add(&g_prog_built, 1); }
                 else if (rc < 0) { g_pretry[i].used = 0; atomic_fetch_add(&g_prog_failed, 1); }
                 else if (warm_now_ms() - g_pretry[i].first_ms > WARM_PROG_RETRY_MS) { g_pretry[i].used = 0; atomic_fetch_add(&g_prog_failed, 1); }
@@ -311,15 +331,12 @@ static void *warm_main(void *unused) {
                 break;
             }
         }
-        // 第三遍：管线（要程序先发布；程序清单全部走完之后才开始，顺序由这份循环保证）。
+        // 第三遍：管线（要程序先发布；程序清单走完后按冻结顺序取剩余配方）。
         if (!did && prog_done) {
             if (pipe_budget > 0 && nvk_pipe_warm_take(&qr)) {
                 pipe_budget--;
-                int rc = nvk_pipe_warm_build(&qr);
+                warm_build_pipe(&qr);
                 did = 1;
-                if (rc == 0) atomic_fetch_add(&g_pipe_built, 1);
-                else if (rc == 1) { if (qretry_push(&qr)) atomic_fetch_add(&g_pipe_failed, 1); }
-                else atomic_fetch_add(&g_pipe_failed, 1);
             }
         }
         if (!did && prog_done) {

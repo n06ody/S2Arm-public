@@ -121,6 +121,19 @@ int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length, struct nvn
     return -1;
 }
 void nvn_vk_program_free_compute(struct nvn_vk_compute_program *program) { (void)program; }
+// These fixture suites inject only legacy results; exercise the binary parser
+// through the result contract and Vulkan readback suites.
+int nvn_vk_program_parse_graphics_live(const uint8_t *bytes, size_t length, struct fd_program *out,
+                                       int allow_vs_only, char *why, size_t why_size) {
+    (void)bytes; (void)length; (void)out; (void)allow_vs_only; (void)why; (void)why_size;
+    return -1;
+}
+int nvn_vk_program_parse_compute_live(const uint8_t *bytes, size_t length, struct nvn_vk_compute_program *out,
+                                      char *why, size_t why_size) {
+    (void)bytes; (void)length; (void)out; (void)why; (void)why_size;
+    return -1;
+}
+
 nvn_gpu_rc nvn_gpu_shader_load(const nvn_gpu_shader_src *s, nvn_gpu_shader *out, nvn_gpu_err *err) {
     (void)s; (void)err;
     static unsigned seq;

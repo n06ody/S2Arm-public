@@ -10,7 +10,12 @@
 
 // OP_PUSH_CONST_PTR（11-04）：Push{Graphics,Compute}ConstantsDeferred——数据指针录下、回放时才读（见下「推常量」）。新操作码一律接在 OP_NVN2_END_ 前，回放 rec_bad 的上限跟着走
 // OP_MULTI_DRAW（11-06）：间接计数多绘超过 1,024 条时整段一条记录（见下「间接计数多绘」；补齐上游参考实现（MIT）c7ba23df，上游放在 nvn_obj.h，这里同理接在 OP_COUNT_ 之后）
-enum { OP_PUSH_CONST = OP_COUNT_, OP_DLSS, OP_PUSH_CONST_PTR, OP_MULTI_DRAW, OP_NVN2_END_ };
+enum { OP_PUSH_CONST = OP_COUNT_, OP_DLSS, OP_PUSH_CONST_PTR, OP_MULTI_DRAW, OP_SET_PROVOKING_VERTEX, OP_SAMPLE_MASK, OP_DISCARD_COLOR, OP_DISCARD_DS, OP_NVN2_END_ };
+
+// NVN 驱动参数按硬件位取值，0 取首顶点、1 取末顶点。
+typedef struct { uint32_t mode; } p_provoking_vertex;
+typedef struct { uint32_t mask; } p_sample_mask;
+typedef struct { int32_t slot; uint32_t pad; } p_discard_color;
 
 // ---------- 间接计数多绘（MultiDraw{Arrays,Elements}IndirectCount）----------
 // 不超过 1,024 条的照旧逐条录成带计数地址与序号的间接绘制（hle_nvn.c rec_draw / rec_draw_idx，怪物猎人崛起那条路不变）；更大的一次调用录成这一条：参数记录的起点（宿主地址）、

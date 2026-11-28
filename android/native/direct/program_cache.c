@@ -13,6 +13,8 @@
 // 同一身份下的字节损坏。两个都要比，不能只比文件名。
 #include "installed_seed.h"
 #include "program_cache.h"
+#include "compile_phase.h"
+#include "../nvn/nvk_result_view.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -447,75 +449,191 @@ int s2a_program_cache_store(const char *dir, const uint8_t identity[32],
     return 0;
 }
 
-// ---- 异步写：一次性分离线程，当前绘制不等磁盘（方案 §5.5.2 第 5 条）----
-
+// 本会话的程序写入队列。当前写入也占字节预算；磁盘操作不持队列锁。
+enum { PCACHE_QUEUE_MAX = 32 };
 struct pcache_job {
-    char *dir;
+    char dir[PCACHE_PATH];
     uint8_t identity[32];
     uint8_t *bytes;
     size_t len;
+    s2a_direct_encode_result_fn encode;
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_idle = PTHREAD_COND_INITIALIZER;
-static unsigned g_pending;
+static pthread_cond_t g_work = PTHREAD_COND_INITIALIZER;
+static struct pcache_job g_queue[PCACHE_QUEUE_MAX], g_current;
+static unsigned g_head, g_queued;
+static size_t g_write_bytes;
+static int g_writer_alive, g_writer_stopping;
 
-static void *pcache_writer(void *arg) {
-    struct pcache_job *j = arg;
-    char why[192] = "";
-    if (s2a_program_cache_store(j->dir, j->identity, j->bytes, j->len, why, sizeof why) != 0) {
-        // 写盘失败只记缓存问题，不影响已经可用的内存结果。
-        fprintf(stderr, "[s2a] program cache: store failed: %s\n", why);
-        atomic_fetch_add(&g_failures, 1);
-    }
-    free(j->bytes);
-    free(j->dir);
-    free(j);
+static int same_job(const struct pcache_job *job, const char *dir, const uint8_t identity[32]) {
+    return job->len && !memcmp(job->identity, identity, sizeof job->identity) && !strcmp(job->dir, dir);
+}
+
+struct pcache_emit {
+    uint8_t *json;
+    size_t length;
+    unsigned emitted;
+};
+
+static int32_t store_legacy_emit(void *sink, s2a_direct_bytes result) {
+    struct pcache_emit *c = sink;
+    if (c->emitted == 1) { c->emitted = 2; return S2A_DIRECT_RES_ARGUMENT; }
+    if (c->emitted) return S2A_DIRECT_RES_ARGUMENT;
+    c->emitted = 1;
+    if (!result.data || result.bytes > PCACHE_MAX_PAYLOAD || result.bytes < 2 || result.data[0] != '{')
+        return S2A_DIRECT_RES_ARGUMENT;
+    c->json = malloc((size_t)result.bytes);
+    if (!c->json) return S2A_DIRECT_RES_INTERNAL;
+    c->length = (size_t)result.bytes;
+    memcpy(c->json, result.data, c->length);
+    return S2A_DIRECT_RES_OK;
+}
+
+static void *pcache_writer(void *unused) {
+    (void)unused;
     pthread_mutex_lock(&g_lock);
-    if (g_pending) g_pending--;
-    if (!g_pending) pthread_cond_broadcast(&g_idle);
+    for (;;) {
+        while (!g_queued && !g_writer_stopping) pthread_cond_wait(&g_work, &g_lock);
+        if (!g_queued) break;
+        g_current = g_queue[g_head];
+        g_head = (g_head + 1) % PCACHE_QUEUE_MAX;
+        g_queued--;
+        pthread_mutex_unlock(&g_lock);
+
+        char why[192] = "";
+        struct pcache_emit sink = {0};
+        const uint8_t *payload = g_current.bytes;
+        size_t length = g_current.len;
+        int rc = 0;
+        if (g_current.encode) {
+            struct s2a_compile_stamp phase = s2a_compile_phase_begin();
+            rc = g_current.encode((s2a_direct_bytes){payload, length}, store_legacy_emit, &sink);
+            s2a_compile_phase_end(phase, "cache-encode", g_current.identity);
+            if (!rc && (sink.emitted != 1 || !sink.json)) rc = S2A_DIRECT_RES_COMPILE;
+            if (rc) {
+                snprintf(why, sizeof why, "legacy result encoding failed (rc=%d)", rc);
+                atomic_fetch_add(&g_failures, 1);
+            }
+            payload = sink.json;
+            length = sink.length;
+        }
+        if (!rc) {
+            struct s2a_compile_stamp phase = s2a_compile_phase_begin();
+            rc = s2a_program_cache_store(g_current.dir, g_current.identity, payload, length, why, sizeof why);
+            s2a_compile_phase_end(phase, "cache-write", g_current.identity);
+        }
+        if (rc) fprintf(stderr, "[s2a] program cache: store failed: %s\n", why);
+        free(sink.json);
+        free(g_current.bytes);
+
+        pthread_mutex_lock(&g_lock);
+        g_write_bytes -= g_current.len;
+        memset(&g_current, 0, sizeof g_current);
+        if (!g_queued) pthread_cond_broadcast(&g_idle);
+    }
+    g_writer_alive = 0;
+    pthread_cond_broadcast(&g_idle);
     pthread_mutex_unlock(&g_lock);
     return NULL;
+}
+
+int s2a_program_cache_start(void) {
+    pthread_mutex_lock(&g_lock);
+    int rc = g_writer_stopping && g_writer_alive ? -1 : 0;
+    if (!g_writer_alive) {
+        pthread_attr_t attr;
+        rc = pthread_attr_init(&attr);
+        if (!rc) {
+            pthread_t thread;
+            rc = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (!rc) rc = pthread_create(&thread, &attr, pcache_writer, NULL);
+            pthread_attr_destroy(&attr);
+        }
+        if (!rc) {
+            g_writer_stopping = 0;
+            g_writer_alive = 1;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rc ? -1 : 0;
+}
+
+static int enqueue_owned(const char *dir, const uint8_t identity[32], uint8_t *bytes, size_t len,
+                         s2a_direct_encode_result_fn encode) {
+    if (!dir || !*dir || strlen(dir) >= PCACHE_PATH || !identity || !bytes || !len || len > PCACHE_MAX_PAYLOAD)
+        return -1;
+    pthread_mutex_lock(&g_lock);
+    if (!g_writer_alive || g_writer_stopping) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    int duplicate = same_job(&g_current, dir, identity);
+    for (unsigned i = 0; !duplicate && i < g_queued; i++)
+        duplicate = same_job(&g_queue[(g_head + i) % PCACHE_QUEUE_MAX], dir, identity);
+    if (duplicate) {
+        pthread_mutex_unlock(&g_lock);
+        free(bytes);
+        return 0;
+    }
+    if (g_queued == PCACHE_QUEUE_MAX || len > PCACHE_MAX_PAYLOAD - g_write_bytes) {
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+    struct pcache_job *job = &g_queue[(g_head + g_queued) % PCACHE_QUEUE_MAX];
+    strcpy(job->dir, dir);   // 路径长度在入队前核对。
+    memcpy(job->identity, identity, sizeof job->identity);
+    job->bytes = bytes;
+    job->len = len;
+    job->encode = encode;
+    g_queued++;
+    g_write_bytes += len;
+    pthread_cond_signal(&g_work);
+    pthread_mutex_unlock(&g_lock);
+    return 0;
+}
+
+int s2a_program_cache_store_owned(const char *dir, const uint8_t identity[32],
+                                  uint8_t *bytes, size_t len) {
+    return enqueue_owned(dir, identity, bytes, len, NULL);
+}
+
+int s2a_program_cache_store_live_owned(const char *dir, const uint8_t identity[32],
+    uint8_t *bytes, size_t len, s2a_direct_encode_result_fn encode) {
+    struct nvk_result_value frame;
+    if (!encode || !bytes || rv_frame(bytes, len, &frame)) return -1;
+    return enqueue_owned(dir, identity, bytes, len, encode);
 }
 
 int s2a_program_cache_store_async(const char *dir, const uint8_t identity[32],
                                   const uint8_t *bytes, size_t len) {
     if (!dir || !*dir || !identity || !bytes || !len || len > PCACHE_MAX_PAYLOAD) return -1;
-    struct pcache_job *j = calloc(1, sizeof *j);
-    if (!j) return -1;
-    j->dir = strdup(dir);
-    j->bytes = malloc(len);
-    if (!j->dir || !j->bytes) { free(j->dir); free(j->bytes); free(j); return -1; }
-    memcpy(j->identity, identity, 32);
-    memcpy(j->bytes, bytes, len);
-    j->len = len;
-    pthread_mutex_lock(&g_lock);
-    g_pending++;
-    pthread_mutex_unlock(&g_lock);
-    pthread_t t;
-    if (pthread_create(&t, NULL, pcache_writer, j) != 0) {
-        pthread_mutex_lock(&g_lock);
-        if (g_pending) g_pending--;
-        if (!g_pending) pthread_cond_broadcast(&g_idle);
-        pthread_mutex_unlock(&g_lock);
-        free(j->bytes); free(j->dir); free(j);
-        return -1;
-    }
-    pthread_detach(t);
-    return 0;
+    uint8_t *copy = malloc(len);
+    if (!copy) return -1;
+    memcpy(copy, bytes, len);
+    int rc = s2a_program_cache_store_owned(dir, identity, copy, len);
+    if (rc) free(copy);
+    return rc;
 }
 
-int s2a_program_cache_drain(uint32_t timeout_ms) {
+static int wait_writer(uint32_t timeout_ms, int stop) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += timeout_ms / 1000u;
     deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     pthread_mutex_lock(&g_lock);
-    int rc = 0;
-    while (g_pending) {
-        if (pthread_cond_timedwait(&g_idle, &g_lock, &deadline) == ETIMEDOUT) { rc = g_pending ? -1 : 0; break; }
+    if (stop && g_writer_alive) {
+        g_writer_stopping = 1;
+        pthread_cond_signal(&g_work);
     }
+    while (stop ? g_writer_alive : g_write_bytes != 0)
+        if (pthread_cond_timedwait(&g_idle, &g_lock, &deadline) == ETIMEDOUT) break;
+    const int busy = stop ? g_writer_alive : g_write_bytes != 0;
     pthread_mutex_unlock(&g_lock);
-    return rc;
+    return busy ? -1 : 0;
 }
+
+int s2a_program_cache_drain(uint32_t timeout_ms) { return wait_writer(timeout_ms, 0); }
+int s2a_program_cache_stop(uint32_t timeout_ms) { return wait_writer(timeout_ms, 1); }

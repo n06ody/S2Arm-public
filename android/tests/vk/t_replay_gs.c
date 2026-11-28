@@ -13,6 +13,8 @@
 #include "direct/s2a_direct.h"
 #include "direct/sha256.h"
 #include "direct/jv.h"
+#include "direct/program_cache.h"
+#include "gfx_plat/nvk_session.h"
 #include "compiler_cli.h"
 #include <spawn.h>
 #include <sys/wait.h>
@@ -22,6 +24,10 @@ static uint8_t *request_data, *result_data, *profile_data;
 static size_t request_len, result_len, profile_len;
 static char closure[128]; static int compile_calls;
 static const char *case_dir;
+static uint8_t *binary_data;
+static size_t binary_len;
+static int binary_calls, legacy_encodes;
+static int binary_registered;
 static prog_t guest_program; static uint8_t guest_keys[6][8], guest_stages[6];
 static p_set_rt target; static tex_t target_tex; static nvn_gpu_view target_view;
 int g_s2a_logfd = 2; int s2a_nvn_rast_flip;
@@ -43,6 +49,11 @@ int rp_pool_find(uint64_t a, uint64_t n, const uint8_t **m, uint64_t *s) { (void
 // 本夹具没有存储缓冲声明；空存储语义由真实 rp_buf GPU 用例验证。
 nvn_gpu_buf rp_buf_for_null_storage(void) { return NULL; }
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t a, uint64_t n, nvn_gpu_buf *b, uint64_t *o) { (void)c; (void)a; (void)n; (void)b; (void)o; return 0; }
+// 本独立夹具没有 guest 缓冲池，不能读取间接指针。
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value) {
+    (void)b; (void)off; (void)addr; (void)value;
+    return 0;
+}
 int rp_buf_gpu_pending(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; }   // 本夹具没有 GPU 写回：恒无还没落地的写
 // #958 批量解析：逐段转给上面的单段替身（口径一致）
 int rp_buf_resolve_multi(int n, const uint64_t *a, const uint64_t *l, nvn_gpu_buf *b, uint64_t *o, unsigned char *ok) {
@@ -114,6 +125,27 @@ static int32_t compiled_result(uint64_t session, uint64_t generation, s2a_direct
     s2a_direct_bytes out = {compiled, n}; int32_t rc = emit(sink, out); free(compiled); return rc;
 }
 s2a_direct_compile_fn s2a_direct_bound_compile_any(void) { return compiled_result; }
+static int32_t compiled_binary(uint64_t session, uint64_t generation, s2a_direct_bytes req,
+    s2a_direct_emit_fn emit, void *sink) {
+    if (session != 4 || generation != 6 || req.bytes != request_len || memcmp(req.data, request_data, request_len)) {
+        fprintf(stderr, "FAIL: binary production request differs from real compiler input\n");
+        return S2A_DIRECT_RES_IDENTITY;
+    }
+    binary_calls++;
+    return emit(sink, (s2a_direct_bytes){binary_data, binary_len});
+}
+
+// Managed binary -> canonical JSON equality is checked at the real provider.
+static int32_t encode_legacy(s2a_direct_bytes binary, s2a_direct_emit_fn emit, void *sink) {
+    if (binary.bytes != binary_len || memcmp(binary.data, binary_data, binary_len)) return S2A_DIRECT_RES_IDENTITY;
+    legacy_encodes++;
+    return emit(sink, (s2a_direct_bytes){result_data, result_len});
+}
+
+struct s2a_direct_live_compiler s2a_direct_bound_binary_compiler(void *context) {
+    if (context != &guest_program || !binary_registered) return (struct s2a_direct_live_compiler){0};
+    return (struct s2a_direct_live_compiler){compiled_binary, encode_legacy};
+}
 static void put32(uint8_t *p, uint32_t n) { p[0] = n; p[1] = n >> 8; p[2] = n >> 16; p[3] = n >> 24; }
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
@@ -121,6 +153,16 @@ int main(int argc, char **argv) {
     char path[1024];
 #define READ(dst, len, suffix) do { snprintf(path, sizeof path, "%s/%s", argv[1], suffix); dst = read_file(path, &len); if (!dst) return 2; } while (0)
     READ(request_data, request_len, "request.json"); READ(result_data, result_len, "compiled/program.json"); READ(profile_data, profile_len, "profile.json");
+    const int binary = getenv("S2A_TEST_LIVE_RESULT_BINARY") != NULL;
+    if (binary) {
+        READ(binary_data, binary_len, "compiled/program.live");
+        snprintf(path, sizeof path, "%s/live-cache", case_dir);
+        setenv("S2A_DIRECT_CACHE_DIR", path, 1);
+    }
+    CHECK(nvk_shader_open() == 0, "shader session opens");
+    // Android registers the managed callbacks between Prepare and Activate.
+    binary_registered = binary;
+    nvk_shader_activate_codec(&guest_program);
     struct s2a_jv root = {(const char *)request_data, request_len}, val;
     if (s2a_jv_obj_find(root, "translatorClosure", &val) || s2a_jv_str(val, closure, sizeof closure)) return 2;
     memset(&guest_program, 0, sizeof guest_program); guest_program.magic = MAGIC('P','R','O','G'); guest_program.serial = 101; guest_program.nstage = 3;
@@ -151,11 +193,17 @@ int main(int argc, char **argv) {
     rp_draw(cmd, &draw, NULL, &draw); nvn_gpu_pass_end(cmd); nvn_gpu_copy_tex_buf(cmd, tex, 0, 0, NULL, rb, 0, 16, 64);
     nvn_gpu_err e = {0}; nvn_gpu_rc r = nvn_gpu_cmd_commit(cmd, 1, on_done, NULL, &e); CHECK(OK(r), "core commit %d %s", r.code, e.why);
     r = nvn_gpu_fence_wait(1, 5000000000ull, &e); CHECK(OK(r), "core wait %d %s", r.code, e.why);
-    uint64_t drawn = 0, skipped = 0; rp_draw_stats(&drawn, &skipped); CHECK(compile_calls == 1 && drawn == 1 && skipped == 0, "one exact request and one replay draw");
+    uint64_t drawn = 0, skipped = 0; rp_draw_stats(&drawn, &skipped);
+    CHECK(compile_calls == !binary && binary_calls == binary && drawn == 1 && skipped == 0, "one exact request in the selected transport and one replay draw");
+    if (binary) {
+        CHECK(!s2a_program_cache_drain(5000) && legacy_encodes == 1 && s2a_program_cache_stores() == 1,
+              "one background legacy program published");
+        printf("GS live binary transport: %d compile, %d legacy encode\n", binary_calls, legacy_encodes);
+    }
     for (int i = 0; i < 16; i++) { const uint8_t green[4] = {0,255,0,255}; const uint8_t *v = buf_cpu(rb) + 4*i;
         CHECK(!memcmp(v, green, 4), "core pixel %d got %u,%u,%u,%u", i, v[0],v[1],v[2],v[3]); }
     rp_shader_reset(); nvn_gpu_view_release(target_view); nvn_gpu_tex_release(tex); nvn_gpu_buf_release(rb, NULL, NULL);
     CHECK(OK(nvn_gpu_close(5000000000ull, &e)), "close core session"); s2a_vk_device_destroy(&g_dev, 1);
-    free(request_data); free(result_data); free(profile_data);
+    free(request_data); free(result_data); free(profile_data); free(binary_data);
     printf("core Maxwell GS: 16 pixels, failures=%d\n", g_fail); return g_fail ? 1 : 0;
 }

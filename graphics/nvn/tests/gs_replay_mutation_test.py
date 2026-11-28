@@ -8,8 +8,8 @@ OUT = ROOT / 'build/gs-replay-mutations'
 OUT.mkdir(parents=True, exist_ok=True)
 source = (ROOT/'graphics/nvn/replay/rp_draw.c').read_text()
 mutations = [
-    ('gs-dirty', 'int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2];',
-     'int args_dirty = rp_args_dirty[0] || rp_args_dirty[1];', 'g_resolves == 2'),
+    ('gs-dirty', 'int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[2] || rp_args_dirty[3] || rp_args_dirty[4];',
+     'int args_dirty = rp_args_dirty[0] || rp_args_dirty[1] || rp_args_dirty[3] || rp_args_dirty[4];', 'g_resolves == 2'),
     ('gs-fs-bind', 'st == 5 ? NVN_GPU_SH_CS : (nvn_gpu_stage)st',
      'st == 5 ? NVN_GPU_SH_CS : st == 2 ? NVN_GPU_SH_FS : (nvn_gpu_stage)st', 'g_bind_calls[NVN_GPU_SH_GS] == 2'),
     ('gs-pipeline', 'for (int st = 0; st < RP_PROG_STAGES; st++) pd.st[st].sh = g_prog->sh[st];',
@@ -24,8 +24,8 @@ mutations = [
     # 带索引的展开同样按 GL 序；换成原生序必须红在带索引的序列上
     ('gs-tstrip-indexed', 'd[o++] = IXG(k + (i & 1)); d[o++] = IXG(k + 1 - (i & 1)); d[o++] = IXG(k + 2);',
      'd[o++] = IXG(k); d[o++] = IXG(k + 1 + (i & 1)); d[o++] = IXG(k + 2 - (i & 1));', 'g_last_da.count == 9 && !memcmp'),
-    # 邻接图元（10..13）放行；退回只认 0..9 必须红在邻接用例上
-    ('gs-adjacency', 'if (!(prim <= 13))', 'if (!(prim <= 9))', 'adjacency_without_geometry_feature") == 1'),
+    # 邻接图元（10..13）与细分补丁（14）放行；退回只认 0..9 必须红在邻接用例上
+    ('gs-adjacency', 'if (!(prim <= 14))', 'if (!(prim <= 9))', 'adjacency_without_geometry_feature") == 1'),
 ]
 sources = ['graphics/nvn/tests/t_nvn_replay.c','graphics/nvn/tests/nvn_clear_view_unused.c',
            *('graphics/nvn/replay/'+x for x in ('rp_exec.c','rp_copy_t2b.c','rp_clear_tex.c','rp_draw_tex.c','rp_state.c','rp_entry.c','rp_res.c','rp_buf.c','rp_pass.c','rp_present.c','nvn_unimpl.c')),

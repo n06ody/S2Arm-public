@@ -83,6 +83,18 @@ typedef int32_t (*s2a_direct_emit_fn)(void *sink, s2a_direct_bytes result);
 typedef int32_t (*s2a_direct_compile_fn)(uint64_t session, uint64_t generation,
     s2a_direct_bytes request, s2a_direct_emit_fn emit, void *sink);
 
+typedef int32_t (*s2a_direct_encode_result_fn)(s2a_direct_bytes result,
+    s2a_direct_emit_fn emit, void *sink);
+struct s2a_direct_live_compiler {
+    s2a_direct_compile_fn compile;
+    s2a_direct_encode_result_fn encode_legacy;
+};
+// 可选二进制 provider。与已登记的 JSON 入口同会话，在 Activate 前补登记。
+int32_t s2a_direct_bind_binary_compiler_v1(void *context, s2a_direct_compile_fn compile,
+    s2a_direct_encode_result_fn encode_legacy);
+// 仅返回指定会话已冻结的二进制入口。没有登记时两个指针均为空。
+struct s2a_direct_live_compiler s2a_direct_bound_binary_compiler(void *context);
+
 // 私有 C 导出：NativeAOT 同 DSO 直调；context 必须属于已冻结 session。
 // 同一 context 重复登记同一指针是幂等的；登记成别的指针返回 S2A_DIRECT_RES_IDENTITY，
 // 释放登记用 unbind（会话销毁时由 provider 调）。

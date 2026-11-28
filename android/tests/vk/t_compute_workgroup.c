@@ -160,7 +160,7 @@ static uint32_t two_entries[] = {
     INST(SpvOpLabel, 2), 6, INST(SpvOpReturn, 1), INST(SpvOpFunctionEnd, 1),
 };
 
-static void guard_edges(const char *dir) {
+static void guard_edges(const char *dir, int maint4_enabled) {
     run_case("entry_missing", two_entries, sizeof two_entries, "absent", "entry not found", 0);
     run_case("entry_too_long", two_entries, sizeof two_entries,
              "entry_name_exceeding_the_backend_storage_capacity", "entry name exceeds", 0);
@@ -178,7 +178,8 @@ static void guard_edges(const char *dir) {
             break;
         }
         const char *names[] = {"zero", "large_dimension", "malformed_length", "local_size_id"};
-        const char *reasons[] = {"LocalSize[0]=0", "maxComputeWorkGroupSize", "malformed instruction length", "maintenance4"};
+        const char *reasons[] = {"LocalSize[0]=0", "maxComputeWorkGroupSize", "malformed instruction length",
+                                 maint4_enabled ? "LocalSizeId" : "maintenance4"};
         run_case(names[mode], words, sizeof words, "small", reasons[mode], 0);
     }
     // A legal default expression (IAdd 1 1) instead of a scalar SpecConstant.
@@ -358,7 +359,7 @@ int main(int argc, char **argv) {
     two_entries[0] = SpvMagicNumber;
     run_case("entry_small", two_entries, sizeof two_entries, "small", NULL, 0);
     run_case("entry_large", two_entries, sizeof two_entries, "large", "maxComputeWorkGroupInvocations", 0);
-    if (argc == 3) guard_edges(argv[1]);
+    if (argc == 3) guard_edges(argv[1], device.maintenance4_enabled);
     GPU(nvn_gpu_close(5000000000ull, &error)); REQUIRE(!s2a_vk_device_destroy(&device, 1));
     printf("workgroup cases=%u failures=%u\n", cases, failures);
     return failures ? 1 : 0;

@@ -42,6 +42,8 @@ static class SwshXlate
     sealed class Accessor : IGpuAccessor
     {
         public bool QueryHostSupportsTextureSizeTable() => true;
+        public bool QueryS2ALateStorageBufferAlignment() => _job["storage_window_mask"] is JsonValue value && (bool)value;
+        public bool QueryHasUnalignedStorageBuffer() => QueryS2ALateStorageBufferAlignment();
         readonly byte[] _code; readonly JsonObject _job; int _binding = 1; public readonly List<string> Notes = new();
         // S2Arm 11-05: the translator's own warnings (Ryujinx ILogger.Log: "Invalid reduction type", forms it drops) go into the shader's notes, so a build shows what a
         //   translation lost (they were silent: 398 float reductions in 33 of Zelda: Ocarina of Time's shaders disappeared without a trace)

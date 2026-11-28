@@ -5,6 +5,7 @@ struct buf_alias { uint64_t lo, hi, phys, pool; };
 static struct buf_alias *aliases;
 static size_t alias_count, alias_cap;
 static int aliases_live;
+static uint64_t alias_epoch;
 static size_t alias_lower_bound(uint64_t addr) {
     size_t lo = 0, hi = alias_count;
     while (lo < hi) {
@@ -80,6 +81,7 @@ int rp_buf_alias_set(uint64_t at, uint64_t len, uint64_t phys) {
         struct buf_alias a = {at, end, phys, (uintptr_t)pool};
         alias_dirty(&a, at, end);
     }
+    if (rp_buf_land_guard_active()) alias_epoch++;
     __atomic_store_n(&aliases_live, alias_count != 0, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_bmu);
     return 1;

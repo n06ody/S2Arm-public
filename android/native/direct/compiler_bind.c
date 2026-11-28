@@ -15,6 +15,7 @@
 struct bound_entry {
     void *context;
     s2a_direct_compile_fn compile;
+    struct s2a_direct_live_compiler binary;
     int frozen;    // Activate 之后置位；当前策略冻结前后都不接受换指针
 };
 
@@ -52,6 +53,36 @@ int32_t s2a_direct_bind_compiler_v1(void *context, s2a_direct_compile_fn compile
     return S2A_DIRECT_RES_INTERNAL;   // 表满：宁可报错，也不覆盖别的会话
 }
 
+int32_t s2a_direct_bind_binary_compiler_v1(void *context, s2a_direct_compile_fn compile,
+    s2a_direct_encode_result_fn encode_legacy) {
+    if (!context || !compile || !encode_legacy) return S2A_DIRECT_RES_ARGUMENT;
+    pthread_mutex_lock(&g_lock);
+    struct bound_entry *entry = find_locked(context);
+    int32_t rc = S2A_DIRECT_RES_ARGUMENT;
+    if (entry) {
+        if (entry->binary.compile == compile && entry->binary.encode_legacy == encode_legacy)
+            rc = S2A_DIRECT_RES_OK;
+        else if (entry->frozen || entry->binary.compile)
+            rc = S2A_DIRECT_RES_IDENTITY;
+        else {
+            entry->binary = (struct s2a_direct_live_compiler){compile, encode_legacy};
+            rc = S2A_DIRECT_RES_OK;
+        }
+    }
+    pthread_mutex_unlock(&g_lock);
+    return rc;
+}
+
+struct s2a_direct_live_compiler s2a_direct_bound_binary_compiler(void *context) {
+    struct s2a_direct_live_compiler found = {0};
+    if (!context) return found;
+    pthread_mutex_lock(&g_lock);
+    struct bound_entry *entry = find_locked(context);
+    if (entry && entry->frozen) found = entry->binary;
+    pthread_mutex_unlock(&g_lock);
+    return found;
+}
+
 int32_t s2a_direct_freeze_compiler_v1(void *context) {
     if (!context) return S2A_DIRECT_RES_ARGUMENT;
     pthread_mutex_lock(&g_lock);
@@ -70,9 +101,7 @@ int32_t s2a_direct_unbind_compiler_v1(void *context) {
     pthread_mutex_lock(&g_lock);
     struct bound_entry *entry = find_locked(context);
     if (entry) {
-        entry->context = NULL;
-        entry->compile = NULL;
-        entry->frozen = 0;
+        memset(entry, 0, sizeof *entry);
     }
     pthread_mutex_unlock(&g_lock);
     return S2A_DIRECT_RES_OK;

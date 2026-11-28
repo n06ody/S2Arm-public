@@ -8,6 +8,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "s2a_direct.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,12 +48,22 @@ int s2a_program_cache_probe(const char *dir, const uint8_t identity[32],
 int s2a_program_cache_store(const char *dir, const uint8_t identity[32],
                             const uint8_t *bytes, size_t len, char *why, size_t why_size);
 
-// 方案 §5.5.2 第 5 条：当前绘制完成不等待磁盘写入。内部复制一份字节，起一次性分离线程写。
-// 复制失败返回 -1；写盘失败只记 s2a_program_cache_failures()，不影响已经可用的内存结果。
+// 会话启动与停局管理。提交线程只入队，不创建线程或等磁盘。
+int s2a_program_cache_start(void);
+int s2a_program_cache_stop(uint32_t timeout_ms);
+
+// 成功后转交 bytes 所有权（同身份已在写入或排队时释放副本）。
+// 拒收保留调用方所有权。缓存不可写或队列满不影响内存里的程序。
+int s2a_program_cache_store_owned(const char *dir, const uint8_t identity[32],
+                                  uint8_t *bytes, size_t len);
 int s2a_program_cache_store_async(const char *dir, const uint8_t identity[32],
                                   const uint8_t *bytes, size_t len);
 
-// 等所有在途异步写结束；超时返回 -1（仍在途）。Stop 用它把写盘收干净。
+// 二进制帧在同一个 writer 上物化为旧 JSON。所有权和拒收约定同 store_owned。
+int s2a_program_cache_store_live_owned(const char *dir, const uint8_t identity[32],
+    uint8_t *bytes, size_t len, s2a_direct_encode_result_fn encode);
+
+// 等已接受的异步写结束；超时返回 -1（仍在途）。
 int s2a_program_cache_drain(uint32_t timeout_ms);
 
 uint64_t s2a_program_cache_hits(void);

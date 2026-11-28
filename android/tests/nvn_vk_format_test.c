@@ -203,6 +203,60 @@ int main(void) {
                rc != 0 ? "ok" : "FAIL");
         if (rc == 0) bad++;
     }
+    // bc_decoded 异格式视图解析（含 RGBA8/R8/RG8/RGBA16F 计算解码存储与 ASTC 4x4 转码存储）：
+    {
+        struct { VkFormat stor; uint32_t tex, view; VkFormat want; const char *name; } allow[] = {
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGB_DXT1, NVN_FORMAT_RGB_DXT1_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC1_RGB->SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGB_DXT1_SRGB, NVN_FORMAT_RGB_DXT1, VK_FORMAT_R8G8B8A8_UNORM, "BC1_RGB_SRGB->UNORM" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_DXT1_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC1_RGBA->SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1_SRGB, NVN_FORMAT_RGBA_DXT1, VK_FORMAT_R8G8B8A8_UNORM, "BC1_RGBA_SRGB->UNORM" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGB_DXT1_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC1_RGBA->RGB_SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT3, NVN_FORMAT_RGBA_DXT3_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC2->SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT3_SRGB, NVN_FORMAT_RGBA_DXT3, VK_FORMAT_R8G8B8A8_UNORM, "BC2_SRGB->UNORM" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT5, NVN_FORMAT_RGBA_DXT5_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC3->SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT5_SRGB, NVN_FORMAT_RGBA_DXT5, VK_FORMAT_R8G8B8A8_UNORM, "BC3_SRGB->UNORM" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_BPTC_UNORM, NVN_FORMAT_BPTC_UNORM_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC7->SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_BPTC_UNORM_SRGB, NVN_FORMAT_BPTC_UNORM, VK_FORMAT_R8G8B8A8_UNORM, "BC7_SRGB->UNORM" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA8_SRGB, VK_FORMAT_R8G8B8A8_SRGB, "BC1->RGBA8_SRGB" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_BGRA8, VK_FORMAT_B8G8R8A8_UNORM, "BC1->BGRA8" },
+            { VK_FORMAT_R8_UNORM, NVN_FORMAT_RGTC1_UNORM, NVN_FORMAT_R8, VK_FORMAT_R8_UNORM, "BC4->R8" },
+            { VK_FORMAT_R8G8_UNORM, NVN_FORMAT_RGTC2_UNORM, NVN_FORMAT_RG8, VK_FORMAT_R8G8_UNORM, "BC5->RG8" },
+            { VK_FORMAT_R16G16B16A16_SFLOAT, NVN_FORMAT_BPTC_SFLOAT, NVN_FORMAT_RGBA16F, VK_FORMAT_R16G16B16A16_SFLOAT, "BC6H->RGBA16F" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_DXT1_SRGB, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, "ASTC_BC1->SRGB" },
+            { VK_FORMAT_ASTC_4x4_SRGB_BLOCK, NVN_FORMAT_RGBA_DXT1_SRGB, NVN_FORMAT_RGBA_DXT1, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, "ASTC_BC1_SRGB->UNORM" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGB_DXT1_SRGB, VK_FORMAT_ASTC_4x4_SRGB_BLOCK, "ASTC_BC1->RGB_SRGB" },
+        };
+        for (unsigned i = 0; i < sizeof allow / sizeof allow[0]; i++) {
+            why[0] = 0; out = VK_FORMAT_UNDEFINED;
+            int rc = nvn_vk_bc_decoded_view_ok(allow[i].stor, allow[i].tex, allow[i].view, &out, why, sizeof why);
+            printf("bc_decoded allow %-20s -> rc %d out %d %s\n", allow[i].name, rc, (int)out,
+                   (rc == 0 && out == allow[i].want) ? "ok" : "FAIL");
+            if (rc != 0 || out != allow[i].want) bad++;
+        }
+        struct { VkFormat stor; uint32_t tex, view; const char *name; } deny[] = {
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGB_DXT1, NVN_FORMAT_RGBA_DXT1, "BC1_RGB->RGBA" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_DXT3, "BC1->BC2" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_BPTC_UNORM, "BC1->BC7" },
+            { VK_FORMAT_R8_UNORM, NVN_FORMAT_RGTC1_UNORM, NVN_FORMAT_RGTC1_SNORM, "BC4_UNORM->SNORM" },
+            { VK_FORMAT_R8G8_UNORM, NVN_FORMAT_RGTC2_UNORM, NVN_FORMAT_RGTC2_SNORM, "BC5_UNORM->SNORM" },
+            { VK_FORMAT_R16G16B16A16_SFLOAT, NVN_FORMAT_BPTC_SFLOAT, NVN_FORMAT_BPTC_UFLOAT, "BC6H_SFLOAT->UFLOAT" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA16F, "BC1->RGBA16F" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_R8, "BC1->R8" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGB8, "BC1->RGB8_expand" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_DEPTH32F, "BC1->DEPTH32F" },
+            { VK_FORMAT_R8G8B8A8_UNORM, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_ASTC_4x4, "BC1->ASTC4x4" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA8_SRGB, "ASTC_BC1->RGBA8_SRGB" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_DXT5, "ASTC_BC1->BC3" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_ASTC_4x4, "ASTC_BC1->ASTC4x4" },
+            { VK_FORMAT_ASTC_4x4_UNORM_BLOCK, NVN_FORMAT_RGBA_DXT1, NVN_FORMAT_RGBA_ASTC_8x8, "ASTC_BC1->ASTC8x8" },
+        };
+        for (unsigned i = 0; i < sizeof deny / sizeof deny[0]; i++) {
+            why[0] = 0; out = VK_FORMAT_UNDEFINED;
+            int rc = nvn_vk_bc_decoded_view_ok(deny[i].stor, deny[i].tex, deny[i].view, &out, why, sizeof why);
+            printf("bc_decoded deny  %-20s -> rc %d (%s) %s\n", deny[i].name, rc, why, rc != 0 ? "ok" : "FAIL");
+            if (rc == 0) bad++;
+        }
+    }
     // #975：16 位打包格式的贴图映射。期望值不用被测表：NVN 位段按「低位起」手写，Vulkan 各 PACK16 格式的
     // 分量位段按规范手写（首名分量在最高位），逐分量核「NVN 的 c 分量 = 所选 Vulkan 格式第 map[c] 个分量」位段相同。
     // 两种路由都核：mask 0（全精确格式）与 mask 全 1（有退回的都走退回 + 通道补偿）。
@@ -324,6 +378,16 @@ int main(void) {
         { NVN_FORMAT_A1BGR5,      {0x00,0xF8,0,0},       {1.0f, 0.0f, 0.0f, 0.0f}, 2, "A1BGR5 r" },
         { NVN_FORMAT_A1BGR5,      {0x02,0x00,0,0},       {0.0f, 0.0f, 1.0f / 31.0f, 0.0f}, 2, "A1BGR5 b lsb" },
         { NVN_FORMAT_RGB9E5F,     {0x00,0x01,0x01,0x79}, {0.5f, 0.25f, 0.125f, 1.0f}, 4, "RGB9E5F" },
+        { NVN_FORMAT_RGB8,       {0,128,255}, {0.0f, 128.0f/255.0f, 1.0f, 1.0f}, 3, "RGB8" },
+        { NVN_FORMAT_RGB8SN,     {0x80,0x01,0x7f}, {-1.0f, 1.0f/127.0f, 1.0f, 1.0f}, 3, "RGB8SN" },
+        { NVN_FORMAT_RGB8_UI2F,  {0,128,255}, {0.0f, 128.0f, 255.0f, 1.0f}, 3, "RGB8_UI2F" },
+        { NVN_FORMAT_RGB8_I2F,   {0x80,0x01,0x7f}, {-128.0f, 1.0f, 127.0f, 1.0f}, 3, "RGB8_I2F" },
+        { NVN_FORMAT_RGB16F,     {1,0, 0,0xbc, 0,0x80}, {0x1p-24f, -1.0f, -0.0f, 1.0f}, 6, "RGB16F" },
+        { NVN_FORMAT_RGB16,      {0,0, 1,0, 0xff,0xff}, {0.0f, 1.0f/65535.0f, 1.0f, 1.0f}, 6, "RGB16" },
+        { NVN_FORMAT_RGB16SN,    {0,0x80, 1,0, 0xff,0x7f}, {-1.0f, 1.0f/32767.0f, 1.0f, 1.0f}, 6, "RGB16SN" },
+        { NVN_FORMAT_RGB16_UI2F, {0,0x80, 1,0, 0xff,0xff}, {32768.0f, 1.0f, 65535.0f, 1.0f}, 6, "RGB16_UI2F" },
+        { NVN_FORMAT_RGB16_I2F,  {0,0x80, 1,0, 0xff,0x7f}, {-32768.0f, 1.0f, 32767.0f, 1.0f}, 6, "RGB16_I2F" },
+        { NVN_FORMAT_RGB32F,     {0,0,0,0xbf, 0,0,0x00,0x40, 0,0,0,0x80}, {-0.5f, 2.0f, -0.0f, 1.0f}, 12, "RGB32F" },
         // 32 位 UI2F/I2F：0 / 最大值 / 负数 / 2^24 以上精度边界，逐位对拍。
         { NVN_FORMAT_R32_UI2F,    {0,0,0,0},           {0.0f, 0.0f, 0.0f, 1.0f}, 4, "R32_UI2F 0" },
         { NVN_FORMAT_R32_UI2F,    {0xC8,0,0,0},        {200.0f, 0.0f, 0.0f, 1.0f}, 4, "R32_UI2F 200" },

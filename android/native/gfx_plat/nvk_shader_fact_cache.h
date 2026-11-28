@@ -76,16 +76,18 @@ static int fact_cache_hash(const struct s2a_input_identity *id, const uint32_t m
 }
 
 static int fact_cache_mask(const uint8_t *bytes, size_t len, const struct rp_prog *pg, uint32_t mask[4]) {
-    struct s2a_jv doc = {(const char *)bytes, len}, content, deps, v;
+    struct nvk_result_value doc = {(const char *)bytes, len, 0}, content, deps, v;
     char text[128];
     memset(mask, 0, 4 * sizeof *mask);
-    if (s2a_jv_obj_find(doc, "content", &content) || s2a_jv_obj_find(content, "contract", &v) ||
-        s2a_jv_str(v, text, sizeof text) || strcmp(text, "s2a-direct-program-content-v1") ||
-        s2a_jv_obj_find(content, "dependencies", &deps) || !s2a_jv_is_array(deps)) return 0;
+    // The program parser has already validated the successful live result.
+    if ((rv_is_binary(bytes, len) && rv_frame(bytes, len, &doc)) ||
+        rv_obj_find(doc, "content", &content) || rv_obj_find(content, "contract", &v) ||
+        rv_str(v, text, sizeof text) || strcmp(text, "s2a-direct-program-content-v1") ||
+        rv_obj_find(content, "dependencies", &deps) || !rv_is_array(deps)) return 0;
     /* Reflected resource use is included even if a future translator elides a
      * redundant query. Indirect/array resources need a separate contract. */
     for (unsigned st = 0; st < 3; st++) for (unsigned i = 0; i < pg->nent[st]; i++) {
-        const nvn_gpu_layout_ent *e = &pg->ent[st][i];
+        const nvn_gpu_layout_ent *e = &rp_prog_ent(pg, st)[i];
         if (e->src_kind == NVN_RB_TEX) {
             if (e->count != 1 || e->src_reg >= 32 || e->src_reg2 != UINT16_MAX) return 0;
             mask[st] |= 1u << e->src_reg;
@@ -93,25 +95,24 @@ static int fact_cache_mask(const uint8_t *bytes, size_t len, const struct rp_pro
     }
     /* Walk once: arr_item for every query would repeatedly scan long code-read
      * traces. No dependency string or game code is retained by this cache. */
-    const char *p = s2a_jv_ws(deps.p + 1, deps.p + deps.n), *end = deps.p + deps.n;
+    size_t offset = 0;
     unsigned code_reads = 0;
-    while (p < end && *p != ']') {
-        const char *next;
-        if (s2a_jv_scan(p, end, &next)) return 0;
-        struct s2a_jv item = {p, (size_t)(next - p)};
-        if (s2a_jv_obj_find(item, "method", &v) || s2a_jv_str(v, text, sizeof text)) return 0;
+    int more;
+    struct nvk_result_value item;
+    while ((more = rv_array_next(deps, &offset, &item)) > 0) {
+        if (rv_obj_find(item, "method", &v) || rv_str(v, text, sizeof text)) return 0;
         if (!strcmp(text, "GetCode")) code_reads++;
         if (!strcmp(text, "QueryConstantBufferUse")) {
-            if (s2a_jv_obj_find(item, "arguments", &v) || s2a_jv_str(v, text, sizeof text)) return 0;
+            if (rv_obj_find(item, "arguments", &v) || rv_str(v, text, sizeof text)) return 0;
             int st = !strcmp(text, "stage=vs") ? 0 : !strcmp(text, "stage=fs") ? 1 : !strcmp(text, "stage=gs") ? 2 : -1;
             if (st < 0) return 0;
             mask[3] |= 1u << st;
         }
         /* The compile named a handle outside the combined table (found or unbound). High-slot facts are in no key, so such a
          * program must not be reused for identities that differ in them; it keeps the exact identity path. */
-        if (fact_wide() && !s2a_jv_obj_find(item, "arguments", &v) && !s2a_jv_str(v, text, sizeof text) &&
+        if (fact_wide() && !rv_obj_find(item, "arguments", &v) && !rv_str(v, text, sizeof text) &&
             fact_args_high_handle(text)) return 0;
-        if (s2a_jv_obj_find(item, "source", &v) || s2a_jv_str(v, text, sizeof text)) return 0;
+        if (rv_obj_find(item, "source", &v) || rv_str(v, text, sizeof text)) return 0;
         if (!strncmp(text, "texture-fact:", 13)) {
             char stage[3]; unsigned handle; int cb, consumed = 0;
             if (sscanf(text + 13, "%2[^:]:%u:%d%n", stage, &handle, &cb, &consumed) != 3 ||
@@ -132,11 +133,8 @@ static int fact_cache_mask(const uint8_t *bytes, size_t len, const struct rp_pro
             /* A new source needs an explicit identity contract before reuse. */
             return 0;
         }
-        p = s2a_jv_ws(next, end);
-        if (p < end && *p == ',') p = s2a_jv_ws(p + 1, end);
-        else if (p >= end || *p != ']') return 0;
     }
-    return code_reads && p < end && *p == ']';
+    return code_reads && more == 0;
 }
 
 struct fact_variant {

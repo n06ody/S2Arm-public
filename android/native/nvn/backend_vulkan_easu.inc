@@ -6,6 +6,7 @@
 // 这里只提供「把源图合成到一张颜色附件」的一段录制；交换链创建参数一个字都不动
 // （ci.imageUsage 本来就带 COLOR_ATTACHMENT_BIT）。由 backend_vulkan_wsi.inc 的 present 决定开/关。
 #include "nvn_vk_easu_spv.h"
+#include "nvn_vk_wsi_rotate_spv.h"
 
 // 打包校验用的标记：libs2arm_android.so 里带上这串字符串就要求 APK 带 assets/licenses/easu-fsr1-LICENSE.txt；
 // 不带就不求（见 android/verify-apk.py 的 LICENSE_MARKERS）。
@@ -33,15 +34,17 @@ static int easu_is_bgr(VkFormat f) {
 }
 
 #define EASU_FB_N 8
+enum present_pipe { PRESENT_EASU, PRESENT_ROTATE, PRESENT_PIPE_COUNT };
 static struct {
-    VkShaderModule vs, fs;
+    VkShaderModule vs, fs[PRESENT_PIPE_COUNT];
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
     VkSampler sampler;
     VkRenderPass pass;
-    VkPipeline pipe;
+    VkAttachmentDescription attachment;
+    VkPipeline pipe[PRESENT_PIPE_COUNT];
     VkFormat fmt;
-    int failed;
+    int failed[PRESENT_PIPE_COUNT];
     // 交换链图是按 句柄+代 复用的：换代（重建交换链）时整表作废。
     struct { VkImage img; VkImageView view; VkFramebuffer fb; VkExtent2D ext; uint32_t level; } fb[EASU_FB_N];
     unsigned nfb, nextfb;
@@ -98,9 +101,9 @@ static void easu_close(void) {
     easu_fb_clear_locked();
     if (g_easu_q.pool) vkDestroyQueryPool(g.d, g_easu_q.pool, NULL);
     memset(&g_easu_q, 0, sizeof g_easu_q);
-    if (g_easu.pipe) vkDestroyPipeline(g.d, g_easu.pipe, NULL);
+    for (unsigned i = 0; i < PRESENT_PIPE_COUNT; i++) if (g_easu.pipe[i]) vkDestroyPipeline(g.d, g_easu.pipe[i], NULL);
     if (g_easu.pass) vkDestroyRenderPass(g.d, g_easu.pass, NULL);
-    if (g_easu.fs) vkDestroyShaderModule(g.d, g_easu.fs, NULL);
+    for (unsigned i = 0; i < PRESENT_PIPE_COUNT; i++) if (g_easu.fs[i]) vkDestroyShaderModule(g.d, g_easu.fs[i], NULL);
     if (g_easu.vs) vkDestroyShaderModule(g.d, g_easu.vs, NULL);
     if (g_easu.layout) vkDestroyPipelineLayout(g.d, g_easu.layout, NULL);
     if (g_easu.dsl) vkDestroyDescriptorSetLayout(g.d, g_easu.dsl, NULL);
@@ -118,29 +121,35 @@ static int easu_module(const uint32_t *words, size_t bytes, VkShaderModule *out)
 // 调用者持 g_easu_mu。渲染通道只带一个颜色附件、开时清黑。
 // 注意 LOAD_OP_CLEAR 只作用于渲染区：渲染区之外的边框由调用方先整张清黑。
 // 首末布局都用 COLOR_ATTACHMENT_OPTIMAL：present 自己负责 UNDEFINED→附件、附件→PRESENT。
-static int easu_pipelines_locked(VkFormat fmt) {
-    if (g_easu.failed) return 0;
-    easu_q_init_locked();
-    if (g_easu.pipe && g_easu.fmt == fmt) return 1;
-    if (g_easu.pipe) { vkDestroyPipeline(g.d, g_easu.pipe, NULL); g_easu.pipe = VK_NULL_HANDLE; }
-    if (g_easu.pass) { vkDestroyRenderPass(g.d, g_easu.pass, NULL); g_easu.pass = VK_NULL_HANDLE; }
-    easu_fb_clear_locked();   // 帧缓冲绑在旧通道上
-    if (!g_easu.vs && !easu_module(k_easu_vs, sizeof k_easu_vs, &g_easu.vs)) { g_easu.failed = 1; return 0; }
-    if (!g_easu.fs && !easu_module(k_easu_fs, sizeof k_easu_fs, &g_easu.fs)) { g_easu.failed = 1; return 0; }
+static int easu_pipelines_locked(VkFormat fmt, enum present_pipe mode) {
+    if (g_easu.failed[mode]) return 0;
+    if (mode == PRESENT_EASU) easu_q_init_locked();
+    if (g_easu.fmt == fmt && g_easu.pipe[mode]) return 1;
+    if (g_easu.fmt != fmt) {
+        for (unsigned i = 0; i < PRESENT_PIPE_COUNT; i++) if (g_easu.pipe[i]) {
+            vkDestroyPipeline(g.d, g_easu.pipe[i], NULL); g_easu.pipe[i] = VK_NULL_HANDLE;
+        }
+        easu_fb_clear_locked();   // 帧缓冲绑在旧通道上
+        if (g_easu.pass) { vkDestroyRenderPass(g.d, g_easu.pass, NULL); g_easu.pass = VK_NULL_HANDLE; }
+    }
+    if (!g_easu.vs && !easu_module(k_easu_vs, sizeof k_easu_vs, &g_easu.vs)) { g_easu.failed[mode] = 1; return 0; }
+    const uint32_t *fs = mode == PRESENT_EASU ? k_easu_fs : k_wsi_rotate_fs;
+    const size_t fs_size = mode == PRESENT_EASU ? sizeof k_easu_fs : sizeof k_wsi_rotate_fs;
+    if (!g_easu.fs[mode] && !easu_module(fs, fs_size, &g_easu.fs[mode])) { g_easu.failed[mode] = 1; return 0; }
     if (!g_easu.dsl) {
         VkDescriptorSetLayoutBinding b; memset(&b, 0, sizeof b);
         b.binding = 0; b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; b.descriptorCount = 1;
         b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         VkDescriptorSetLayoutCreateInfo ci; memset(&ci, 0, sizeof ci);
         ci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO; ci.bindingCount = 1; ci.pBindings = &b;
-        if (vkCreateDescriptorSetLayout(g.d, &ci, NULL, &g_easu.dsl) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+        if (vkCreateDescriptorSetLayout(g.d, &ci, NULL, &g_easu.dsl) != VK_SUCCESS) { g_easu.failed[mode] = 1; return 0; }
     }
     if (!g_easu.layout) {
         VkPushConstantRange push = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(easu_push)};
         VkPipelineLayoutCreateInfo ci; memset(&ci, 0, sizeof ci);
         ci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO; ci.setLayoutCount = 1; ci.pSetLayouts = &g_easu.dsl;
         ci.pushConstantRangeCount = 1; ci.pPushConstantRanges = &push;
-        if (vkCreatePipelineLayout(g.d, &ci, NULL, &g_easu.layout) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+        if (vkCreatePipelineLayout(g.d, &ci, NULL, &g_easu.layout) != VK_SUCCESS) { g_easu.failed[mode] = 1; return 0; }
     }
     if (!g_easu.sampler) {
         // textureGather 不看过滤方式；地址模式要 CLAMP_TO_EDGE，边界按边缘像素延拓。
@@ -148,7 +157,7 @@ static int easu_pipelines_locked(VkFormat fmt) {
         ci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         ci.magFilter = ci.minFilter = VK_FILTER_NEAREST; ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ci.addressModeU = ci.addressModeV = ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        if (vkCreateSampler(g.d, &ci, NULL, &g_easu.sampler) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+        if (vkCreateSampler(g.d, &ci, NULL, &g_easu.sampler) != VK_SUCCESS) { g_easu.failed[mode] = 1; return 0; }
     }
     if (!g_easu.pass) {
         VkAttachmentDescription a; memset(&a, 0, sizeof a);
@@ -162,12 +171,13 @@ static int easu_pipelines_locked(VkFormat fmt) {
         VkRenderPassCreateInfo ci; memset(&ci, 0, sizeof ci);
         ci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO; ci.attachmentCount = 1; ci.pAttachments = &a;
         ci.subpassCount = 1; ci.pSubpasses = &sp;
-        if (vkCreateRenderPass(g.d, &ci, NULL, &g_easu.pass) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+        if (vkCreateRenderPass(g.d, &ci, NULL, &g_easu.pass) != VK_SUCCESS) { g_easu.failed[mode] = 1; return 0; }
+        g_easu.attachment = a;
     }
     VkPipelineShaderStageCreateInfo stages[2]; memset(stages, 0, sizeof stages);
     for (unsigned i = 0; i < 2; i++) { stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO; stages[i].pName = "main"; }
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT; stages[0].module = g_easu.vs;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = g_easu.fs;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; stages[1].module = g_easu.fs[mode];
     VkPipelineVertexInputStateCreateInfo vi; memset(&vi, 0, sizeof vi); vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     VkPipelineInputAssemblyStateCreateInfo ia; memset(&ia, 0, sizeof ia); ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -187,7 +197,7 @@ static int easu_pipelines_locked(VkFormat fmt) {
     ci.stageCount = 2; ci.pStages = stages; ci.pVertexInputState = &vi; ci.pInputAssemblyState = &ia; ci.pViewportState = &vp;
     ci.pRasterizationState = &rs; ci.pMultisampleState = &ms; ci.pColorBlendState = &cb; ci.pDynamicState = &dyn;
     ci.layout = g_easu.layout; ci.renderPass = g_easu.pass;
-    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &ci, NULL, &g_easu.pipe) != VK_SUCCESS) { g_easu.failed = 1; return 0; }
+    if (vkCreateGraphicsPipelines(g.d, g_plc, 1, &ci, NULL, &g_easu.pipe[mode]) != VK_SUCCESS) { g_easu.failed[mode] = 1; return 0; }
     plc_created();
     g_easu.fmt = fmt;
     return 1;
@@ -267,7 +277,7 @@ static int easu_compose(struct nvn_gpu_cmd_s *c, VkImage dstImg, VkExtent2D dstE
     int32_t dx = rect->dx, dy = rect->dy, dw = rect->dw, dh = rect->dh;
 
     pthread_mutex_lock(&g_easu_mu);
-    int ready = easu_pipelines_locked(dstfmt);   // 通道与管线按目标格式建（源可以是另一种字节序）
+    int ready = easu_pipelines_locked(dstfmt, PRESENT_EASU);   // 通道与管线按目标格式建（源可以是另一种字节序）
     VkFramebuffer fb = ready ? easu_framebuffer_locked(dstImg, dstExtent, dstLevel, surface_gen) : VK_NULL_HANDLE;
     VkQueryPool qp = g_easu_q.pool;
     pthread_mutex_unlock(&g_easu_mu);
@@ -333,7 +343,8 @@ static int easu_compose(struct nvn_gpu_cmd_s *c, VkImage dstImg, VkExtent2D dstE
         vkCmdWriteTimestamp(c->cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, qs * 2u);
     }
     vkCmdBeginRenderPass(c->cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
-    vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.pipe);
+    if (g.pass_io_on) pass_io_record(PASS_IO_EASU, rp.renderArea.extent, 1, &g_easu.attachment, NULL, 1, 0);
+    vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.pipe[PRESENT_EASU]);
     vkCmdSetViewport(c->cb, 0, 1, &vp);
     vkCmdSetScissor(c->cb, 0, 1, &sc);
     vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_easu.layout, 0, 1, &set, 0, NULL);

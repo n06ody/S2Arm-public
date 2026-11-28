@@ -1,6 +1,7 @@
 // 崩溃现场（旧库 crash.c 改后搬，只留信号处理本身）：出错地址、pc / lr 换成模块内偏移、寄存器、帧指针回溯、线程表。
 #include <errno.h>
 #include "native.h"
+#include "s2a_direct_host.h"
 #include "s2a_docs.h"   // 崩溃落点标记写在文档根（s2a_crash_install 时算好路径，信号里只 open / write）
 #include "../../platform/plat.h"
 #include <signal.h>
@@ -232,9 +233,12 @@ static void on_crash(int sig, siginfo_t *si, void *context) {
     if (sig == SIGBUS || sig == SIGSEGV) {
         int write;
         if (s2a_android_fault_esr(context, &write)) {
-            // Preserve the incoming direct-mode hook; no provider means zero.
-            int s2a_direct_fault(void *, int, void *);
-            if (s2a_direct_fault(si->si_addr, write, context)) return;
+            const int direct = s2a_direct_fault(si->si_addr, write, context);
+            if (direct == 1) return;
+            if (direct < 0) {
+                android_crash_fatal(sig, si, u);
+                return;
+            }
         }
     }
     int guest = (sig == SIGBUS || sig == SIGSEGV) && module_of((void *)(uintptr_t)u->uc_mcontext.pc) != NULL;
@@ -594,7 +598,9 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
             // 远端（far.c，乙布局）：别名区伸出宿主窗口那段一碰即缺页，在影子上代执行这条访存并记点
             { int s2a_far_fault(void *, uint64_t, int); er_regs b; er_snap(ctx, &b); if (s2a_far_fault(ctx, (uint64_t)si->si_addr, w)) { er_note(5, ctx, &b, pc, (uint64_t)si->si_addr); return; } }
             // 直连模式的缺页钩子（双轨，s2a_direct_host.h）：游戏代码 / 宿主代码两条分支都最先问；通用模式下没人登记，这里只读一个空指针
-            { int s2a_direct_fault(void *, int, void *); if (s2a_direct_fault(si->si_addr, w, ctx)) return; }
+            const int direct = s2a_direct_fault(si->si_addr, w, ctx);
+            if (direct == 1) return;
+            if (direct < 0) goto report_fatal;
             // 游戏代码（模块原始代码 / 补丁区）写到 GPU 改过的页：改道到正常上下文先回写；宿主代码的缺页照原路径
             if (module_of((void *)pc)) {
                 // 方案 B（帧率能耗线 10-23）：游戏读到读时回写的不可读页、碰的子页不是 GPU 改过的 → 从别名模拟这条读、pc 前进，页保持不可读（不整页回写，免 16 KB / 4 KB 假共享）。
@@ -632,6 +638,7 @@ static void on_crash(int sig, siginfo_t *si, void *ctx) {
           if ((esr >> 6 & 1) && s2a_det_watch_fault((uint64_t)si->si_addr, u->uc_mcontext->__ss.__pc, u->uc_mcontext->__ss.__lr, u->uc_mcontext->__ss.__fp)) return; }
         if ((ec == 0x24 || ec == 0x25) && stale_perm_retry((uint64_t)si->si_addr, (int)(esr >> 6 & 1), esr)) return;   // 过期权限缺页：页已被别的线程放开，重执行（见 stale_perm_retry）
     }
+report_fatal:;
     ucontext_t *uc = ctx; pthread_t self = pthread_self(), none = NULL;
     if (!atomic_compare_exchange_strong(&g_crash_owner, &none, self)) {
         if (pthread_equal(none, self)) _exit(128 + sig);   // 先崩的线程在写报告时自己又崩

@@ -98,6 +98,31 @@ static void guest_untouched(void) {
     printf("%s：通过\n", phase); fflush(stdout);
 }
 
+// 通过公开入口连续设宽线和默认线，回放必须能按原顺序取到两次宽度。
+static void recorded_line_width(void) {
+    phase = "SetLineWidth 录制与恢复";
+    NVNcommandBuffer c;
+    new_cmd(&c, 0x10000, 4096);
+    API(nvnCommandBufferBeginRecording)(&c);
+    API(nvnCommandBufferSetLineWidth)(&c, 5.0f);
+    API(nvnCommandBufferSetLineWidth)(&c, 1.0f);
+    NVNcommandHandle h = API(nvnCommandBufferEndRecording)(&c);
+    CHECK(h != 0);
+    const op_hdr *op = (const op_hdr *)(uintptr_t)h;
+    const float expected[] = {5, 1};
+    for (size_t i = 0; i < 2; i++) {
+        CHECK(op->op == OP_BIND_STATE && op->size >= sizeof *op + sizeof(p_bind_state));
+        const p_bind_state *state = (const p_bind_state *)(op + 1);
+        CHECK(state->kind == NVN_BIND_LINE_WIDTH);
+        float width;
+        memcpy(&width, state->bytes, sizeof width);
+        CHECK(width == expected[i]);
+        op = (const op_hdr *)((const uint8_t *)op + op->size);
+    }
+    CHECK(op->op == OP_END);
+    API(nvnCommandBufferFinalize)(&c);
+}
+
 // ② 已用按设备字节；同一张表再录一次已用相同（塞尔达按它定每个模型的预录尺寸）；已用从最近一次 AddCommandMemory 算起、跨录制累加
 static void used_by_device(void) {
     phase = "② 已用按设备字节、同表两录相同";
@@ -466,7 +491,7 @@ int main(int argc, char **argv) {
     NVNqueueBuilder qb = {{0}}; API(nvnQueueBuilderSetDefaults)(&qb); API(nvnQueueBuilderSetDevice)(&qb, &device); CHECK(API(nvnQueueInitialize)(&queue, &qb));
     new_pool(&cmdpool, &cmdmem, CMD_BYTES); new_pool(&datapool, &datamem, DATA_BYTES);
     data_ga = API(nvnMemoryPoolGetBufferAddress)(&datapool);
-    guest_untouched(); used_by_device(); callback_timing(); totk_slots(); release(); call_guard(); call_redirect(); copy_then_reuse(); spanning(); lm3_patch(); pool_binds_no_cmd_memory(); interned(); replayable(argv[0]);
+    guest_untouched(); recorded_line_width(); used_by_device(); callback_timing(); totk_slots(); release(); call_guard(); call_redirect(); copy_then_reuse(); spanning(); lm3_patch(); pool_binds_no_cmd_memory(); interned(); replayable(argv[0]);
     API(nvnQueueFinish)(&queue);
     API(nvnMemoryPoolFinalize)(&cmdpool); API(nvnMemoryPoolFinalize)(&datapool); API(nvnQueueFinalize)(&queue); API(nvnDeviceFinalize)(&device);
     printf("✓ t_nvn_cmdshadow：%u 条断言（10 组：游戏内存不动、设备口径已用、回调时机、王国之泪排槽、覆盖释放、复制后重用、跨段跨块、录后改写句柄、池绑定不占命令内存、回放放回影子块）\n", checks);

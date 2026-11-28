@@ -19,6 +19,7 @@ uint64_t nvk_session_stop_deadline(void);
 void nvk_shader_stop(void);
 unsigned nvk_shader_inflight(void);
 int nvk_shader_open(void);
+void nvk_shader_activate_codec(void *context);
 uint64_t nvk_shader_cs_fast_hits(void);   // 计算程序快路的累计命中次数（会话清空时归零）；单测断言「没再走完整请求」用
 // 打开：后端接管 dev（不另建、不拥有其寿命）。cache_dir 可为 NULL。0 = 成功；失败 why 写原因。
 int nvk_session_open(struct s2a_vk_device *dev, const char *cache_dir, char *why, size_t why_size);

@@ -94,6 +94,8 @@ static class Program
         foreach (var d in new[] { pkg, prof, refDir, work }) Directory.CreateDirectory(d);
         File.WriteAllText(Path.Combine(prof, "shader_facts.tsv"), ""); File.WriteAllText(Path.Combine(prof, "shader_pairs.tsv"), "");
         var fx = Fixtures(); var map = new List<string>(); var expect = new Dictionary<string, string>();
+        string fragmentKey = Key(fx.Single(f => f.Stage == "ps").Ctl);
+        File.WriteAllText(Path.Combine(prof, "fout_want.tsv"), $"{fragmentKey}\t1\t0\n{fragmentKey}\t0\t1\n");
         foreach (var (stage, code, ctl) in fx)
         {
             File.WriteAllBytes(Path.Combine(pkg, stage + "_0.bin"), Record(code, ctl));
@@ -114,8 +116,9 @@ static class Program
         Check($"① vk_build.tsv：{tsv.Count} 行，vs / ps / cs / 真几何 ok、顶点代码的 gs skipped、越界 failed", tsv.Count == 6 && expect.All(kv => tsv.GetValueOrDefault(kv.Key) == kv.Value),
             string.Join(" ", tsv.Select(kv => kv.Key + "=" + kv.Value)));
         var files = Directory.GetFiles(outDir).Select(Path.GetFileName).OrderBy(x => x, StringComparer.Ordinal).ToList();
-        var want = fx.SelectMany(f => new[] { Key(f.Ctl) + "_b.json", Key(f.Ctl) + "_b.spv" }).Concat(gnames).Append("vk_build.tsv").OrderBy(x => x, StringComparer.Ordinal).ToList();
-        Check($"② 输出目录只有三键的 _b.json / _b.spv、几何键的 6 个 _vg 文件和 vk_build.tsv（{files.Count} 个），没有 _b.metal", files.SequenceEqual(want), string.Join(",", files));
+        var want = fx.SelectMany(f => new[] { Key(f.Ctl) + "_b.json", Key(f.Ctl) + "_b.spv" }).Concat(gnames)
+            .Append(fragmentKey + "_vf.bin").Append("vk_build.tsv").OrderBy(x => x, StringComparer.Ordinal).ToList();
+        Check($"② 出库目录含 SPIR-V、反射和片元输出变体（{files.Count} 个）", files.SequenceEqual(want), string.Join(",", files));
         var gref = DshVk.CompileGeometry(gk, gcode, gctl, xc, prof, true, work);
         Check("③g 几何键 6 个 _vg 文件与直接调 CompileGeometry 的逐字节相同", gref.Count == 6 && gnames.All(n => File.Exists(Path.Combine(outDir, n)) && File.ReadAllBytes(Path.Combine(outDir, n)).AsSpan().SequenceEqual(gref[n])));
 
@@ -144,13 +147,15 @@ static class Program
         {
             byte[] idx = File.ReadAllBytes(Path.Combine(lib, "lib.idx")), pak = File.ReadAllBytes(Path.Combine(lib, "lib.000.pak"));
             uint n = BitConverter.ToUInt32(idx, 12), ns = BitConverter.ToUInt32(idx, 16);
-            Check($"⑩ 头：魔数 S2ALIB、版本 1、链号 0123456789ab、{n} 条记录、{ns} 个分片", idx.AsSpan(0, 8).SequenceEqual("S2ALIB\0\0"u8) && BitConverter.ToUInt32(idx, 8) == 1 && Encoding.ASCII.GetString(idx, 24, 12) == "0123456789ab" && n == 12 && ns == 1 && idx.Length == 48 + 16 * ns + 24 * n);
+            Check($"⑩ 头：魔数 S2ALIB、版本 1、链号 0123456789ab、{n} 条记录、{ns} 个分片", idx.AsSpan(0, 8).SequenceEqual("S2ALIB\0\0"u8) && BitConverter.ToUInt32(idx, 8) == 1 && Encoding.ASCII.GetString(idx, 24, 12) == "0123456789ab" && n == 13 && ns == 1 && idx.Length == 48 + 16 * ns + 24 * n);
             Check($"⑩ 头部 36–43 = 完整指纹 {VkLib.Fp}（u64 小端）、44–47 为 0", BitConverter.ToUInt64(idx, 36) == Convert.ToUInt64(VkLib.Fp, 16) && BitConverter.ToUInt32(idx, 44) == 0);
-            var wantRec = fx.Select(f => (Key(f.Ctl), new[] { (1, "_b.json"), (52, "_b.spv") }))
+            var wantRec = fx.Select(f => (Key(f.Ctl), f.Stage == "ps"
+                ? new[] { (1, "_b.json"), (52, "_b.spv"), (125, "_vf.bin") }
+                : new[] { (1, "_b.json"), (52, "_b.spv") }))
                 .Append((gk, new[] { (112, "_vg0.json"), (113, "_vg1.json"), (115, "_vg3.json"), (120, "_vg0.spv"), (121, "_vg1.spv"), (123, "_vg3.spv") }))
                 .OrderBy(e => Convert.ToUInt64(e.Item1, 16)).SelectMany(e => e.Item2.Select(r => (e.Item1, r.Item1, r.Item2))).ToList();
             var got = Enumerable.Range(0, (int)n).Select(i => 48 + 16 * (int)ns + 24 * i).Select(o => (Key: BitConverter.ToUInt64(idx, o), Kind: (int)idx[o + 8], Len: BitConverter.ToUInt32(idx, o + 12), Off: BitConverter.ToUInt64(idx, o + 16))).ToList();
-            Check("⑩ 12 条记录按 (键, 种类) 升序、_b.json 种类 1 / _b.spv 种类 52、_vg<t>.json 112+t / _vg<t>.spv 120+t、每段字节 = 逐键文件",
+            Check("⑩ 13 条记录按 (键, 种类) 升序，含片元变体种类 125，每段字节 = 逐键文件",
                 got.Count == wantRec.Count && got.Zip(wantRec).All(x => x.First.Key == Convert.ToUInt64(x.Second.Item1, 16) && x.First.Kind == x.Second.Item2
                     && pak.AsSpan((int)x.First.Off, (int)x.First.Len).SequenceEqual(File.ReadAllBytes(Path.Combine(outDir, x.Second.Item1 + x.Second.Item3)))));
             var (pb2, _) = VkLib.Pack(outDir, lib, "0123456789ab");

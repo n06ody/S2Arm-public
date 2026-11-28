@@ -48,10 +48,11 @@ static int gate_open(void) { return s2a_debug_entries_open(); }
 static int raw_prop_get(const char *name, char *out) { return __system_property_get(name, out); }
 static int sysfs_read(const char *path, char *buf, size_t n) {
     const int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return -1;
+    if (fd < 0) return -errno;
     const ssize_t r = read(fd, buf, n - 1);
+    const int error = r < 0 ? errno : 0;
     close(fd);
-    if (r <= 0) return -1;
+    if (r <= 0) return -error;
     buf[r] = 0;
     return (int)r;
 }
@@ -196,15 +197,24 @@ static int read_gpu_mode(void) {
     if (!strcmp(v, "1") || !strcmp(v, "on") || !strcmp(v, "always")) return S2A_TURBO_ALWAYS;
     return S2A_TURBO_AUTO;
 }
-struct gq_src { uint64_t work, time, last_ns; uint32_t cur_khz, max_khz; };
-static uint32_t sysfs_hz_khz(const char *path) {
+struct gq_src {
+    uint64_t work, time, last_ns;
+    uint32_t cur_khz, max_khz;
+    int cur_denied, max_denied;
+};
+static uint32_t sysfs_hz_khz(const char *path, int *denied) {
+    if (*denied) return 0;
     char b[32] = {0};
-    if (sysfs_read(path, b, sizeof b) <= 0) return 0;
+    const int r = sysfs_read(path, b, sizeof b);
+    // A permission failure applies to this node in this monitor session.
+    if (r == -EACCES || r == -EPERM) *denied = 1;
+    if (r <= 0) return 0;
     unsigned long long hz = strtoull(b, NULL, 10);
     return hz >= 1000 && hz / 1000 <= UINT32_MAX ? (uint32_t)(hz / 1000) : 0;
 }
 static void gq_poll(struct gq_src *g, uint64_t now) {
-    uint32_t cur = sysfs_hz_khz("/sys/class/kgsl/kgsl-3d0/gpuclk"), max = sysfs_hz_khz("/sys/class/kgsl/kgsl-3d0/max_gpuclk");
+    const uint32_t cur = sysfs_hz_khz("/sys/class/kgsl/kgsl-3d0/gpuclk", &g->cur_denied);
+    const uint32_t max = sysfs_hz_khz("/sys/class/kgsl/kgsl-3d0/max_gpuclk", &g->max_denied);
     if (cur) {
         if (g->cur_khz && g->last_ns && now > g->last_ns) { uint64_t dt = (now - g->last_ns) / 1000; g->work += (uint64_t)g->cur_khz * dt; g->time += dt; }
         g->cur_khz = cur; g->last_ns = now;

@@ -56,7 +56,7 @@ uint32_t nvk_fu_item_ms(void);
 uint32_t nvk_fu_frame_ms(void);
 uint32_t nvk_fu_unsafe_ms(void);
 
-struct nvn_pipe_demand_stats { uint64_t kicked, dedup, built, failed, timeouts, full, published; };   // published：结果已发布进待取表、前台看得见（built 在发布之前计）
+struct nvn_pipe_demand_stats { uint64_t kicked, dedup, built, failed, timeouts, full, published, cache_hits; };   // published：结果已发布进待取表、前台看得见（built 在发布之前计）；cache_hits：经 cache_control 零阻塞直出次数
 void nvn_vk_pipe_demand_stats(struct nvn_pipe_demand_stats *out);
 
 #ifdef __cplusplus

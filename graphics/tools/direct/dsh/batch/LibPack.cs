@@ -223,11 +223,13 @@ static partial class LibPack
     // ---------------- lib_pack.py ----------------
     const int VER = 1, ALIGN = 16; const long SHARD_MAX = 64L << 20; const int SHARD_COUNT_MAX = 65536;   // 分片上限 64 MB（运行时按需映射，iOS 虚拟地址紧）
     static readonly byte[] MAGIC = Encoding.ASCII.GetBytes("S2ALIB\0\0");
-    static readonly Regex NAME = new(@"\A([0-9a-f]{16})_(b\.metallib|b\.json|b\.spv|bf\.metallib|bv\.metallib|ft\.metallib|se\.metallib|vp\.metallib|bp\.metallib|b_t([0-2])\.metallib|bg(\d+)\.(metallib|json)|bgv\.(metallib|json)|bgs(\d+)\.(metallib|json)|bgc\.(metallib|json)|vg([0-4])\.(json|spv))$", RegexOptions.CultureInvariant);
+    static readonly Regex NAME = new(@"\A([0-9a-f]{16})_(b\.metallib|b\.json|b\.spv|bf\.metallib|bv\.metallib|ft\.metallib|se\.metallib|vp\.metallib|bp\.metallib|b_t([0-2])\.metallib|bg(\d+)\.(metallib|json)|bgv\.(metallib|json)|bgs(\d+)\.(metallib|json)|bgc\.(metallib|json)|vg([0-4])\.(json|spv)|vf\.bin)$", RegexOptions.CultureInvariant);
     static readonly Regex VKFP = new(@"\A[0-9a-f]{16}\z", RegexOptions.CultureInvariant);
     const int K_SPV = 52;   // Vulkan 库的 _b.spv（#783）；0–51 是 Metal 的种类
     const int K_VGJSON = 112, K_VGSPV = 120;   // Vulkan 库的原生几何阶段：_vg<t>.json 112+t / _vg<t>.spv 120+t（t = 输入图元 InputTopology 编号 0–4，安卓 Vulkan 导出的原生几何阶段）
-    static bool VkKind(int k) => k == 1 || k == K_SPV || (k >= K_VGJSON && k < K_VGJSON + 5) || (k >= K_VGSPV && k < K_VGSPV + 5);
+    const int K_VF = 125;  // Vulkan 片元颜色输出变体，_vf.bin
+    static bool VkKind(int k) => k == 1 || k == K_SPV || k == K_VF ||
+        (k >= K_VGJSON && k < K_VGJSON + 5) || (k >= K_VGSPV && k < K_VGSPV + 5);
     static readonly Regex CHAIN = new(@"\A[0-9a-z]{1,12}\z", RegexOptions.CultureInvariant);
     static readonly Regex KEYFILE = new(@"\A[0-9a-f]{16}_", RegexOptions.CultureInvariant);
     static readonly Regex BATCH = new(@"\Au[0-9a-f]{16}\z", RegexOptions.CultureInvariant);
@@ -238,6 +240,7 @@ static partial class LibPack
     static int? Kind(Match m)
     {
         string s = m.Groups[2].Value;
+        if (s == "vf.bin") return K_VF;
         switch (s) { case "b.metallib": return 0; case "b.json": return 1; case "bf.metallib": return 2; case "bv.metallib": return 3; case "ft.metallib": return 50; case "se.metallib": return 51; case "vp.metallib": return 54; case "bp.metallib": return 55; case "b.spv": return K_SPV; }
         if (m.Groups[3].Success) return 4 + (m.Groups[3].Value[0] - '0');
         if (m.Groups[4].Success)
@@ -292,7 +295,7 @@ static partial class LibPack
             ident = n => n[0] == '\0' ? n : ident0?.Invoke(n);
         }
         if (vkfp == null && ents.Any(e => e.K != 1 && VkKind(e.K))) return (new() { $"有 {ents.First(e => e.K != 1 && VkKind(e.K)).N}（Vulkan 库的种类）却没给 Vulkan 侧指纹" }, "");
-        if (vkfp != null && ents.Any(e => !VkKind(e.K))) return (new() { $"给了 Vulkan 侧指纹却混进了 Metal 段（如 {ents.First(e => !VkKind(e.K)).N}；Vulkan 库只收 _b.json / _b.spv / _vg<t>.json / _vg<t>.spv）" }, "");
+        if (vkfp != null && ents.Any(e => !VkKind(e.K))) return (new() { $"给了 Vulkan 侧指纹却混进了 Metal 段（如 {ents.First(e => !VkKind(e.K)).N}）" }, "");
         if (ents.Count == 0) return (new() { $"{d} 一个键文件都没有" }, "");
         // A network's layers must all execute, or all use the old stand-in. Per-key opt-in would
         // mix newly translated missing keys with old packaged scalar layers and read unwritten buffers.

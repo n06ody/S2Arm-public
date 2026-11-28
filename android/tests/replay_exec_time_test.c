@@ -115,8 +115,9 @@ void rp_res_xfer_aborted(uint64_t sub) { (void)sub; CHECK(0); }
 void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans) {
     (void)refs; (void)count; (void)spans; CHECK(0);
 }
-void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged) {
-    (void)pool_key; (void)id; (void)ok; (void)staged; CHECK(0);
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok,
+                              const uint8_t *staged, const uint64_t *readback_plus_one) {
+    (void)pool_key; (void)id; (void)ok; (void)staged; (void)readback_plus_one; CHECK(0);
 }
 void rp_buf_frame_flip(void) {}
 void rp_buf_hold_begin(void) {}   // 本测试只测计时：回放窗口（池销毁的镜像缓冲延后放）在 t_nvn_replay / 隔离夹具里测

@@ -40,7 +40,13 @@ static void case_caps_table(void) {
     CHECK(s2a_spv_cap_req(SpvCapabilityStorageImageWriteWithoutFormat) == SPV_REQ_STORAGE_WRITE_WOF);
     CHECK(s2a_spv_cap_req(SpvCapabilityGroupNonUniformBallot) == SPV_REQ_API_1_1);
     CHECK(s2a_spv_cap_req(SpvCapabilityDrawParameters) == SPV_REQ_DRAW_PARAMETERS);
-    CHECK(s2a_spv_cap_req(SpvCapabilityStorageBuffer16BitAccess) == SPV_REQ_16BIT_STORAGE);
+    CHECK(s2a_spv_cap_req(SpvCapabilityStorageBuffer16BitAccess) == SPV_REQ_16BIT_STORAGE_SSBO);
+    CHECK(s2a_spv_cap_req(SpvCapabilityUniformAndStorageBuffer16BitAccess) == SPV_REQ_16BIT_STORAGE_UBO_SSBO);
+    CHECK(s2a_spv_cap_req(SpvCapabilityStoragePushConstant16) == SPV_REQ_16BIT_STORAGE_PUSH);
+    CHECK(s2a_spv_cap_req(SpvCapabilityStorageInputOutput16) == SPV_REQ_16BIT_STORAGE_IO);
+    CHECK(s2a_spv_cap_req(SpvCapabilityVariablePointersStorageBuffer) == SPV_REQ_VARIABLE_POINTERS_SB);
+    CHECK(s2a_spv_cap_req(SpvCapabilityVariablePointers) == SPV_REQ_VARIABLE_POINTERS);
+    CHECK(s2a_spv_cap_req(SpvCapabilityMultiView) == SPV_REQ_MULTIVIEW);
     CHECK(s2a_spv_cap_req(SpvCapabilityDenormPreserve) == SPV_REQ_FLOAT_CONTROLS);
     CHECK(s2a_spv_cap_req(SpvCapabilityShader) == SPV_REQ_CORE);
     CHECK(s2a_spv_cap_req(SpvCapabilityImageQuery) == SPV_REQ_CORE);
@@ -50,9 +56,21 @@ static void case_caps_table(void) {
     CHECK(s2a_spv_cap_req(9999u) == SPV_REQ_UNLISTED);
     // req 名可回查（日志用），未知名不出指针（拒收行按数值打）
     CHECK(s2a_spv_req_name(SPV_REQ_INT16) && strstr(s2a_spv_req_name(SPV_REQ_INT16), "Int16"));
+    CHECK(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_SSBO) && !strcmp(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_SSBO), "storageBuffer8BitAccess"));
+    CHECK(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_UBO_SSBO) && !strcmp(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_UBO_SSBO), "uniformAndStorageBuffer8BitAccess"));
+    CHECK(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_PUSH) && !strcmp(s2a_spv_req_name(SPV_REQ_8BIT_STORAGE_PUSH), "storagePushConstant8"));
+    CHECK(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_SSBO) && !strcmp(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_SSBO), "storageBuffer16BitAccess"));
+    CHECK(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_UBO_SSBO) && !strcmp(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_UBO_SSBO), "uniformAndStorageBuffer16BitAccess"));
+    CHECK(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_PUSH) && !strcmp(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_PUSH), "storagePushConstant16"));
+    CHECK(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_IO) && !strcmp(s2a_spv_req_name(SPV_REQ_16BIT_STORAGE_IO), "storageInputOutput16"));
+    CHECK(s2a_spv_req_name(SPV_REQ_VARIABLE_POINTERS_SB) && !strcmp(s2a_spv_req_name(SPV_REQ_VARIABLE_POINTERS_SB), "variablePointersStorageBuffer"));
+    CHECK(s2a_spv_req_name(SPV_REQ_VARIABLE_POINTERS) && !strcmp(s2a_spv_req_name(SPV_REQ_VARIABLE_POINTERS), "variablePointers"));
     // 扩展表
     CHECK(s2a_spv_ext_req("SPV_KHR_shader_draw_parameters") == SPV_REQ_DRAW_PARAMETERS);
     CHECK(s2a_spv_ext_req("SPV_KHR_16bit_storage") == SPV_REQ_16BIT_STORAGE);
+    CHECK(s2a_spv_ext_req("SPV_KHR_8bit_storage") == SPV_REQ_8BIT_STORAGE);
+    CHECK(s2a_spv_ext_req("SPV_KHR_variable_pointers") == SPV_REQ_VARIABLE_POINTERS_SB);
+    CHECK(s2a_spv_ext_req("SPV_KHR_multiview") == SPV_REQ_MULTIVIEW);
     CHECK(s2a_spv_ext_req("SPV_EXT_descriptor_indexing") == SPV_REQ_DESCRIPTOR_INDEXING);
     CHECK(s2a_spv_ext_req("SPV_KHR_storage_buffer_storage_class") == SPV_REQ_SBC_CLASS);
     CHECK(s2a_spv_ext_req("SPV_KHR_device_group") == SPV_REQ_API_1_1);
@@ -128,6 +146,19 @@ static void case_workgroup_bytes(void) {
     uint64_t total = 0;
     CHECK(s2a_spv_workgroup_bytes(w, (p - w) * 4, &total) == NULL);
     CHECK(total == 45056);
+    struct s2a_spv_decl d;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL);
+    CHECK(d.has_workgroup_init == 0);
+    // 带 OpConstantNull 初始化器的 Workgroup OpVariable（5 词）→ 必须扫出 has_workgroup_init=1
+    p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpTypeInt, 4); p[1] = 2; p[2] = 32; p[3] = 0; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 2; p[2] = 3; p[3] = 64; p += 4;
+    p[0] = W32(SpvOpTypeArray, 4); p[1] = 4; p[2] = 2; p[3] = 3; p += 4;
+    p[0] = W32(SpvOpTypePointer, 4); p[1] = 5; p[2] = SpvStorageClassWorkgroup; p[3] = 4; p += 4;
+    p[0] = W32(SpvOpConstantNull, 3); p[1] = 4; p[2] = 7; p += 3;
+    p[0] = W32(SpvOpVariable, 5); p[1] = 5; p[2] = 6; p[3] = SpvStorageClassWorkgroup; p[4] = 7; p += 5;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL);
+    CHECK(d.has_workgroup_init == 1);
     printf("case_workgroup_bytes ok\n");
 }
 
@@ -143,12 +174,140 @@ static void case_malformed(void) {
     printf("case_malformed ok\n");
 }
 
+static void case_scalar_block_layout(void) {
+    uint32_t w[256]; struct s2a_spv_decl d;
+    // 1) 标准 std430 / relaxed_block_layout（float@0 + vec3@4 不跨 16B，vec3[] ArrayStride=16）→ 0
+    uint32_t *p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpDecorate, 4); p[1] = 5; p[2] = SpvDecorationArrayStride; p[3] = 16; p += 4;
+    p[0] = W32(SpvOpMemberDecorate, 5); p[1] = 6; p[2] = 0; p[3] = SpvDecorationOffset; p[4] = 0; p += 5;
+    p[0] = W32(SpvOpMemberDecorate, 5); p[1] = 6; p[2] = 1; p[3] = SpvDecorationOffset; p[4] = 4; p += 5;
+    p[0] = W32(SpvOpTypeFloat, 3); p[1] = 1; p[2] = 32; p += 3;
+    p[0] = W32(SpvOpTypeVector, 4); p[1] = 2; p[2] = 1; p[3] = 3; p += 4;
+    p[0] = W32(SpvOpTypeInt, 4); p[1] = 3; p[2] = 32; p[3] = 0; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 3; p[2] = 4; p[3] = 2; p += 4;
+    p[0] = W32(SpvOpTypeArray, 4); p[1] = 5; p[2] = 2; p[3] = 4; p += 4;
+    p[0] = W32(SpvOpTypeStruct, 4); p[1] = 6; p[2] = 1; p[3] = 2; p += 4;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 0);
+    // 2) vec3 偏移 12（跨 16B 对齐边界）→ 1
+    p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpMemberDecorate, 5); p[1] = 6; p[2] = 0; p[3] = SpvDecorationOffset; p[4] = 0; p += 5;
+    p[0] = W32(SpvOpMemberDecorate, 5); p[1] = 6; p[2] = 1; p[3] = SpvDecorationOffset; p[4] = 12; uint32_t *offset = &p[4]; p += 5;
+    p[0] = W32(SpvOpTypeFloat, 3); p[1] = 1; p[2] = 32; uint32_t *width = &p[2]; p += 3;
+    p[0] = W32(SpvOpTypeVector, 4); p[1] = 2; p[2] = 1; p[3] = 3; uint32_t *components = &p[3]; p += 4;
+    p[0] = W32(SpvOpTypeStruct, 4); p[1] = 6; p[2] = 2; p[3] = 2; p += 4;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 1);
+    // relaxed 布局按 16B 边界判跨越。vec2@4 合法，vec2@12 跨界。
+    *offset = 4;
+    *components = 2;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 0);
+    *offset = 12;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 1);
+    // 超过 16B 的向量只要求从 16B 边界开始。
+    *width = 64;
+    *components = 3;
+    *offset = 16;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 0);
+    *offset = 8;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 1);
+    // 3) vec3 数组 ArrayStride=12 → 1
+    p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpDecorate, 4); p[1] = 5; p[2] = SpvDecorationArrayStride; p[3] = 12; p += 4;
+    p[0] = W32(SpvOpTypeFloat, 3); p[1] = 1; p[2] = 32; p += 3;
+    p[0] = W32(SpvOpTypeVector, 4); p[1] = 2; p[2] = 1; p[3] = 3; p += 4;
+    p[0] = W32(SpvOpTypeInt, 4); p[1] = 3; p[2] = 32; p[3] = 0; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 3; p[2] = 4; p[3] = 2; p += 4;
+    p[0] = W32(SpvOpTypeArray, 4); p[1] = 5; p[2] = 2; p[3] = 4; p += 4;
+    CHECK(s2a_spv_scan(w, (p - w) * 4, &d) == NULL && d.has_scalar_block_layout == 1);
+    printf("case_scalar_block_layout ok\n");
+}
+
+static size_t emit_ubo_mod(uint32_t *w, uint32_t block_dec, uint32_t stride) {
+    uint32_t *p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpDecorate, 3); p[1] = 5; p[2] = block_dec; p += 3;
+    p[0] = W32(SpvOpDecorate, 4); p[1] = 4; p[2] = SpvDecorationArrayStride; p[3] = stride; p += 4;
+    p[0] = W32(SpvOpTypeFloat, 3); p[1] = 1; p[2] = 32; p += 3;
+    p[0] = W32(SpvOpTypeInt, 4); p[1] = 2; p[2] = 32; p[3] = 0; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 2; p[2] = 3; p[3] = 8; p += 4;
+    p[0] = W32(SpvOpTypeArray, 4); p[1] = 4; p[2] = 1; p[3] = 3; p += 4;
+    p[0] = W32(SpvOpTypeStruct, 3); p[1] = 5; p[2] = 4; p += 3;
+    p[0] = W32(SpvOpTypePointer, 4); p[1] = 6; p[2] = SpvStorageClassUniform; p[3] = 5; p += 4;
+    p[0] = W32(SpvOpVariable, 4); p[1] = 6; p[2] = 7; p[3] = SpvStorageClassUniform; p += 4;
+    return (size_t)(p - w) * 4;
+}
+static void case_ubo_std430_layout(void) {
+    uint32_t w[256]; struct s2a_spv_decl d;
+    // 1) 标准 std140 UBO（Block + ArrayStride=16）→ 0
+    CHECK(s2a_spv_scan(w, emit_ubo_mod(w, SpvDecorationBlock, 16), &d) == NULL && d.has_ubo_std430_layout == 0);
+    // 2) 旧式 SSBO（BufferBlock + ArrayStride=4）→ 0（不误报 SSBO）
+    CHECK(s2a_spv_scan(w, emit_ubo_mod(w, SpvDecorationBufferBlock, 4), &d) == NULL && d.has_ubo_std430_layout == 0);
+    // 3) std430 紧凑 UBO（Block + ArrayStride=4）→ 1
+    CHECK(s2a_spv_scan(w, emit_ubo_mod(w, SpvDecorationBlock, 4), &d) == NULL && d.has_ubo_std430_layout == 1);
+    printf("case_ubo_std430_layout ok\n");
+}
+
+static void case_local_size_id(void) {
+    // 合成 SPIR-V 1.3 计算模块：OpExecutionModeId %fn LocalSizeId %c4 %c2 %c1
+    uint32_t w[128]; uint32_t *p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpCapability, 2); p[1] = SpvCapabilityShader; p += 2;
+    p[0] = W32(SpvOpMemoryModel, 3); p[1] = SpvAddressingModelLogical; p[2] = SpvMemoryModelGLSL450; p += 3;
+    p[0] = W32(SpvOpEntryPoint, 5); p[1] = SpvExecutionModelGLCompute; p[2] = 3;
+    size_t nm = put_str(p + 3, "main"); p[0] = W32(SpvOpEntryPoint, (uint32_t)(3 + nm)); p += 3 + nm;
+    uint32_t *exec_mode = p;
+    p[0] = W32(SpvOpExecutionModeId, 6); p[1] = 3; p[2] = SpvExecutionModeLocalSizeId; p[3] = 7; p[4] = 8; p[5] = 9; p += 6;
+    p[0] = W32(SpvOpTypeVoid, 2); p[1] = 1; p += 2;
+    p[0] = W32(SpvOpTypeFunction, 3); p[1] = 2; p[2] = 1; p += 3;
+    p[0] = W32(SpvOpTypeInt, 4); p[1] = 6; p[2] = 32; p[3] = 0; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 6; p[2] = 7; p[3] = 4; p += 4;
+    p[0] = W32(SpvOpSpecConstant, 4); p[1] = 6; p[2] = 8; p[3] = 2; p += 4;
+    p[0] = W32(SpvOpConstant, 4); p[1] = 6; p[2] = 9; p[3] = 1; p += 4;
+    p[0] = W32(SpvOpFunction, 5); p[1] = 1; p[2] = 3; p[3] = SpvFunctionControlMaskNone; p[4] = 2; p += 5;
+    p[0] = W32(SpvOpLabel, 2); p[1] = 4; p += 2;
+    p[0] = W32(SpvOpReturn, 1); p += 1;
+    p[0] = W32(SpvOpFunctionEnd, 1); p += 1;
+    size_t nb = (size_t)(p - w) * 4;
+    struct s2a_spv_decl d;
+    CHECK(s2a_spv_scan(w, nb, &d) == NULL && d.has_local_size_id == 1);
+    CHECK(s2a_spv_req_name(SPV_REQ_MAINTENANCE4) && !strcmp(s2a_spv_req_name(SPV_REQ_MAINTENANCE4), "VK_KHR_maintenance4"));
+    uint32_t sz[3] = {0};
+    // maintenance4 关闭时拒收并具名 maintenance4
+    const char *why_off = s2a_spirv_workgroup_size_ex(w, nb, "main", 0, sz);
+    CHECK(why_off && strstr(why_off, "maintenance4"));
+    // maintenance4 开启时准确解析常量 / 特化常量默认值 {4, 2, 1}
+    CHECK(s2a_spirv_workgroup_size_ex(w, nb, "main", 1, sz) == NULL && sz[0] == 4 && sz[1] == 2 && sz[2] == 1);
+    // 非法 ID（越界）在 maintenance4 开启时仍拒收
+    exec_mode[3] = 99;
+    const char *why_bad = s2a_spirv_workgroup_size_ex(w, nb, "main", 1, sz);
+    CHECK(why_bad && strstr(why_bad, "LocalSizeId"));
+    printf("case_local_size_id ok\n");
+}
+
+static void case_float_controls(void) {
+    uint32_t w[128]; struct s2a_spv_decl d;
+    uint32_t *p = spv_head(w, 0x10300u, 16);
+    p[0] = W32(SpvOpCapability, 2); p[1] = SpvCapabilityShader; p += 2;
+    p[0] = W32(SpvOpCapability, 2); p[1] = SpvCapabilitySignedZeroInfNanPreserve; p += 2;
+    size_t u = put_str(p + 1, "SPV_KHR_float_controls"); p[0] = W32(SpvOpExtension, (uint32_t)(1 + u)); p += 1 + u;
+    p[0] = W32(SpvOpExecutionMode, 4); p[1] = 3; p[2] = SpvExecutionModeSignedZeroInfNanPreserve; p[3] = 32; p += 4;
+    p[0] = W32(SpvOpExecutionMode, 4); p[1] = 3; p[2] = SpvExecutionModeRoundingModeRTE; p[3] = 16; p += 4;
+    p[0] = W32(SpvOpExecutionMode, 4); p[1] = 3; p[2] = SpvExecutionModeDenormFlushToZero; p[3] = 64; p += 4;
+    CHECK(s2a_spv_scan(w, (size_t)(p - w) * 4, &d) == NULL);
+    CHECK(d.float_controls_modes == ((1u << 7) | (1u << 9) | (1u << 5)));
+    // 非法位宽（24 位）具名拒收
+    p[-1] = 24;
+    CHECK(s2a_spv_scan(w, (size_t)(p - w) * 4, &d) != NULL);
+    printf("case_float_controls ok\n");
+}
+
 int main(void) {
     case_caps_table();
     case_scan_positive();
     case_scan_ext_and_unlisted();
     case_push_bytes();
     case_workgroup_bytes();
+    case_scalar_block_layout();
+    case_ubo_std430_layout();
+    case_local_size_id();
+    case_float_controls();
     case_malformed();
     printf("t_spv_compliance: all cases pass\n");
     return 0;

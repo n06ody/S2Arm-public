@@ -24,6 +24,11 @@ static int32_t compile_b(uint64_t session, uint64_t generation, s2a_direct_bytes
     return S2A_DIRECT_RES_COMPILE;
 }
 
+static int32_t encode_legacy(s2a_direct_bytes result, s2a_direct_emit_fn emit, void *sink) {
+    (void)result; (void)emit; (void)sink;
+    return S2A_DIRECT_RES_OK;
+}
+
 int main(void) {
     void *ctx = (void *)(uintptr_t)0x100;
     void *other = (void *)(uintptr_t)0x200;
@@ -52,6 +57,14 @@ int main(void) {
     CHECK(s2a_direct_bind_compiler_v1(other, compile_b) == S2A_DIRECT_RES_OK, "second context binds independently");
     CHECK(s2a_direct_bound_compile(other) == compile_b, "second context reads its own compiler");
     CHECK(s2a_direct_bound_compile_any() == compile_a, "bound_compile_any returns the first registration only");
+    CHECK(s2a_direct_bind_binary_compiler_v1(other, compile_b, encode_legacy) == S2A_DIRECT_RES_OK,
+          "binary provider registers after Prepare");
+    CHECK(!s2a_direct_bound_binary_compiler(other).compile, "unfrozen binary provider stays hidden");
+    CHECK(s2a_direct_freeze_compiler_v1(other) == S2A_DIRECT_RES_OK, "Activate freezes the second context");
+    struct s2a_direct_live_compiler binary = s2a_direct_bound_binary_compiler(other);
+    CHECK(binary.compile == compile_b && binary.encode_legacy == encode_legacy,
+          "active context reads both binary callbacks despite a prior JSON registration");
+    CHECK(!s2a_direct_bound_binary_compiler(ctx).compile, "JSON-only context keeps its own transport");
 
     // 解绑（会话销毁路径）：读不到、可以重新登记，表项不泄漏。
     CHECK(s2a_direct_unbind_compiler_v1(ctx) == S2A_DIRECT_RES_OK, "unbind");
@@ -66,6 +79,7 @@ int main(void) {
     CHECK(s2a_direct_bind_compiler_v1((void *)(uintptr_t)0x400, compile_a) == S2A_DIRECT_RES_INTERNAL,
           "a full table refuses instead of overwriting another session");
     CHECK(s2a_direct_unbind_compiler_v1(other) == S2A_DIRECT_RES_OK, "free one slot");
+    CHECK(!s2a_direct_bound_binary_compiler(other).compile, "unbinding clears the binary callbacks");
     CHECK(s2a_direct_bind_compiler_v1((void *)(uintptr_t)0x400, compile_a) == S2A_DIRECT_RES_OK,
           "the freed slot is reusable");
 

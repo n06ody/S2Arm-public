@@ -706,3 +706,5 @@
 20261126-2206-audio-splitter-snapshot-links.patch
 20261127-1516-joycon-imu-gravity-frame.patch
 20261127-1853-audio-nodestates-pinned.patch
+20261127-1257-libpack-ssbo-window-mask.patch
+20261127-1332-direct-compile-phase-timing.patch

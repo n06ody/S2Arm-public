@@ -388,6 +388,91 @@ int nvn_vk_format_texview_ok(VkFormat base, uint32_t tex_nvn_format, uint32_t vi
     return nvn_vk_format_override_ok(base, view_nvn_format, out, why, why_size);
 }
 
+static uint32_t bc_decoded_storage_bytes(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: return 1;
+    case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: return 2;
+    case VK_FORMAT_R8G8B8A8_UNORM: return 4;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+    default: return 0;
+    }
+}
+
+static int bc_decoded_same_family_bc(uint32_t tex_nvn, uint32_t view_nvn, int *view_is_srgb) {
+    *view_is_srgb = 0;
+    switch (tex_nvn) {
+    case NVN_FORMAT_RGB_DXT1:
+    case NVN_FORMAT_RGB_DXT1_SRGB:
+        if (view_nvn == NVN_FORMAT_RGB_DXT1) return 1;
+        if (view_nvn == NVN_FORMAT_RGB_DXT1_SRGB) { *view_is_srgb = 1; return 1; }
+        return 0;
+    case NVN_FORMAT_RGBA_DXT1:
+    case NVN_FORMAT_RGBA_DXT1_SRGB:
+        if (view_nvn == NVN_FORMAT_RGBA_DXT1 || view_nvn == NVN_FORMAT_RGB_DXT1) return 1;
+        if (view_nvn == NVN_FORMAT_RGBA_DXT1_SRGB || view_nvn == NVN_FORMAT_RGB_DXT1_SRGB) { *view_is_srgb = 1; return 1; }
+        return 0;
+    case NVN_FORMAT_RGBA_DXT3:
+    case NVN_FORMAT_RGBA_DXT3_SRGB:
+        if (view_nvn == NVN_FORMAT_RGBA_DXT3) return 1;
+        if (view_nvn == NVN_FORMAT_RGBA_DXT3_SRGB) { *view_is_srgb = 1; return 1; }
+        return 0;
+    case NVN_FORMAT_RGBA_DXT5:
+    case NVN_FORMAT_RGBA_DXT5_SRGB:
+        if (view_nvn == NVN_FORMAT_RGBA_DXT5) return 1;
+        if (view_nvn == NVN_FORMAT_RGBA_DXT5_SRGB) { *view_is_srgb = 1; return 1; }
+        return 0;
+    case NVN_FORMAT_BPTC_UNORM:
+    case NVN_FORMAT_BPTC_UNORM_SRGB:
+        if (view_nvn == NVN_FORMAT_BPTC_UNORM) return 1;
+        if (view_nvn == NVN_FORMAT_BPTC_UNORM_SRGB) { *view_is_srgb = 1; return 1; }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+int nvn_vk_bc_decoded_view_ok(VkFormat storage_fmt, uint32_t tex_nvn_format, uint32_t view_nvn_format,
+                              VkFormat *out, char *why, size_t why_size) {
+    const int astc = storage_fmt == VK_FORMAT_ASTC_4x4_UNORM_BLOCK || storage_fmt == VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+    if (view_nvn_format >= NVN_FORMAT_RGB_DXT1 && view_nvn_format <= NVN_FORMAT_BPTC_UFLOAT) {
+        int view_srgb = 0;
+        if (!bc_decoded_same_family_bc(tex_nvn_format, view_nvn_format, &view_srgb)) {
+            if (why && why_size) snprintf(why, why_size,
+                "BC 解码贴图 0x%x 不支持跨族/改符号视图格式 0x%x", tex_nvn_format, view_nvn_format);
+            return -1;
+        }
+        if (astc) {
+            if (out) *out = view_srgb ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+            return 0;
+        }
+        if (storage_fmt == VK_FORMAT_R8G8B8A8_UNORM) {
+            if (out) *out = view_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            return 0;
+        }
+        if (why && why_size) snprintf(why, why_size,
+            "BC 解码贴图存储格式 %d 不支持 BC 视图 0x%x", (int)storage_fmt, view_nvn_format);
+        return -1;
+    }
+    if (astc || nvn_vk_format_is_compressed(storage_fmt)) {
+        if (why && why_size) snprintf(why, why_size,
+            "ASTC 转码 BC 贴图 0x%x 不支持非 BC1 视图格式 0x%x", tex_nvn_format, view_nvn_format);
+        return -1;
+    }
+    const uint32_t sb = bc_decoded_storage_bytes(storage_fmt);
+    nvn_fmt_info vi;
+    VkFormat vf = nvn_vk_format(view_nvn_format);
+    if (!sb || vf == VK_FORMAT_UNDEFINED || !nvn_fmt_info_of(view_nvn_format, &vi) ||
+        vi.depth || vi.stencil || vi.expand || vi.bw != 1 || vi.bh != 1 ||
+        nvn_vk_format_is_depth(vf) || nvn_vk_format_is_compressed(vf) || vi.bytes != sb) {
+        if (why && why_size) snprintf(why, why_size,
+            "BC 解码贴图 0x%x（存储 %u 字节）与视图格式 0x%x 存储类不兼容",
+            tex_nvn_format, sb, view_nvn_format);
+        return -1;
+    }
+    if (out) *out = vf;
+    return 0;
+}
+
 // sRGB → 线性：规范分段公式在 8 位输入上逐值预计算（与固定功能顶点获取同一数学定义；
 // 本文件刻意不进 libm，powf/ldexpf 会让宿主纯函数单测多一条链接依赖）。
 static const float vattr_srgb_lut[256] = {
@@ -454,6 +539,18 @@ static void vattr_i2f32(const uint8_t *src, float *out, int n, int is_signed) {
     }
 }
 
+static float vattr_f16(uint16_t value) {
+    const uint32_t exp = (value >> 10) & 31u, frac = value & 1023u;
+    if (!exp) {
+        const float magnitude = (float)frac * 0x1p-24f;
+        return value & 0x8000u ? -magnitude : magnitude;
+    }
+    const uint32_t bits = ((uint32_t)(value & 0x8000u) << 16) | ((exp == 31u ? 255u : exp + 112u) << 23) | (frac << 13);
+    float out;
+    memcpy(&out, &bits, sizeof out);
+    return out;
+}
+
 // 顶点取数语义无原生 VkFormat 等价物、必须走 CPU 解码的 NVN 格式（不取决于设备能力）：
 // 32 位 UI2F/I2F——Vulkan 无 32 位 USCALED/SSCALED；按 *_UINT/*_SINT 绑定会让声明为
 // Float 的着色器输入拿到整数位模式（静默读错值）。返回 1 = 顶点路径必须解码。
@@ -474,6 +571,41 @@ int nvn_vattr_cpu_decode(uint32_t nvn_format, const uint8_t *src, float out[4]) 
     out[0] = out[1] = out[2] = 0.0f;
     out[3] = 1.0f;
     switch (nvn_format) {
+    // 三分量顶点格式的设备支持逐格式查。缺原生格式时只解这三个分量，W 仍是默认的 1。
+    case NVN_FORMAT_RGB8:
+    case NVN_FORMAT_RGB8SN:
+    case NVN_FORMAT_RGB8_UI2F:
+    case NVN_FORMAT_RGB8_I2F:
+        for (int i = 0; i < 3; i++) {
+            const int8_t s = (int8_t)src[i];
+            switch (nvn_format) {
+            case NVN_FORMAT_RGB8: out[i] = (float)src[i] / 255.0f; break;
+            case NVN_FORMAT_RGB8SN: out[i] = s == INT8_MIN ? -1.0f : (float)s / 127.0f; break;
+            case NVN_FORMAT_RGB8_UI2F: out[i] = (float)src[i]; break;
+            default: out[i] = (float)s; break;
+            }
+        }
+        return 3;
+    case NVN_FORMAT_RGB16F:
+    case NVN_FORMAT_RGB16:
+    case NVN_FORMAT_RGB16SN:
+    case NVN_FORMAT_RGB16_UI2F:
+    case NVN_FORMAT_RGB16_I2F:
+        for (int i = 0; i < 3; i++) {
+            memcpy(&v, src + 2 * i, sizeof v);
+            const int16_t s = (int16_t)v;
+            switch (nvn_format) {
+            case NVN_FORMAT_RGB16F: out[i] = vattr_f16(v); break;
+            case NVN_FORMAT_RGB16: out[i] = (float)v / 65535.0f; break;
+            case NVN_FORMAT_RGB16SN: out[i] = s == INT16_MIN ? -1.0f : (float)s / 32767.0f; break;
+            case NVN_FORMAT_RGB16_UI2F: out[i] = (float)v; break;
+            default: out[i] = (float)s; break;
+            }
+        }
+        return 6;
+    case NVN_FORMAT_RGB32F:
+        memcpy(out, src, 3 * sizeof out[0]);
+        return 12;
     // 8 位 sRGB：RGB 分量过 EOTF，alpha 恒为线性 unorm；RGBX/BGRX 的 X 是填充位取 1.0。
     case NVN_FORMAT_RGBX8_SRGB:
         out[0] = vattr_srgb_lut[src[0]]; out[1] = vattr_srgb_lut[src[1]]; out[2] = vattr_srgb_lut[src[2]];

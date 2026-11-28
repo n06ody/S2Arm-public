@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """安卓首局预热随包种子整理（android/tools/vk_warm_seed.py）单测：python3 android/tests/vk_warm_seed_test.py
 
-文件按宿主格式手写（程序清单 60 + n*844 + 8、管线清单 32 + n*388，见 android/native/nvn/nvn_vk_{prog,pipe}_warm.c），
+文件按宿主格式手写（程序清单 60 + n*624 + 8、管线清单 32 + n*388，见 android/native/nvn/nvn_vk_{prog,pipe}_warm.c），
 期望的目录名、条数、字节由测试自己算，不调被测实现：
   ① 一台设备一份（程序 P1 P2 + 管线 P1 P2 P9）→ <闭包 hex16>-<profile hex16>/ 下：程序清单逐字节原样，管线清单只剩 P1 P2（P9 的程序不在），
      条数 2、校验和按手算 FNV-1a 重算
@@ -40,9 +40,9 @@ def sha8(s): return hashlib.sha256(s.encode()).digest()[:8]
 
 
 def prog_file(ids, profile='profile-A', closure='closure-A', corrupt=False):
-    hdr = struct.pack('<IIII', 0x31575053, 2, 88, len(ids)) + hashlib.sha256(profile.encode()).digest() + struct.pack('<i', 7) + sha8(closure)
+    hdr = struct.pack('<IIII', 0x31575053, 3, 112, len(ids)) + hashlib.sha256(profile.encode()).digest() + struct.pack('<i', 7) + sha8(closure)
     assert len(hdr) == 60
-    body = b''.join(ident(n) + struct.pack('<I', 3) + bytes(24) + b'\x03\x02\x00\x00' + struct.pack('<IIIIQ', 0x100, 0x100, 0, 9, 1) + bytes([n]) * 0x200 for n in ids)   # 88 字节头 + 两段 0x100 的 c1
+    body = b''.join(ident(n) + struct.pack('<I', 3) + bytes(40) + b'\x03\x02\x00\x00' + struct.pack('<IIIIIIQ', 0x100, 0x100, 0, 0, 0, 9, 1) + bytes([n]) * 0x200 for n in ids)   # 112 字节头 + 两段 0x100 的 c1
     b = hdr + body
     return b + struct.pack('<Q', fnv(b) ^ (1 if corrupt else 0)), 'programs-v1-' + sha8(closure).hex() + '.bin'
 

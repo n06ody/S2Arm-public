@@ -48,6 +48,7 @@ void nvk_pp_reset(nvk_pp *t);
 // 1 = 你是构建者（成功/失败都必须且只能 publish 一次，或 abandon）；2 = 同键已有项（用 state/wait 取）；
 // 0 = 表满/停用：这次不合并，自己建（调用方回退 SYNC）。eq 判两个 key 是否同一配方。
 int  nvk_pp_enter(nvk_pp *t, const void *key, int (*eq)(const void *, const void *), int *handle);
+int  nvk_pp_reclaim_ready(nvk_pp *t, int handle);   // 调用方确认管线已被淘汰，原 READY 槽重新认领
 void nvk_pp_publish(nvk_pp *t, int handle, void *obj, int code, const char *why);
 void nvk_pp_abandon(nvk_pp *t, int handle);   // 构建者放弃（入队失败回退 SYNC 时）
 

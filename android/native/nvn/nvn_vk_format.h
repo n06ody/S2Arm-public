@@ -68,6 +68,12 @@ int nvn_vk_format_override_ok(VkFormat base, uint32_t nvn_format, VkFormat *out,
 // 格式覆盖，输出 base（解码后的图像/默认采样视图格式）；异格式才按兼容类表校验。
 int nvn_vk_format_texview_ok(VkFormat base, uint32_t tex_nvn_format, uint32_t view_nvn_format,
                              VkFormat *out, char *why, size_t why_size);
+// bc_decoded 贴图（compute 解码未压缩存储或 BC1->ASTC 4x4 转码存储）的异格式视图解析：
+// - BC->BC：仅允许同解码算法的 UNORM<->SRGB 孪生（BC1 RGB/RGBA、BC2、BC3、BC7）及 RGBA_DXT1*->RGB_DXT1*；
+// - BC->未压缩：仅限未压缩解码存储，且视图格式须为单平面非深度/非压缩/非展开且每纹素字节数与存储一致；
+// - 其余（跨族 BC、BC4/5 UNORM<->SNORM、BC6H SFLOAT<->UFLOAT、ASTC 转码图的非 BC1 视图、异字节类等）明确返回 -1。
+int nvn_vk_bc_decoded_view_ok(VkFormat storage_fmt, uint32_t tex_nvn_format, uint32_t view_nvn_format,
+                              VkFormat *out, char *why, size_t why_size);
 #ifdef __cplusplus
 }
 #endif

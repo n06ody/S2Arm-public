@@ -26,6 +26,7 @@ static int g_pipe_fail;
 static uint64_t g_fake_hits = 12345;
 
 int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_warm_reactive")) return getenv("S2A_TEST_WARM_REACTIVE") != NULL;
     if (!strcmp(name, "nvk_compute_warm")) return getenv("S2A_COMPUTE_WARM") ? atoi(getenv("S2A_COMPUTE_WARM")) : dflt;
     if (!strcmp(name, "nvk_warm_max")) { const char *e = getenv("S2A_PW_MAX"); return e && *e ? atoi(e) : dflt; }
     if (!strcmp(name, "nvk_pw_diag")) { const char *e = getenv("S2A_PW_DIAG"); return e && *e ? atoi(e) : dflt; }   // #1372：诊断开关，缺省 0
@@ -186,15 +187,15 @@ static void prog_setup(uint8_t seed) {
 
 // ---- 逐字段改动表：kind + 下标，mutate 把该字段改「一点点」 ----
 enum {
-    K_CFMT, K_LMAP, K_PRIM, K_PATCH, K_PRIM_RESTART, K_DFMT, K_SFMT, K_SAMPLES,
+    K_CFMT, K_LMAP, K_PRIM, K_PATCH, K_PRIM_RESTART, K_PROVOKING_LAST, K_DFMT, K_SFMT, K_SAMPLES,
     K_BLEND_TARGET, K_BLEND_SRC_RGB, K_BLEND_DST_RGB, K_BLEND_SRC_A, K_BLEND_DST_A, K_BLEND_EQ_RGB, K_BLEND_EQ_A,
     K_BLEND_ADV_MODE, K_BLEND_ADV_OVERLAP, K_BLEND_ADV_PREMUL, K_BLEND_ADV_NORMDST,
     K_COLOR_BLEND_EN, K_COLOR_LOGIC_OP, K_COLOR_ALPHA_FUNC, K_CHMASK, K_MS_A2C, K_MS_SL_GRID,
-    K_ATTR_FMT, K_ATTR_OFFSET, K_ATTR_STREAM, K_STREAM_STRIDE, K_STREAM_DIVISOR,
+    K_ATTR_FMT, K_ATTR_OFFSET, K_ATTR_STREAM, K_STREAM_STRIDE, K_STREAM_DIVISOR_2, K_STREAM_DIVISOR_3,
     K_DS_DT, K_DS_DW, K_DS_DF, K_DS_ST, K_DS_SF_F, K_DS_SF_B, K_DS_FAIL_F, K_DS_ZFAIL_F, K_DS_ZPASS_F,
     K_DS_FAIL_B, K_DS_ZFAIL_B, K_DS_ZPASS_B,
-    K_POLY_CULL, K_POLY_FRONT, K_POLY_MODE, K_POLY_OFFSET_EN,
-    K_RAST_DISCARD, K_CLIP_NEG1, K_ORIGIN_LL, K_DEPTH_CLAMP
+    K_POLY_CULL, K_POLY_FRONT, K_POLY_MODE, K_POLY_OFFSET_EN, K_DISABLED_SAMPLES,
+    K_RAST_DISCARD, K_CLIP_NEG1, K_ORIGIN_LL, K_DEPTH_CLAMP, K_SAMPLE_SHADING, K_DEPTH_BOUNDS
 };
 
 static void mutate(nvn_gpu_pipe_desc *d, int kind, int idx) {
@@ -204,6 +205,7 @@ static void mutate(nvn_gpu_pipe_desc *d, int kind, int idx) {
     case K_PRIM: d->prim += 1; break;
     case K_PATCH: d->patch_size += 1; break;
     case K_PRIM_RESTART: d->prim_restart ^= 1; break;
+    case K_PROVOKING_LAST: d->provoking_last ^= 1; break;
     case K_DFMT: d->dfmt += 1; break;
     case K_SFMT: d->sfmt += 1; break;
     case K_SAMPLES: d->samples += 1; break;
@@ -228,7 +230,8 @@ static void mutate(nvn_gpu_pipe_desc *d, int kind, int idx) {
     case K_ATTR_OFFSET: d->attr[idx].offset += 1; break;
     case K_ATTR_STREAM: d->attr[idx].stream += 1; break;
     case K_STREAM_STRIDE: d->stream[idx].stride += 1; break;
-    case K_STREAM_DIVISOR: d->stream[idx].divisor += 1; break;
+    case K_STREAM_DIVISOR_2: d->stream[idx].divisor = 2; break;
+    case K_STREAM_DIVISOR_3: d->stream[idx].divisor = 3; break;
     case K_DS_DT: d->ds.dt ^= 1; break;
     case K_DS_DW: d->ds.dw ^= 1; break;
     case K_DS_DF: d->ds.df += 1; break;
@@ -245,9 +248,12 @@ static void mutate(nvn_gpu_pipe_desc *d, int kind, int idx) {
     case K_POLY_FRONT: d->poly.front ^= 1; break;
     case K_POLY_MODE: d->poly.mode += 1; break;
     case K_POLY_OFFSET_EN: d->poly.offset_en += 1; break;
+    case K_DISABLED_SAMPLES: d->disabled_samples = 0x8105; break;
     case K_RAST_DISCARD: d->rast_discard ^= 1; break;
     case K_CLIP_NEG1: d->clip_neg1 ^= 1; break;
     case K_ORIGIN_LL: d->origin_ll ^= 1; break;
+    case K_SAMPLE_SHADING: d->sample_shading = NVN_SAMPLE_MODE_FORCE_ON; break;
+    case K_DEPTH_BOUNDS: d->depth_bounds_enable ^= 1; break;
     case K_DEPTH_CLAMP: d->depth_clamp ^= 1; break;
     default: break;
     }
@@ -259,6 +265,7 @@ static const struct mut k_muts[] = {
     {"cfmt4", K_CFMT, 4}, {"cfmt5", K_CFMT, 5}, {"cfmt6", K_CFMT, 6}, {"cfmt7", K_CFMT, 7},
     {"lmap0", K_LMAP, 0}, {"lmap1", K_LMAP, 1}, {"lmap7", K_LMAP, 7},
     {"prim", K_PRIM, 0}, {"patch_size", K_PATCH, 0}, {"prim_restart", K_PRIM_RESTART, 0},
+    {"provoking_last", K_PROVOKING_LAST, 0},
     {"dfmt", K_DFMT, 0}, {"sfmt", K_SFMT, 0}, {"samples", K_SAMPLES, 0},
     {"color.blend_en", K_COLOR_BLEND_EN, 0}, {"color.logic_op", K_COLOR_LOGIC_OP, 0},
     {"color.alpha_func", K_COLOR_ALPHA_FUNC, 0}, {"chmask", K_CHMASK, 0},
@@ -269,8 +276,10 @@ static const struct mut k_muts[] = {
     {"ds.zfail_b", K_DS_ZFAIL_B, 0}, {"ds.zpass_b", K_DS_ZPASS_B, 0},
     {"poly.cull", K_POLY_CULL, 0}, {"poly.front", K_POLY_FRONT, 0}, {"poly.mode", K_POLY_MODE, 0},
     {"poly.offset_en", K_POLY_OFFSET_EN, 0},
+    {"disabled_samples", K_DISABLED_SAMPLES, 0},
     {"rast_discard", K_RAST_DISCARD, 0}, {"clip_neg1", K_CLIP_NEG1, 0},
-    {"origin_ll", K_ORIGIN_LL, 0}, {"depth_clamp", K_DEPTH_CLAMP, 0},
+    {"origin_ll", K_ORIGIN_LL, 0}, {"depth_clamp", K_DEPTH_CLAMP, 0}, {"sample_shading", K_SAMPLE_SHADING, 0},
+    {"depth_bounds_enable", K_DEPTH_BOUNDS, 0},
     // 数组：每个元素都扫（blend 的 11 个字段扫第 0、第 7 个元素；attr / stream 扫全部 16 个）
     {"blend0.target", K_BLEND_TARGET, 0}, {"blend0.src_rgb", K_BLEND_SRC_RGB, 0},
     {"blend0.dst_rgb", K_BLEND_DST_RGB, 0}, {"blend0.src_a", K_BLEND_SRC_A, 0},
@@ -281,8 +290,9 @@ static const struct mut k_muts[] = {
     {"blend7.dst_a", K_BLEND_DST_A, 7}, {"blend7.adv_mode", K_BLEND_ADV_MODE, 7},
     {"attr0.fmt", K_ATTR_FMT, 0}, {"attr0.offset", K_ATTR_OFFSET, 0}, {"attr0.stream", K_ATTR_STREAM, 0},
     {"attr15.fmt", K_ATTR_FMT, 15}, {"attr15.stream", K_ATTR_STREAM, 15},
-    {"stream0.stride", K_STREAM_STRIDE, 0}, {"stream0.divisor", K_STREAM_DIVISOR, 0},
-    {"stream15.stride", K_STREAM_STRIDE, 15}, {"stream15.divisor", K_STREAM_DIVISOR, 15},
+    {"stream0.stride", K_STREAM_STRIDE, 0}, {"stream0.divisor2", K_STREAM_DIVISOR_2, 0},
+    {"stream0.divisor3", K_STREAM_DIVISOR_3, 0},
+    {"stream15.stride", K_STREAM_STRIDE, 15}, {"stream15.divisor2", K_STREAM_DIVISOR_2, 15},
 };
 #define NMUT ((int)(sizeof k_muts / sizeof k_muts[0]))
 #define NFIELDS (NMUT + 1)
@@ -668,6 +678,7 @@ static int mode_save_race(void) {
 // 载入之后 take 的顺序与集合必须就是文件里那份；运行期的 note、热点重排（order 重建）、淘汰、周期 save
 // 都不许影响它——否则同一配方被取两次、另一个配方永远漏掉（复核复现的 A→A）。
 static int mode_frozen(void) {
+    setenv("S2A_TEST_WARM_REACTIVE", "1", 1);
     uint8_t id[32];
     ident_fill(id, 0x66);
     prog_setup(0x66);
@@ -680,7 +691,13 @@ static int mode_frozen(void) {
     CHECK(nvk_pipe_warm_load() == 3, "frozen: three recipes load");
     struct nvk_pipe_rec got, ar, br, cr;
     nvk_pipe_warm_rec_of(&a, id, &ar); nvk_pipe_warm_rec_of(&b, id, &br); nvk_pipe_warm_rec_of(&c, id, &cr);
-    CHECK(nvk_pipe_warm_take(&got) == 1 && !memcmp(got.desc, ar.desc, NVK_PW_DESC_BYTES), "frozen: first take = hottest A");
+    uint8_t other[32];
+    memcpy(other, id, sizeof other);
+    other[31] ^= 1;
+    CHECK(!nvk_pipe_warm_take_program(other, &got) && nvk_pipe_warm_pending() == 3,
+          "frozen: same bucket with different full identity cannot take a recipe");
+    CHECK(nvk_pipe_warm_take_program(id, &got) && !memcmp(got.desc, ar.desc, NVK_PW_DESC_BYTES) &&
+          nvk_pipe_warm_pending() == 2, "frozen: published program takes its hottest recipe exactly once");
     // 运行期搅动：B 变最热、插入新配方 D、立刻落盘（会重排 order）
     for (int i = 0; i < 20; i++) nvk_pipe_warm_note(&b, id);
     nvk_pipe_warm_note(&d, id);

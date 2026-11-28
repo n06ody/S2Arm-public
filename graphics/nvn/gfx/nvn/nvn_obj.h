@@ -6,6 +6,7 @@
 #include <string.h>
 #include "nvn.h"
 #include "nvn_tex.h"
+#include "nvn_wait_trace.h"
 
 #define MAGIC(a, b, c, d) ((uint32_t)(a) | (uint32_t)(b) << 8 | (uint32_t)(c) << 16 | (uint32_t)(d) << 24)
 #define FITS(T, H) _Static_assert(sizeof(T) <= sizeof(H), #T " exceeds the reserved size of " #H)
@@ -74,7 +75,9 @@ typedef struct { NVNdevice *dev; samp_par p; } samp_builder_t;                  
 typedef struct { uint32_t magic, pad; samp_par p; } samp_t;                                   FITS(samp_t, NVNsampler);
 
 // The per-stage shader keys are not kept in prog_t: the game's real NVNprogram may be smaller than the header's 0xC0 (growing prog_t corrupted the adjacent object in Mario); see prog_keys in hle_nvn.c
-typedef struct { uint32_t magic, nstage; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
+enum { NVN_SAMPLE_MODE_DEFAULT, NVN_SAMPLE_MODE_FORCE_ON, NVN_SAMPLE_MODE_FORCE_OFF };
+// 保持旧程序对象与落盘快照的尺寸和字段偏移；旧的 nstage 在 [0,6]，高六位均为零。
+typedef struct { uint32_t magic; uint32_t nstage : 26, sample_shading : 6; NVNshaderData sd[6]; uint64_t serial; } prog_t;     FITS(prog_t, NVNprogram);   // serial: table key for the replay layer's resolved result
 
 // ext_ev / ext_val：来自别的队列的栅栏（nvnSyncInitializeFromFencedGLSync：GL 层的共享事件与提交序号）；NULL = 普通 NVN 栅栏
 typedef struct { uint32_t magic, fenced; uint64_t fence; void *ext_ev; uint64_t ext_val; } sync_t;   FITS(sync_t, NVNsync);
@@ -84,6 +87,9 @@ static inline void sync_publish_ext(sync_t *s, uint64_t fence, void *ev, uint64_
     __atomic_store_n(&s->fence, fence, __ATOMIC_RELAXED);
     __atomic_store_n(&s->ext_ev, ev, __ATOMIC_RELAXED); __atomic_store_n(&s->ext_val, v, __ATOMIC_RELAXED);
     __atomic_store_n(&s->fenced, 1u, __ATOMIC_RELEASE);
+#if defined(__ANDROID__) || defined(S2A_WAIT_TRACE_TEST)
+    if (s2a_nvk_wait_trace_publish) s2a_nvk_wait_trace_publish(s, fence);
+#endif
 }
 static inline void sync_publish(sync_t *s, uint64_t fence) { sync_publish_ext(s, fence, NULL, 0); }   // 重新围栏：别的队列的栅栏作废
 // 已发布且是别的队列的栅栏：*ev / *v 给出要等的共享事件与值
@@ -161,7 +167,7 @@ enum {
     OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_CLEAR_BUF, OP_DEPTH_CLAMP, OP_RENDER_COND, OP_FENCE_SYNC, OP_TF_BIND, OP_TF_STATE, OP_RAST_DISCARD, OP_VP_SWIZZLE, OP_BIND_TEX1, OP_PRIM_RESTART, OP_SET_PATCH_SIZE, OP_DRAW_TEX, OP_WAIT_SYNC, OP_ALPHA_REF, OP_COUNT_
 };
 // Payload (immediately follows op_hdr)
-typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
+typedef struct p_set_rt { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
 // SetRenderTargets 的记录按实际内容编码（11-01，Mario Tennis Aces）：定长 p_set_rt（8 个颜色槽）+ n+1 份快照每条 504 字节，比真机 NVN 大 5–10 倍，
 // 每帧 1 MB 命令内存被它和视口用满后回调游戏，游戏那块缓冲没注册溢出处理 → 跳空指针。紧凑记录（payload，紧跟 op_hdr，全部 8 字节对齐）：
 //   p_set_rt_c 头 8B → 指针 8B × k（非空颜色按槽序，再深度；k = popcount(cmask) + 有深度）→ view_t 16B × v（有视图的颜色按槽序，再深度视图）→ tex_t 快照 128B × k（第 i 个指针的快照）
@@ -218,10 +224,10 @@ typedef struct { int32_t first, n; uint8_t sw[16][4]; } p_vp_swizzle;   // SetVi
 // 各阶段最近一次绑定的 key 合起来才是这次 draw 的有效程序；只记本次调用的掩码会丢掉先绑的阶段。
 // p_bind_program 是回放读的完整样子；命令流里只有 p_bind_program_id，读时一律经 bind_program_rec 还原。
 typedef struct { const prog_t *prog; int32_t stages; uint8_t kok; uint8_t keys[6][8]; prog_t snap; uint8_t stage_of[6]; } p_bind_program;
-// OP_BIND_PROGRAM 的载荷（S2Arm 11-01）：程序身份 = 游戏的程序对象 + 绑定当时的序号 + 阶段位，24 字节、整条 32 字节（旧记录带快照与键，载荷 184 字节、整条 192 字节）。
+// OP_BIND_PROGRAM 的载荷（S2Arm 11-01）：程序对象、绑定当时的序号、阶段位与逐样本模式，24 字节、整条 32 字节（旧大记录载荷 184 字节、整条 192 字节）。
 // 真机 NVN 绑定时只把着色器地址编进命令流；游戏按真机体积给命令内存，旧记录 5–10 倍大，勇者斗恶龙 XI S 开局 8 秒内存回调里 UE4 断言「PSO CommandMemory OOM」。
 // 同一序号的程序内容不再变（SetShaders 换新序号），snap / keys / kok / stage_of 按序号存在宿主表（hle_nvn.c prog_snap_put，只增不删）
-typedef struct { const prog_t *prog; uint64_t serial; int32_t stages, pad; } p_bind_program_id;
+typedef struct { const prog_t *prog; uint64_t serial; int32_t stages; uint32_t sample_shading; } p_bind_program_id;
 // 宿主按序号的程序快照表（hle_nvn.c）：返回的快照指针长期有效；没有该序号返回空。安卓直连核心可能不带 hle_nvn.c 链接，故弱引用
 const prog_t *nvn_prog_snap_get(uint64_t serial, uint8_t keys[6][8], uint8_t *ok, uint8_t stage[6]) __attribute__((weak));
 uint64_t nvn_prog_set_ns(uint64_t serial) __attribute__((weak));   // 首遇等待诊断（#1001，hle_nvn.c）：这个序号 SetShaders 的时刻（now_ns）；没开 DM_NVN_FU_SETAT / 没记到 = 0
@@ -233,9 +239,12 @@ static inline const p_bind_program *bind_program_rec(const void *a, uint32_t siz
     t->prog = r->prog; t->stages = r->stages; t->snap.serial = r->serial;
     const prog_t *s = nvn_prog_snap_get ? nvn_prog_snap_get(r->serial, t->keys, &t->kok, t->stage_of) : NULL;
     if (s) t->snap = *s;
+    t->snap.sample_shading = r->sample_shading;  // 绑定时捕获；旧记录的保留字为 0
     return t;
 }
-typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind: 0 blend 1 color 2 chmask 3 ms 4 poly 5 ds
+enum { NVN_BIND_LINE_WIDTH = 6, NVN_BIND_DEPTH_BOUNDS = 7 };
+typedef struct { uint32_t enable; float min, max; } p_depth_bounds;
+typedef struct { int32_t kind; uint8_t bytes[0x18]; } p_bind_state;      // kind: 0 blend 1 color 2 chmask 3 ms 4 poly 5 ds 6 line width 7 depth bounds
 typedef struct { int32_t first, n; uint32_t st[16]; } p_bind_vattr;
 typedef struct { int32_t first, n; vs_st st[16]; } p_bind_vstream;
 typedef struct { int32_t first, n; NVNbufferRange r[16]; } p_bind_vbuf;

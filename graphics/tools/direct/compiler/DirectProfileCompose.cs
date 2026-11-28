@@ -45,7 +45,7 @@ namespace S2A.DirectCompiler
             Capabilities capabilities = Map(caps);
             SupportLayout layout = SupportLayout.Compile();
 
-            byte[] body = WriteBody(translatorClosure, layout, capabilities);
+            byte[] body = WriteBody(translatorClosure, layout, capabilities, caps.TessellationShader);
             string hash = "sha256-" + Convert.ToHexStringLower(Sha256.HashData(body));
             byte[] profile = InsertHash(body, hash);
 
@@ -169,7 +169,7 @@ namespace S2A.DirectCompiler
         }
 
         // 规范化 body：字段顺序固定、无空白，唯一不含 profileHash。profileHash = sha256(这份字节)。
-        private static byte[] WriteBody(string closure, SupportLayout layout, Capabilities caps)
+        private static byte[] WriteBody(string closure, SupportLayout layout, Capabilities caps, bool tessellationShader)
         {
             using var stream = new MemoryStream();
             using (var w = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = false, SkipValidation = false }))
@@ -213,6 +213,7 @@ namespace S2A.DirectCompiler
                 w.WriteBoolean("supportsGeometryShader", caps.SupportsGeometryShader);
                 w.WriteBoolean("supportsGeometryShaderPassthrough", caps.SupportsGeometryShaderPassthrough);
                 w.WriteBoolean("supportsGeometryShaderOcclusionQuery", caps.SupportsGeometryShaderOcclusionQuery);
+                if (tessellationShader) w.WriteBoolean("supportsTessellationShader", true);
                 w.WriteBoolean("supportsTransformFeedback", caps.SupportsTransformFeedback);
                 w.WriteBoolean("supportsImageLoadFormatted", caps.SupportsImageLoadFormatted);
                 w.WriteBoolean("supportsLayerVertexTessellation", caps.SupportsLayerVertexTessellation);

@@ -2,7 +2,7 @@
 // Copyright 2026 S2Arm contributors
 // Inspect the selected compute entry's default workgroup size before creating a
 // driver shader. This is not a full SPIR-V validator. Unknown size expressions
-// fail explicitly; cpipe_get separately rejects specialization overrides.
+// fail explicitly; cpipe_get repeats the checks with effective overrides.
 #pragma once
 #include "spirv_storage.h"
 #include "../../../graphics/third_party/spirv_cross/spirv.h"
@@ -26,7 +26,21 @@ static inline size_t s2a_spv_wg_def(const unsigned char *p, size_t n, uint32_t i
     return 0;
 }
 
-static inline const char *s2a_spirv_workgroup_size(const void *blob, size_t bytes, const char *entry, uint32_t size[3]) {
+static inline int s2a_spv_wg_scalar_const(const unsigned char *p, size_t n, uint32_t bound, uint32_t id, uint32_t *out_val) {
+    if (!id || id >= bound) return 0;
+    size_t scalar = s2a_spv_wg_def(p, n, id, 0);
+    if (!scalar) return 0;
+    uint32_t first = s2a_spv_wg_word(p, scalar), op = first & 65535u;
+    if ((first >> 16) != 4 || (op != SpvOpConstant && op != SpvOpSpecConstant)) return 0;
+    uint32_t type = s2a_spv_wg_word(p, scalar + 1);
+    size_t integer = s2a_spv_wg_def(p, n, type, SpvOpTypeInt);
+    if (!integer || (s2a_spv_wg_word(p, integer) >> 16) != 4 || s2a_spv_wg_word(p, integer + 2) != 32) return 0;
+    *out_val = s2a_spv_wg_word(p, scalar + 3);
+    return 1;
+}
+
+static inline const char *s2a_spirv_workgroup_size_ex(const void *blob, size_t bytes, const char *entry,
+                                                      int allow_local_size_id, uint32_t size[3]) {
     const unsigned char *p = (const unsigned char *)blob;
     if (!p || bytes < 20 || (bytes & 3u) || s2a_spv_word(p) != SpvMagicNumber)
         return "compute workgroup: malformed SPIR-V header";
@@ -62,9 +76,17 @@ static inline const char *s2a_spirv_workgroup_size(const void *blob, size_t byte
         if ((op == SpvOpExecutionMode || op == SpvOpExecutionModeId) && len >= 3 &&
             s2a_spv_wg_word(p, i + 1) == function) {
             const uint32_t mode = s2a_spv_wg_word(p, i + 2);
-            // vk_device currently enables neither Vulkan 1.3 nor maintenance4.
-            if (mode == SpvExecutionModeLocalSizeId)
-                return "compute workgroup: LocalSizeId requires maintenance4 (not enabled)";
+            if (mode == SpvExecutionModeLocalSizeId) {
+                if (!allow_local_size_id)
+                    return "compute workgroup: LocalSizeId requires maintenance4 (not enabled)";
+                if (op != SpvOpExecutionModeId || len != 6 || have_local)
+                    return "compute workgroup: invalid LocalSizeId execution mode";
+                for (unsigned k = 0; k < 3; k++) {
+                    if (!s2a_spv_wg_scalar_const(p, n, bound, s2a_spv_wg_word(p, i + 3 + k), &size[k]))
+                        return "compute workgroup: LocalSizeId component is not a 32-bit integer constant";
+                }
+                have_local = 1;
+            }
             if (mode == SpvExecutionModeLocalSize) {
                 if (op != SpvOpExecutionMode || len != 6 || have_local)
                     return "compute workgroup: invalid LocalSize execution mode";
@@ -101,6 +123,10 @@ static inline const char *s2a_spirv_workgroup_size(const void *blob, size_t byte
         size[k] = s2a_spv_wg_word(p, scalar + 3);
     }
     return NULL;
+}
+
+static inline const char *s2a_spirv_workgroup_size(const void *blob, size_t bytes, const char *entry, uint32_t size[3]) {
+    return s2a_spirv_workgroup_size_ex(blob, bytes, entry, 0, size);
 }
 
 // Total bytes of all Workgroup storage-class variables, for the device

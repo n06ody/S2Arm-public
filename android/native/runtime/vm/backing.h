@@ -36,6 +36,10 @@ uint64_t plat_backing_deferred(void);   // 推迟打洞的累计次数
 int  s2a_mem_backing_alias_ref(uint64_t src, uint64_t n);
 // unref 后若源已死就按宿主页打洞（此时页已无任何别名引用）。
 void s2a_mem_backing_alias_unref(uint64_t src, uint64_t n);
+// Visit a page-aligned, private RW heap extent under the VM owner lock. The
+// visitor must never reenter the VM owner. Zero means the proof was unavailable.
+size_t s2a_android_mem_land_probe_heap(const void *addr, size_t len,
+                                       size_t (*visit)(const void *, size_t, void *), void *opaque);
 
 #ifdef __cplusplus
 }

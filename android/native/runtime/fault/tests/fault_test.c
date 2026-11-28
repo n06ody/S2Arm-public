@@ -1,5 +1,9 @@
 #define _GNU_SOURCE
 #include "../fault.h"
+#ifdef S2A_NVN_PROBE_FIXTURE
+#include "graphics/nvn/gfx/nvn/nvn_dirty.h"
+#include "s2a_direct_host.h"
+#endif
 #include "../../../guest_signal.h"
 #include <asm/sigcontext.h>
 #include "../sigframe_compat.h"
@@ -186,12 +190,75 @@ static void rejected(ucontext_t *u, int expected, const char *name) {
     check(s2a_android_fault_redirect(u, 77) == -expected, name);
     check(!memcmp(u, &before, sizeof *u), "reject leaves live frame unchanged");
 }
+#ifdef S2A_NVN_PROBE_FIXTURE
+// System-level dependencies outside this fixture's scope. The production direct
+// hook registration, adapter and XSTACK are linked. No test substitutes mprotect
+// or decodes read/write from a fixture flag.
+static s2a_guest_write_prep_fn prep_write;
+void s2a_track_set_write_prep(s2a_guest_write_prep_fn fn) { prep_write = fn; }
+void s2a_track_write_quiet(uint64_t addr, uint64_t len) { if (prep_write) prep_write(addr, len); }
+void dm_log(const char *fmt, ...) { (void)fmt; }
+
+static void land_probe_operations(void) {
+    uint8_t *p = mmap(NULL, 3 * page_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(p != MAP_FAILED, "map exact range for landing access probe");
+    p[0] = 0x19;
+    p[page_size] = 0x28;
+    p[2 * page_size] = 0x37;
+    nvn_dirty_add_range(p, 3 * page_size);
+    nvn_dirty_read_probe_set_redirect(s2a_android_fault_redirect_call);
+    check(nvn_dirty_read_probe_arm(p + 1, 2 * page_size) == 1, "arm only the full page in exact range");
+    check(*(volatile uint8_t *)(p + page_size) == 0x28, "real read retry sees eager bytes");
+    check(nvn_dirty_read_probe_arm(p + page_size, page_size) == 1, "arm full page again");
+    *(volatile uint8_t *)(p + page_size) = 0x42;
+    struct nvn_dirty_read_probe_stats stats;
+    nvn_dirty_read_probe_stats(&stats);
+    check(stats.armed == 2 && stats.read == 1 && stats.write == 1, "read and write classified from real ESR");
+    check(stats.failed == 0 && stats.mp_calls == 4, "two real arm/restore pairs");
+    check(p[0] == 0x19 && p[page_size] == 0x42 && p[2 * page_size] == 0x37, "adjacent pages unchanged");
+
+    int fds[2];
+    check(!pipe(fds), "create real kernel copy fixture");
+    check(nvn_dirty_read_probe_arm(p + page_size, page_size) == 1, "arm before kernel copy");
+    int before_kernel = real_restore;
+    errno = 0;
+    check(write(fds[1], p + page_size, 1) == -1 && errno == EFAULT, "kernel copy-in bypasses user signal");
+    check(real_restore == before_kernel, "EFAULT did not enter XSTACK");
+    struct nvn_dirty_probe_access access;
+    nvn_dirty_read_probe_access_begin(&access, p + page_size, 1, 0);
+    check(nvn_dirty_read_probe_arm(p + page_size, page_size) == 0, "no rearm with kernel access pending");
+    check(write(fds[1], p + page_size, 1) == 1, "same kernel copy-in succeeds within access scope");
+    nvn_dirty_read_probe_access_end(&access);
+    check(nvn_dirty_read_probe_arm(p + 2 * page_size, page_size) == 1, "arm before kernel destination lease");
+    nvn_dirty_read_probe_access_begin(&access, p + 2 * page_size, 1, 1);
+    check(read(fds[0], p + 2 * page_size, 1) == 1 && p[2 * page_size] == 0x42, "scoped kernel copy-out");
+    nvn_dirty_read_probe_access_end(&access);
+    close(fds[0]);
+    close(fds[1]);
+    nvn_dirty_read_probe_stats(&stats);
+    check(stats.armed == 4 && stats.read == 1 && stats.write == 1, "kernel copies excluded from CPU fault totals");
+    check(stats.host_read == 1 && stats.host_write == 1 && stats.censored == 0, "host scope counts first access separately");
+    check(stats.failed == 0 && stats.mp_calls == 8, "four real protection arm/restore pairs");
+    printf("NVN land probe: page_bytes=%zu cpu_read=1 cpu_write=1 kernel_preflight_read=1 kernel_preflight_write=1 protection_calls=8 protection_ns=%llu\n",
+           page_size, (unsigned long long)stats.mp_ns);
+    nvn_dirty_remove_range(p);
+    check(!munmap(p, 3 * page_size), "unmap retired fixture range");
+}
+#endif
 static void handler(int sig, siginfo_t *si, void *pointer) {
     in_handler = 1;
     if (sig == SIGTRAP) {
         if (s2a_android_fault_handle(sig, si->si_addr, pointer, 0) != 1) _exit(122);
         real_restore++;
     } else {
+#ifdef S2A_NVN_PROBE_FIXTURE
+        int write;
+        if (s2a_android_fault_esr(pointer, &write)) {
+            const int handled = s2a_direct_fault(si->si_addr, write, pointer);
+            if (handled < 0) _exit(123);
+            if (handled == 1) { in_handler = 0; return; }
+        }
+#endif
         int guest = si->si_addr == page;
         if (s2a_android_fault_handle(sig, si->si_addr, pointer, guest) != 1) _exit(124);
         if (guest) real_fault++;
@@ -327,6 +394,12 @@ real:
     s2a_android_fault_dispatch_reset();
     check(!s2a_android_fault_dispatch_ready(), "handler owner can invalidate proof before replacement");
     check(!s2a_android_fault_probe(), "repeat final proof after handler lifecycle change");
+#ifdef S2A_NVN_PROBE_FIXTURE
+    const int before_landing_restore = real_restore;
+    s2a_fault_test_guest_stack(land_probe_operations, (char *)guest + guest_length);
+    check(real_restore == before_landing_restore + 2, "landing probe used two existing XSTACK returns");
+    check(touch_count == touches && host_slot.cur == host_slot.top, "no generic tracker callback or borrowed stack leak");
+#endif
     sigaction(SIGTRAP, &old_trap, NULL);
     sigaction(SIGSEGV, &old_segv, NULL);
     munmap(page, page_size); page = NULL;

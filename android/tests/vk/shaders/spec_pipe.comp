@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 S2Arm contributors
+#version 450
+layout(local_size_x_id = 9) in;
+layout(constant_id = 2) const int base = -1;
+layout(constant_id = 5) const float delta = 0;
+layout(set = 0, binding = 0, std430) writeonly buffer Result { int value; } result;
+void main() {
+    if (gl_LocalInvocationIndex == 0)
+        result.value = base + int(delta) + int(gl_WorkGroupSize.x) - 1;
+}

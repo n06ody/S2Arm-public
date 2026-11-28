@@ -64,6 +64,8 @@ void nvk_pipe_warm_test_hash_const(int on);
 //   程序清单还没定（-1）时 load 返回 -1 让预热线程稍后重试；种子不在 / 坏只打一行黄，本局按没有清单走。本局落盘照常写本机路径。
 int nvk_pipe_warm_load(void);        // 开局读清单 + 整份校验；返回可用条数（<0 = 关闭/失败）
 int nvk_pipe_warm_take(struct nvk_pipe_rec *out);
+// 取该已发布身份在开局快照中最热的待建配方；与顺序 take 共用消费状态。
+int nvk_pipe_warm_take_program(const uint8_t identity[32], struct nvk_pipe_rec *out);
 int nvk_pipe_warm_pending(void);
 
 // 按记录建一条管线并装进后端缓存（后台线程）：

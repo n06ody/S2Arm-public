@@ -64,7 +64,7 @@ struct s2a_input_identity_decoded {
     char fragment_output_types[8][S2A_INPUT_IDENTITY_NAME_MAX];
     char attribute_types[32][S2A_INPUT_IDENTITY_NAME_MAX];
     char alpha_test_compare[S2A_INPUT_IDENTITY_NAME_MAX];
-    char tex_stage[S2A_COMPILE_TEXTURE_MAX][4];                       // "vs"/"fs"/"cs"/"gs"
+    char tex_stage[S2A_COMPILE_TEXTURE_MAX][4];                       // NVN 阶段名，含 tcs/tes
     char tex_sampler_type[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_SAMPLER_MAX];
     char tex_format[S2A_COMPILE_TEXTURE_MAX][S2A_TEX_FORMAT_MAX];
 };

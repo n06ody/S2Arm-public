@@ -31,7 +31,7 @@ inc=(-I "$repo/build/c883-ndk")
 for d in android/tests/vkhost android/native/direct android/native runtime/include; do inc+=(-I "$repo/$d"); done
 wrap=()
 for fn in vkCreateInstance vkCreateDevice vkDestroyInstance vkEnumerateInstanceExtensionProperties \
-          vkEnumerateDeviceExtensionProperties vkGetPhysicalDeviceFeatures2; do wrap+=(-Wl,--wrap="$fn"); done
+          vkEnumerateDeviceExtensionProperties vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures2; do wrap+=(-Wl,--wrap="$fn"); done
 cc -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter -ffunction-sections -fdata-sections \
     "${inc[@]}" "$repo/android/tests/vk/standalone/device-features.c" "$source_file" \
     "${wrap[@]}" -Wl,--gc-sections -lvulkan -lpthread -lm -o "$binary"
@@ -44,7 +44,7 @@ rc=$?
 set -e
 if [ "$mode" = --negative-timeline ]; then
     if [ "$rc" != 1 ] || ! grep -q 'FAIL timeline-hidden: timeline create chain/extension mismatch' "$log" ||
-       ! grep -q 'device-features cases=8 failures=4 validation-errors=0' "$log"; then cat "$log"; exit 1; fi
+       ! grep -q 'device-features cases=11 failures=4 validation-errors=0' "$log"; then cat "$log"; exit 1; fi
     # 预期红只留在独立日志；模拟档失败诊断会扫描整套输出中的 ^FAIL，不能把负控冒充正向失败。
     echo "device-features negative: PASS (timeline-hidden rejected; 4 expected failures; log=$log)"
     exit 0
@@ -52,5 +52,5 @@ fi
 cat "$log"
 [ "$rc" = 0 ] || exit "$rc"
 ! grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"
-grep -q 'device-features cases=8 failures=0 validation-errors=0' "$log"
+grep -q 'device-features cases=11 failures=0 validation-errors=0' "$log"
 if [ -z "$mode" ]; then bash "$0" --negative-timeline; fi

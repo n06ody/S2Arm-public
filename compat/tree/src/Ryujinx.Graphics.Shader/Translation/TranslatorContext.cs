@@ -318,6 +318,12 @@ namespace Ryujinx.Graphics.Shader.Translation
             }
         }
 
+        public static void SetSpirvPhaseSample(Action<long, long> sample, Func<long> cpuClock)
+        {
+            SpirvGenerator.PhaseSample = sample;
+            SpirvGenerator.PhaseCpuClock = cpuClock;
+        }
+
         public ShaderProgram Translate(bool asCompute = false)
         {
             ResourceManager resourceManager = CreateResourceManager(asCompute);

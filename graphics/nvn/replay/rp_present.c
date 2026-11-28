@@ -4,9 +4,15 @@
 #include <time.h>
 #include <stdatomic.h>
 #include "rp_exec.h"
+// 弱链接[replay]：rp_buf_land_diag_log
+// 弱链接[replay]：rp_buf_guest_snapshot
+// 弱链接[replay]：rp_buf_replay_snapshot
+void rp_buf_land_diag_log(double frames) __attribute__((weak));
 #include "rp_shader.h"
 #include "rp_fps_seg.h"
 #include "rp_res.h"
+// 弱链接[replay]：rp_tex_upload_diag_window
+#pragma weak rp_tex_upload_diag_window
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
 #include "nvn_dirty.h"
@@ -20,6 +26,8 @@
 // 弱链接登记（tools/weak_link_decl.py，场合 replay = 回放核心宿主单测）：后端 / 首用模块的可选件，缺实现时地址为空、走不到调用
 // 弱链接[replay]：rp_shader_live_compile_take
 #pragma weak rp_shader_live_compile_take
+// 弱链接[replay]：rp_shader_lookahead_frame_end
+#pragma weak rp_shader_lookahead_frame_end
 // 弱链接[replay]：s2a_direct_diag_frame
 __attribute__((weak)) void s2a_direct_diag_frame(void);
 // 弱链接[replay]：nvn_gpu_stats
@@ -50,6 +58,94 @@ static uint64_t g_gap_over33;   // 超过 33 毫秒的帧数（精确按纳秒�
 // 这里按弱引用处理（同 rp_entry.c 的 nvn_ft_written）：没有实现时这一项显示 0，不改变既有日志与回放语义。
 // 只在上屏线程、只在长帧日志打开时查（nvn_gpu_stats 要锁后端、走一遍统计表）。
 extern void nvn_gpu_stats(nvn_gpu_stat_fn fn, void *user, int take) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_pass_discard_window
+void nvn_gpu_pass_discard_window(void) __attribute__((weak));
+
+// 弱链接[replay]：rp_binst_cut_diag_enabled
+int rp_binst_cut_diag_enabled(void) __attribute__((weak));
+
+// 原始窗口次数。stop 和 absent_stop 分别给出建表及实际缺项时旧表的扫描终点。
+static void binst_cut_window(const uint64_t *pf, uint64_t frames) {
+    static const char *const names[] = {
+        "empty", "cmd", "seg", "wgen", "absent", "consumed", "record", "binding", "mask",
+        "mdi", "stream", "hoist_off", "rebuilt_hit", "rebuilt_miss", "single_cut",
+        "resolve_skipped", "alloc_truncated",
+    };
+    _Static_assert(sizeof names / sizeof *names == RP_PERF_BI_TRUNC_ALLOC - RP_PERF_BI_EMPTY + 1,
+                   "binst cut fields");
+    char line[4096];
+    size_t n = (size_t)snprintf(line, sizeof line, "frames=%llu cut=%llu", (unsigned long long)frames,
+                                (unsigned long long)pf[RP_PERF_BINST_CUT]);
+    uint64_t undiagnosed = pf[RP_PERF_BINST_CUT];
+    for (int i = RP_PERF_BI_EMPTY; i <= RP_PERF_BI_OFF; i++) undiagnosed -= pf[i];
+    n += (size_t)snprintf(line + n, sizeof line - n, " diag_off=%llu", (unsigned long long)undiagnosed);
+    for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+        n += (size_t)snprintf(line + n, sizeof line - n, " %s=%llu", names[i],
+                             (unsigned long long)pf[RP_PERF_BI_EMPTY + i]);
+    static const char *const limits[] = {"cap", "steps", "header"};
+    for (int pass = 0; pass < 2; pass++) {
+        const int base = pass ? RP_PERF_BI_MISS_CAP : RP_PERF_BI_STOP_CAP;
+        const char *prefix = pass ? "absent_stop" : "stop";
+        for (int i = 0; i < 3; i++)
+            n += (size_t)snprintf(line + n, sizeof line - n, " %s_%s=%llu", prefix, limits[i],
+                                 (unsigned long long)pf[base + i]);
+        // 每个有值的 opcode 一项，用录制流的数值，限制单行长度。
+        for (int op = 0; op <= OP_NVN2_END_; op++) {
+            uint64_t count = pf[base + 3 + op];
+            if (count && n + 48 < sizeof line)
+                n += (size_t)snprintf(line + n, sizeof line - n, " %c%u=%llu", pass ? 'm' : 's',
+                                     (unsigned)op, (unsigned long long)count);
+        }
+    }
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "binst-cut-diag", line);
+}
+
+static void pass_discard_window(const uint64_t *perf, uint64_t frames) {
+    static const char *const names[] = {
+        "hint_color", "hint_ds", "reject_scope", "reject_next", "reject_range", "reject_target", "reject_mode",
+        "color", "depth", "stencil", "full_color", "full_depth", "full_stencil", "partial",
+        "mixed_size_clear", "folded_aspects", "vtx_stream", "guest_bind", "layer_out", "cond_query",
+        "non_primary", "target_state", "park", "first_encode",
+        "first_cold", "first_indirect", "first_stream", "first_topology", "first_indexed",
+        "first_index_format", "first_index_span", "first_record"
+    };
+    _Static_assert(sizeof names / sizeof *names == RP_PERF_DC_FIRST_RECORD - RP_PERF_DC_HINT_COLOR + 1,
+                   "discard window names");
+    static const char *const next_names[] = {
+        "next_bind_program", "next_viewport", "next_scissor", "next_set_rt", "next_draw",
+        "next_end_handle", "next_end_submit", "next_end_call", "next_jump_call",
+        "next_sync_xfer", "next_bad_clear", "next_other"
+    };
+    _Static_assert(sizeof next_names / sizeof *next_names == RP_PERF_DC_NEXT_OTHER - RP_PERF_DC_NEXT_BIND_PROGRAM + 1,
+                   "discard successor names");
+    uint64_t total = 0;
+    for (unsigned i = 0; i < sizeof names / sizeof *names; i++) total += perf[RP_PERF_DC_HINT_COLOR + i];
+    for (int i = RP_PERF_DC_PRIM_0; i <= RP_PERF_DC_PRIM_OTHER; i++) total += perf[i];
+    if (total) {
+        char line[2560];
+        int n = snprintf(line, sizeof line, "frames=%llu", (unsigned long long)frames);
+        for (unsigned i = 0; i < sizeof names / sizeof *names; i++) {
+            n += snprintf(line + n, sizeof line - (size_t)n, " %s=%llu", names[i],
+                          (unsigned long long)perf[RP_PERF_DC_HINT_COLOR + i]);
+            if ((unsigned)n >= sizeof line) break;
+        }
+        // Count the old topology rejects, including those now admitted.
+        for (unsigned prim = 0; prim <= NVN_DRAW_PRIMITIVE_PATCHES && (unsigned)n < sizeof line; prim++) {
+            const uint64_t count = perf[RP_PERF_DC_PRIM_0 + prim];
+            if (count)
+                n += snprintf(line + n, sizeof line - (size_t)n, " topo_0x%x=%llu", prim, (unsigned long long)count);
+        }
+        if (perf[RP_PERF_DC_PRIM_OTHER] && (unsigned)n < sizeof line)
+            n += snprintf(line + n, sizeof line - (size_t)n, " topo_other=%llu",
+                          (unsigned long long)perf[RP_PERF_DC_PRIM_OTHER]);
+        for (unsigned i = 0; i < sizeof next_names / sizeof *next_names && (unsigned)n < sizeof line; i++)
+            n += snprintf(line + n, sizeof line - (size_t)n, " %s=%llu", next_names[i],
+                          (unsigned long long)perf[RP_PERF_DC_NEXT_BIND_PROGRAM + i]);
+        nvn_plat_log(NVN_PLAT_LOG_INFO, "pass-discard", line);
+    }
+    if (nvn_gpu_pass_discard_window) nvn_gpu_pass_discard_window();
+}
+
 struct plc_ns_rd { uint64_t ns; int got; };
 static uint64_t g_plc_ns_last;   // 上次取到的累计值（只在 [上屏] 动）
 static void plc_ns_cb(void *user, const char *name, uint64_t value) {
@@ -255,16 +351,19 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
       clock_gettime(CLOCK_MONOTONIC, &p1); present_ns = (uint64_t)(p1.tv_sec - p0.tv_sec) * 1000000000ull + (uint64_t)p1.tv_nsec - (uint64_t)p0.tv_nsec; rp_perf_add(RP_PERF_PRESENT_NS, present_ns); }
     nvn_gpu_view_release(v);   // 录完就放：后端段按引用保活到段完成
     if (nvn_gpu_ok(r)) {
+        if (rp_shader_lookahead_frame_end) rp_shader_lookahead_frame_end();
         if (s2a_direct_diag_frame) s2a_direct_diag_frame();
         if (s2a_frame_log_present_timed) s2a_frame_log_present_timed(acquire_ns, present_ns);
         if (rp_shader_live_compile_take) {
             struct rp_shader_live_compile_stats live;
             rp_shader_live_compile_take(&live);
-            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.timeout || live.compiled) {
-                char b[400];
-                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
+            if (live.enqueued || live.wait_ns || live.pending || live.fallback || live.start_failed ||
+                live.future_hits || live.timeout || live.compiled) {
+                char b[512];
+                snprintf(b, sizeof b, "现编帧 %llu：排队 %llu、提交等待 %.3f ms、暂缓 %llu、启动失败回退 %llu、前瞻未命中/缺任务回退 %llu、前瞻结果命中 %llu、无结果 %llu；编译线程跑完 %llu 份、合计 %.3f ms、最长 %.3f ms",
                          (unsigned long long)rp_frame(), (unsigned long long)live.enqueued, live.wait_ns / 1e6,
-                         (unsigned long long)live.pending, (unsigned long long)live.fallback, (unsigned long long)live.timeout,
+                         (unsigned long long)live.pending, (unsigned long long)live.start_failed, (unsigned long long)live.fallback,
+                         (unsigned long long)live.future_hits, (unsigned long long)live.timeout,
                          (unsigned long long)live.compiled, live.compile_ns / 1e6, live.compile_max_ns / 1e6);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
             }
@@ -329,6 +428,7 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                 snprintf(b, sizeof b, "分时（通道，每帧）：%.1f 个，共 %.1f 百万像素；颜色附件载入 %.1f 个；挂深度模板的 %.1f 个，其中整个通道没用到它的 %.1f 个；只有 0–1 笔绘制的 %.1f 个（挂深度模板 %.1f / 不挂 %.1f，共 %.1f 百万像素；一笔都没画的 %.1f 个）；同目标续接 %.1f 次、挂起清除 %.1f 条、缩小区域 %.1f 个（共 %.1f 百万像素）、影子附件 %.1f 个；开着的通道被结束的原因：换目标 %.1f、通道中途的整屏清除 %.1f、同一提交里第二次同步 %.1f、超长通道中途先交 %.1f、着色器写之后的游戏屏障 %.1f",
                          (double)pf[RP_PERF_PASSES] / f, (double)pf[RP_PERF_P_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_LOADC] / f, (double)pf[RP_PERF_P_DS] / f, (double)pf[RP_PERF_P_DS_IDLE] / f, (double)pf[RP_PERF_P_ONE] / f, (double)pf[RP_PERF_P_TINY_DS] / f, (double)pf[RP_PERF_P_TINY_NODS] / f, (double)pf[RP_PERF_P_TINY_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_CLEARONLY] / f, (double)pf[RP_PERF_P_CONT] / f, (double)pf[RP_PERF_P_PARK] / f, (double)pf[RP_PERF_P_AREA] / f, (double)pf[RP_PERF_P_AREA_KPIX] / 1e3 / f, (double)pf[RP_PERF_P_SHADOW] / f, (double)pf[RP_PERF_P_CUT_RT] / f, (double)pf[RP_PERF_P_CUT_CLEAR] / f, (double)pf[RP_PERF_P_CUT_XFER] / f, (double)pf[RP_PERF_P_CUT_LONG] / f, (double)pf[RP_PERF_P_CUT_BAR] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (rp_binst_cut_diag_enabled && rp_binst_cut_diag_enabled()) binst_cut_window(pf, fr);
                 if (pf[RP_PERF_BINST_HZ] || pf[RP_PERF_BINST_ONE] || pf[RP_PERF_BINST_SCAN]) {
                     snprintf(b, sizeof b, "分时（间接绘制 base instance 拷贝，每帧）：批量前移拷贝 %.1f 笔、回退逐笔 %.1f 笔（其中为它收了开着的通道 %.1f 次）、前移扫描 %.1f 次、前移了没用上 %.1f 笔",
                              (double)pf[RP_PERF_BINST_HZ] / f, (double)pf[RP_PERF_BINST_ONE] / f, (double)pf[RP_PERF_BINST_CUT] / f, (double)pf[RP_PERF_BINST_SCAN] / f, (double)pf[RP_PERF_BINST_WASTE] / f);
@@ -374,11 +474,24 @@ static uint64_t present_impl(const tex_t *t, double period_s, const int crop[4])
                     snprintf(b + strlen(b), sizeof b - strlen(b), "；显卡写登记 %.0f 条共 %.0f KB、同段合并 %.0f 条省 %.0f KB",
                              (double)pf[RP_PERF_GW_REG_N] / f, (double)pf[RP_PERF_GW_REG_KB] / f, (double)pf[RP_PERF_GW_MERGED_N] / f, (double)pf[RP_PERF_GW_MERGED_KB] / f);
                 nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                if (rp_buf_land_diag_log) rp_buf_land_diag_log(f);
+                if (rp_tex_upload_diag_window) rp_tex_upload_diag_window(fr);
+                pass_discard_window(pf, fr);
                 if (pf[RP_PERF_MIRROR_HOIST] || pf[RP_PERF_MIRROR_OVERLAP] || pf[RP_PERF_MIRROR_FALLBACK]) {
-                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu",
+                    // 分因只在 nvk_mirror_exact_guard 开启的提交计数。
+                    snprintf(b, sizeof b, "镜像同步（本窗口）disjoint_hoisted=%llu true_overlap_split=%llu fallback_split=%llu"
+                             " fb_gw=%llu fb_land=%llu fb_overflow=%llu fb_unknown=%llu fb_other=%llu",
                              (unsigned long long)pf[RP_PERF_MIRROR_HOIST], (unsigned long long)pf[RP_PERF_MIRROR_OVERLAP],
-                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK]);
+                             (unsigned long long)pf[RP_PERF_MIRROR_FALLBACK], (unsigned long long)pf[RP_PERF_MIRROR_FB_GW],
+                             (unsigned long long)pf[RP_PERF_MIRROR_FB_LAND], (unsigned long long)pf[RP_PERF_MIRROR_FB_OVERFLOW],
+                             (unsigned long long)pf[RP_PERF_MIRROR_FB_UNKNOWN], (unsigned long long)pf[RP_PERF_MIRROR_FB_OTHER]);
                     nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    if (pf[RP_PERF_MIRROR_SPAN_GW] || pf[RP_PERF_MIRROR_SPAN_LAND]) {
+                        snprintf(b, sizeof b, "镜像按上传区间前移（本窗口，已计入 disjoint_hoisted）span_gw=%llu span_land=%llu",
+                                 (unsigned long long)pf[RP_PERF_MIRROR_SPAN_GW],
+                                 (unsigned long long)pf[RP_PERF_MIRROR_SPAN_LAND]);
+                        nvn_plat_log(NVN_PLAT_LOG_INFO, "present", b);
+                    }
                 }
                 if (pf[RP_PERF_TEX_BYTE_EQUAL] || pf[RP_PERF_TEX_BYTE_CHANGED] || nvn_plat_flag("nvk_tex_byte_equal", 0)) {
                     snprintf(b, sizeof b, "窗口合计 byte_equal_skipped=%llu byte_changed=%llu skipped_bytes=%llu",

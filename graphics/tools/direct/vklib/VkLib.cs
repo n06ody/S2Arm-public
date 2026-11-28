@@ -110,7 +110,7 @@ namespace S2A.DshVkLib
                         {
                             DshVk.CompileWithSpv(key, stage, cc.Value.Code, cc.Value.Ctl, outDir, xc, profile, imgLoadRaw, work);
                             made[key + "_b.json"] = Encoding.UTF8.GetBytes(DshCompiler.PackFiles[key + "_b.json"]);
-                            made[key + "_b.spv"] = DshVk.PackSpv[key + "_b.spv"];
+                            foreach (var (name, bytes) in DshVk.PackSpv) made[name] = bytes;
                         }
                         foreach (var (name, bytes) in made) Write(outDir, name, bytes);
                         if (ck != null && made.Count > 0) Store.Put(ck, made);
@@ -127,12 +127,15 @@ namespace S2A.DshVkLib
             return rows;
         }
 
-        /// <summary>把 keysDir 里逐键的 _b.json / _b.spv（几何：_vg&lt;t&gt;.json / .spv）打成离线 Vulkan 库写进 libDir（LibPack.PackFiles，头部记完整指纹 Fp）→ (红行, 汇总行)；libDir 里已有 lib.idx 报红</summary>
+        /// <summary>把 keysDir 里逐键的反射、SPIR-V、片元输出变体打成离线 Vulkan 库，头部记完整指纹 Fp。libDir 里已有 lib.idx 报红。</summary>
         public static (List<string> Bad, string Line) Pack(string keysDir, string libDir, string chain)
         {
             Directory.CreateDirectory(libDir);
             var vg = new System.Text.RegularExpressions.Regex(@"_vg\d\.(json|spv)\z", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
-            var names = Directory.EnumerateFiles(keysDir).Select(Path.GetFileName).Where(n => !n.StartsWith("._", StringComparison.Ordinal) && (n.EndsWith("_b.json", StringComparison.Ordinal) || n.EndsWith("_b.spv", StringComparison.Ordinal) || vg.IsMatch(n))).ToList();
+            var names = Directory.EnumerateFiles(keysDir).Select(Path.GetFileName)
+                .Where(n => !n.StartsWith("._", StringComparison.Ordinal) &&
+                    (n.EndsWith("_b.json", StringComparison.Ordinal) || n.EndsWith("_b.spv", StringComparison.Ordinal) ||
+                     n.EndsWith("_vf.bin", StringComparison.Ordinal) || vg.IsMatch(n))).ToList();
             return LibPack.PackFiles(names, n => File.ReadAllBytes(Path.Combine(keysDir, n)), libDir, chain, Fp);
         }
 

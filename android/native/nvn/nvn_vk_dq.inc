@@ -22,37 +22,56 @@
 #define DQ_U __attribute__((unused))
 
 #define DQ_CMDS(X) \
-    X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) \
+    X(vkCmdPipelineBarrier) X(vkCmdPipelineBarrier2KHR) X(vkCmdCopyBuffer) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) X(vkCmdFillBuffer) X(vkCmdUpdateBuffer) \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) X(vkCmdResolveImage) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBeginRendering) \
     X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdBindVertexBuffers) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor) \
-    X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdSetLineWidth) X(vkCmdDraw) \
+    X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetDepthBias) X(vkCmdSetDepthBounds) X(vkCmdSetLineWidth) X(vkCmdDraw) \
     X(vkCmdPushConstants) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) X(vkCmdDispatchIndirect) X(vkCmdResetQueryPool) \
-    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdBeginQuery) X(vkCmdEndQuery)
+    X(vkCmdWriteTimestamp) X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT) X(vkCmdDrawIndirectByteCountEXT) X(vkCmdDrawIndirectCount) X(vkCmdDrawIndexedIndirectCount) X(vkCmdBeginQuery) X(vkCmdEndQuery) X(vkCmdPushDescriptorSetKHR)
 #define DQ_SYNC(X) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkQueueSubmit) X(vkQueuePresentKHR) X(vkQueueWaitIdle) X(vkDeviceWaitIdle) \
     X(vkDestroyCommandPool) X(vkFreeCommandBuffers) X(vkResetCommandBuffer)
 #define DQ_REAL(f) static PFN_##f r_##f;
+S2A_VK_EDS1_COMMANDS(DQ_REAL)
+S2A_VK_EDS2_COMMANDS(DQ_REAL)
+S2A_VK_VERTEX_INPUT_COMMANDS(DQ_REAL)
 DQ_CMDS(DQ_REAL)   // 命令缓冲之外的那几个入口（提交、呈现、池）直接调符号：它们没有版本 / 扩展的问题，宿主用例对其中几个打了桩
 #define DQ_OP(f) OP_##f,
-enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
+enum { OP_WRAP, DQ_CMDS(DQ_OP) OP_FILL, OP_EXT_STATE, OP_EXT_INPUT, OP_EXT_STRIDE, OP_N };   // OP_FILL：暂存填充（nvn_gpu_arena_fill），不是 Vulkan 调用
 // 诊断读数：每类调用经过包装多少次（不管开关开没开）。backend_vulkan_wsi.inc 随「对象读数」每 300 帧打一行。
 #define DQ_NAME(f) #f,
-static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill" };
+static const char *const g_dq_names[OP_N] = { "wrap", DQ_CMDS(DQ_NAME) "fill", "extended state", "vertex input", "vertex stride" };
 static uint64_t g_dq_cnt[OP_N];
 #define DQ_COUNT(op) __atomic_fetch_add(&g_dq_cnt[op], 1, __ATOMIC_RELAXED)
 
 // ---- the queue: one producer, one consumer; positions count bytes since the start (the ring index is position % dq_RING), records 16-byte aligned ----
-enum { dq_RING = 32 << 20 };
+enum { dq_RING = 32 << 20, DQ_PUB_BATCH = 16, DQ_PUB_BYTES = 4096, DQ_RD_BATCH = 32 };
 typedef struct { uint32_t op, size; VkCommandBuffer cb; } dq_rec_hdr;   // size: the whole record, header included
-static uint8_t *g_dq_ring; static uint64_t g_dq_w;   // the producer's write position
-static _Atomic uint64_t g_dq_pub, g_dq_rd;           // published end, the recorder's read position
-static _Atomic int g_dq_sleeping;   // the recorder is (about to be) asleep on g_dq_cv
-static _Atomic int g_dq_draining;   // how many threads wait in vk_dq_drain's slow path (a count, not a flag: threads drain concurrently and the one that leaves first must not erase the others' mark, or the recorder skips the wake-up and they sit out the 1 s timeout)
-static pthread_spinlock_t g_dq_pl;   // the producers' lock, from dq_rec_begin to dq_rec_end
-static pthread_mutex_t g_dq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dq_cv, g_dq_dcv = PTHREAD_COND_INITIALIZER;   // g_dq_cv 在 vk_dq_init 里按单调时钟初始化（录制线程定时醒要用）；录制线程起来之前没有人睡在它上面，也没有人叫它
+// 缓存行隔离（debug.s2a.nvk_dq_opt，缺省 0）：把生产者热变量、共享发布位、录制线程热变量、清空慢路径拆到独立 64B 缓存行，
+// 避免回放线程与 s2a-vk-record 在每条 vkCmd* 上跨核乒乓；开档时启用生产者本地 rd 缓存、pub/rd 批量发布与 drain 强制刷新。
+static uint8_t *g_dq_ring;
+static _Alignas(64) struct {
+    pthread_spinlock_t pl;   // the producers' lock, from dq_rec_begin to dq_rec_end
+    int opt;                 // protected by pl, including switch changes between records
+    uint64_t w;              // the producer's write position
+    uint64_t rd_cached;      // 生产者本地缓存的 g_dq_rd（nvk_dq_opt=1 时仅在估算满环才跨核重读）
+    uint32_t unpub;          // 尚未发布到 g_dq_pub 的记录数
+    size_t unpub_bytes;      // 尚未发布的字节数
+    uint64_t opt_pub;        // 实际执行 g_dq_pub seq_cst 发布的次数（持 pl 递增，无额外原子 RMW）
+    uint64_t opt_flush;      // vk_dq_drain 触发强制刷新的次数（持 pl 递增）
+    uint64_t opt_rd_reload;  // 生产者实际跨核读 g_dq_rd 的次数（持 pl 递增）
+} g_dq_p;
+static _Alignas(64) _Atomic uint64_t g_dq_pub;   // published end
+static _Atomic int g_dq_unpub_flag;              // 存在未发布记录（release/acquire 与 vk_dq_drain 配对）
 static _Atomic int g_dq_on;   // 开关：dq_poll 在提交处改，各生产者线程读（relaxed：切换点之后的调用走新路径即可）
+static _Atomic int g_dq_opt;  // 开关 debug.s2a.nvk_dq_opt（缺省 0）：缓存行隔离 + rd 本地缓存 + pub/rd 批量发布
 #define DQ_ON() atomic_load_explicit(&g_dq_on, memory_order_relaxed)
+static _Alignas(64) _Atomic uint64_t g_dq_rd;    // the recorder's read position
+static _Atomic int g_dq_sleeping;   // the recorder is (about to be) asleep on g_dq_cv
+static _Atomic uint32_t g_dq_cur_op;   // 录制线程正在做 / 刚开始做的那条的 op（清空等超时的自报红里指出卡在哪一类调用）
+static uint64_t g_dq_opt_rd;        // 录制线程实际发布 g_dq_rd 的次数（仅录制线程写，无额外原子 RMW）
+static _Alignas(64) _Atomic int g_dq_draining;   // how many threads wait in vk_dq_drain's slow path (a count, not a flag: threads drain concurrently and the one that leaves first must not erase the others' mark, or the recorder skips the wake-up and they sit out the 1 s timeout)
+static pthread_mutex_t g_dq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dq_cv, g_dq_dcv = PTHREAD_COND_INITIALIZER;   // g_dq_cv 在 vk_dq_init 里按单调时钟初始化（录制线程定时醒要用）；录制线程起来之前没有人睡在它上面，也没有人叫它
 static uint64_t g_dq_recs, g_dq_drains, g_dq_direct;   // records queued, drains, calls made directly (unknown arguments); 诊断计数，各线程可能同时读写：一律 relaxed 原子访问
-static _Atomic uint32_t g_dq_cur_op;                   // 录制线程正在做 / 刚开始做的那条的 op（清空等超时的自报红里指出卡在哪一类调用）
 static pthread_t g_dq_rec_th;                          // 录制线程（读它的 CPU 时间用，见 nvn_vk_dbg_dq_thread_cpu_ns）
 
 // 录制线程怎么等活（调试开关，开会话时读、之后每 64 次提交再读；缺省都是原行为）：
@@ -101,8 +120,30 @@ static DQ_U void dq_lat_line(char *b, size_t n) {
 }
 
 static void dq_wake(void) { if (atomic_load(&g_dq_sleeping)) { DQ_ST(DQS_WAKE, 1); pthread_mutex_lock(&g_dq_mu); pthread_cond_signal(&g_dq_cv); pthread_mutex_unlock(&g_dq_mu); } }
+// pl is held. Publish the record before clearing the drain hint.
+static void dq_opt_publish(void) {
+    atomic_store(&g_dq_pub, g_dq_p.w);
+    if (g_dq_p.unpub) {
+        g_dq_p.unpub = 0;
+        g_dq_p.unpub_bytes = 0;
+        atomic_store_explicit(&g_dq_unpub_flag, 0, memory_order_release);
+    }
+    __atomic_store_n(&g_dq_p.opt_pub, g_dq_p.opt_pub + 1, __ATOMIC_RELAXED);
+}
+static void dq_flush_pub(void) {
+    pthread_spin_lock(&g_dq_p.pl);
+    const int did = g_dq_p.unpub != 0;
+    if (did) {
+        dq_opt_publish();
+        __atomic_store_n(&g_dq_p.opt_flush, g_dq_p.opt_flush + 1, __ATOMIC_RELAXED);
+    }
+    pthread_spin_unlock(&g_dq_p.pl);
+    if (did) dq_wake();
+}
 static void vk_dq_drain(void) {
     if (!g_dq_ring) return;
+    const int dq_need_flush = atomic_load_explicit(&g_dq_unpub_flag, memory_order_acquire);
+    if (dq_need_flush) dq_flush_pub();
     uint64_t w = atomic_load(&g_dq_pub);   // 到此刻已经写完的记录（原文在自旋锁里读写位置；这里读已发布的位置，免得开关关着时每个调用都过一次锁。别的线程正写到一半的那条不算，它那次调用还没返回）
     if (atomic_load_explicit(&g_dq_rd, memory_order_acquire) >= w) return;
     const uint64_t t0 = atomic_load_explicit(&g_dq_stat, memory_order_relaxed) ? dq_now_ns() : 0;
@@ -119,25 +160,59 @@ static void vk_dq_drain(void) {
 done:
     if (t0) { const uint64_t ns = dq_now_ns() - t0; DQ_ST(DQS_DRAIN_WAIT, 1); DQ_ST(DQS_DRAIN_NS, ns); dq_hist_add(g_dq_hd, &g_dq_hd_max, ns); }
 }
-static void *dq_rec_begin(uint32_t op, VkCommandBuffer cb, size_t n) {   // room for a record with n bytes after its header
-    size_t need = (sizeof(dq_rec_hdr) + n + 15) & ~(size_t)15;   // 16-byte records: the ring's end always has room for a whole header
-    if (need > dq_RING / 4) return NULL;   // (no call copies that much: such a call is made directly)
-    pthread_spin_lock(&g_dq_pl);   // released by dq_rec_end
-    size_t off = (size_t)(g_dq_w % dq_RING);
-    if (off + need > dq_RING) {   // the rest of the ring is skipped
-        while (g_dq_w + (dq_RING - off) - atomic_load_explicit(&g_dq_rd, memory_order_acquire) > dq_RING) { dq_wake(); sched_yield(); }
-        dq_rec_hdr *h = (dq_rec_hdr *)(g_dq_ring + off); h->op = OP_WRAP; h->size = (uint32_t)(dq_RING - off); g_dq_w += dq_RING - off; atomic_store_explicit(&g_dq_pub, g_dq_w, memory_order_release); off = 0;
+static void dq_wait_room(size_t bytes) {
+    const uint64_t end = g_dq_p.w + bytes;
+    if (!g_dq_p.opt) {
+        while (end - atomic_load_explicit(&g_dq_rd, memory_order_acquire) > dq_RING) {
+            dq_wake(); sched_yield();
+        }
+        return;
     }
-    while (g_dq_w + need - atomic_load_explicit(&g_dq_rd, memory_order_acquire) > dq_RING) { dq_wake(); sched_yield(); }
+    while (end - g_dq_p.rd_cached > dq_RING) {
+        g_dq_p.rd_cached = atomic_load_explicit(&g_dq_rd, memory_order_acquire);
+        __atomic_store_n(&g_dq_p.opt_rd_reload, g_dq_p.opt_rd_reload + 1, __ATOMIC_RELAXED);
+        if (end - g_dq_p.rd_cached <= dq_RING) break;
+        if (g_dq_p.unpub) dq_opt_publish();
+        dq_wake(); sched_yield();
+    }
+}
+static void *dq_rec_begin(uint32_t op, VkCommandBuffer cb, size_t n) {
+    size_t need = (sizeof(dq_rec_hdr) + n + 15) & ~(size_t)15;
+    if (need > dq_RING / 4) return NULL;
+    pthread_spin_lock(&g_dq_p.pl);   // released by dq_rec_end
+    size_t off = (size_t)(g_dq_p.w & (dq_RING - 1));
+    if (off + need > dq_RING) {
+        const size_t pad = dq_RING - off;
+        dq_wait_room(pad);
+        dq_rec_hdr *h = (dq_rec_hdr *)(g_dq_ring + off); h->op = OP_WRAP; h->size = (uint32_t)pad; h->cb = VK_NULL_HANDLE;
+        g_dq_p.w += pad;
+        if (g_dq_p.opt) dq_opt_publish();
+        else atomic_store(&g_dq_pub, g_dq_p.w);
+        off = 0;
+    }
+    dq_wait_room(need);
     dq_rec_hdr *h = (dq_rec_hdr *)(g_dq_ring + off); h->op = op; h->size = (uint32_t)need; h->cb = cb;
     return h + 1;
 }
 static void dq_rec_end(void *payload) {
-    dq_rec_hdr *h = (dq_rec_hdr *)payload - 1; g_dq_w += h->size; __atomic_store_n(&g_dq_recs, g_dq_recs + 1, __ATOMIC_RELAXED);   // 自旋锁里：写者只有一个，读者（用例 / 读数）用原子读
-    const uint64_t w = g_dq_w;
-    atomic_store(&g_dq_pub, w);   // (seq_cst, against the recorder's sleep flag: either it sees this record or this sees it asleep)
-    pthread_spin_unlock(&g_dq_pl);
-    if (atomic_load(&g_dq_sleeping)) {   // 录制线程醒着就不用叫：它做完手头的会看到这一条
+    dq_rec_hdr *h = (dq_rec_hdr *)payload - 1; g_dq_p.w += h->size; __atomic_store_n(&g_dq_recs, g_dq_recs + 1, __ATOMIC_RELAXED);   // 自旋锁里：写者只有一个，读者（用例 / 读数）用原子读
+    const uint64_t w = g_dq_p.w;
+    int do_pub = 1;
+    if (!g_dq_p.opt) {
+        atomic_store(&g_dq_pub, w);   // seq_cst against recorder's sleep flag
+    } else {
+        if (h->op != OP_FILL) {
+            do_pub = g_dq_p.unpub + 1 >= DQ_PUB_BATCH || g_dq_p.unpub_bytes + h->size >= DQ_PUB_BYTES ||
+                     atomic_load_explicit(&g_dq_draining, memory_order_acquire);
+        }
+        if (do_pub) dq_opt_publish();
+        else {
+            g_dq_p.unpub_bytes += h->size;
+            if (!g_dq_p.unpub++) atomic_store_explicit(&g_dq_unpub_flag, 1, memory_order_release);
+        }
+    }
+    pthread_spin_unlock(&g_dq_p.pl);
+    if (do_pub && atomic_load(&g_dq_sleeping)) {   // 录制线程醒着就不用叫：它做完手头的会看到这一条
         if (atomic_load_explicit(&g_dq_stat, memory_order_relaxed) && !atomic_load_explicit(&g_dq_t0, memory_order_relaxed)) {   // 读数：记下睡着期间第一条记录发布的时刻（只在睡着时记，醒着时发布的记录不读时钟）
             uint64_t z = 0; atomic_compare_exchange_strong_explicit(&g_dq_t0, &z, dq_now_ns(), memory_order_relaxed, memory_order_relaxed);
         }
@@ -151,6 +226,7 @@ static uint8_t *dq_put(uint8_t **at, const void *src, size_t n) { uint8_t *d = *
 
 // ---- the recorder thread ----
 typedef struct { VkPipelineStageFlags src, dst; VkDependencyFlags dep; uint32_t nm, nb, ni; } a_barrier;
+typedef struct { VkDependencyFlags dep; uint32_t nm, nb, ni; } a_barrier2;
 typedef struct { VkBuffer s, d; uint32_t n; } a_copybuf;
 typedef struct { VkBuffer b; VkImage i; VkImageLayout l; uint32_t n; } a_b2i;
 typedef struct { VkImage i; VkImageLayout l; VkBuffer b; uint32_t n; } a_i2b;
@@ -163,11 +239,13 @@ typedef struct { VkRenderPassBeginInfo bi; VkRenderPassAttachmentBeginInfo ab; i
 typedef struct { VkRenderingInfo ri; int has_d, has_s; VkRenderingAttachmentInfo d, s; } a_rbegin;
 typedef struct { VkPipelineBindPoint bp; VkPipeline p; } a_bindpipe;
 typedef struct { VkPipelineBindPoint bp; VkPipelineLayout l; uint32_t first, n, ndyn; } a_sets;
+typedef struct { VkPipelineBindPoint bp; VkPipelineLayout l; uint32_t set, nw, ni, nb, nt; } a_pushdesc;
 typedef struct { uint32_t first, n; } a_range;
 typedef struct { VkBuffer b; VkDeviceSize off; VkIndexType t; } a_index;
 typedef struct { float c[4]; } a_blend;
 typedef struct { VkStencilFaceFlags f; uint32_t v; } a_stencil;
 typedef struct { float c, clamp, slope; } a_bias;
+typedef struct { float lo, hi; } a_bounds;
 typedef struct { uint32_t a, b, c, d; int32_t e; uint32_t f; } a_draw;
 typedef struct { VkPipelineLayout l; VkShaderStageFlags st; uint32_t off, size; } a_push;
 typedef struct { VkBuffer b; VkDeviceSize off; uint32_t n, stride; } a_indirect;
@@ -230,12 +308,70 @@ static int dq_fill_take(uint64_t t) {
     return 2;
 }
 
+enum {
+    DQ_EDS_CULL          = 1u << 0,
+    DQ_EDS_FRONT         = 1u << 1,
+    DQ_EDS_TOPOLOGY      = 1u << 2,
+    DQ_EDS_DEPTH_TEST    = 1u << 3,
+    DQ_EDS_DEPTH_WRITE   = 1u << 4,
+    DQ_EDS_DEPTH_COMPARE = 1u << 5,
+    DQ_EDS_STENCIL_TEST  = 1u << 6,
+    DQ_EDS_STENCIL_FRONT = 1u << 7,
+    DQ_EDS_STENCIL_BACK  = 1u << 8,
+    DQ_EDS_DISCARD       = 1u << 9,
+    DQ_EDS_BIAS          = 1u << 10,
+    DQ_EDS_RESTART       = 1u << 11,
+    DQ_EDS_RASTER_MASK   = DQ_EDS_CULL | DQ_EDS_FRONT | DQ_EDS_TOPOLOGY,
+    DQ_EDS_DS_MASK       = DQ_EDS_DEPTH_TEST | DQ_EDS_DEPTH_WRITE | DQ_EDS_DEPTH_COMPARE |
+                           DQ_EDS_STENCIL_TEST | DQ_EDS_STENCIL_FRONT | DQ_EDS_STENCIL_BACK,
+    DQ_EDS_BASE2_MASK    = DQ_EDS_DISCARD | DQ_EDS_BIAS | DQ_EDS_RESTART,
+};
+typedef struct {
+    uint32_t mask;
+    VkCullModeFlags cull;
+    VkFrontFace front;
+    VkPrimitiveTopology topology;
+    VkBool32 depth_test, depth_write, stencil_test;
+    VkCompareOp depth_compare;
+    VkStencilOpState stencil[2];
+    VkBool32 discard, bias, restart;
+} a_ext_state;
+
+static void r_ext_state(VkCommandBuffer cb, const a_ext_state *a) {
+    const uint32_t m = a->mask;
+    if (m & DQ_EDS_DISCARD) r_vkCmdSetRasterizerDiscardEnableEXT(cb, a->discard);
+    if (m & DQ_EDS_CULL) r_vkCmdSetCullModeEXT(cb, a->cull);
+    if (m & DQ_EDS_FRONT) r_vkCmdSetFrontFaceEXT(cb, a->front);
+    if (m & DQ_EDS_TOPOLOGY) r_vkCmdSetPrimitiveTopologyEXT(cb, a->topology);
+    if (m & DQ_EDS_DEPTH_TEST) r_vkCmdSetDepthTestEnableEXT(cb, a->depth_test);
+    if (m & DQ_EDS_DEPTH_WRITE) r_vkCmdSetDepthWriteEnableEXT(cb, a->depth_write);
+    if (m & DQ_EDS_DEPTH_COMPARE) r_vkCmdSetDepthCompareOpEXT(cb, a->depth_compare);
+    if (m & DQ_EDS_STENCIL_TEST) r_vkCmdSetStencilTestEnableEXT(cb, a->stencil_test);
+    if (m & (DQ_EDS_STENCIL_FRONT | DQ_EDS_STENCIL_BACK)) {
+        for (int f = 0; f < 2; ++f) {
+            if (!(m & (DQ_EDS_STENCIL_FRONT << f))) continue;
+            const VkStencilOpState *st = &a->stencil[f];
+            r_vkCmdSetStencilOpEXT(cb, f ? VK_STENCIL_FACE_BACK_BIT : VK_STENCIL_FACE_FRONT_BIT,
+                                   st->failOp, st->passOp, st->depthFailOp, st->compareOp);
+        }
+    }
+    if (m & DQ_EDS_BIAS) r_vkCmdSetDepthBiasEnableEXT(cb, a->bias);
+    if (m & DQ_EDS_RESTART) r_vkCmdSetPrimitiveRestartEnableEXT(cb, a->restart);
+}
+
 static void dq_run(const dq_rec_hdr *h) {
     const uint8_t *p = (const uint8_t *)(h + 1); VkCommandBuffer cb = h->cb;
     switch (h->op) {
     case OP_vkCmdPipelineBarrier: { const a_barrier *a = (const void *)p; const uint8_t *q = p + sizeof *a;
         const VkMemoryBarrier *m = (const void *)q; q += a->nm * sizeof *m; const VkBufferMemoryBarrier *b = (const void *)q; q += a->nb * sizeof *b; const VkImageMemoryBarrier *im = (const void *)q;
         r_vkCmdPipelineBarrier(cb, a->src, a->dst, a->dep, a->nm, a->nm ? m : NULL, a->nb, a->nb ? b : NULL, a->ni, a->ni ? im : NULL); break; }
+    case OP_vkCmdPipelineBarrier2KHR: { const a_barrier2 *a = (const void *)p; const uint8_t *q = p + sizeof *a;
+        const VkMemoryBarrier2KHR *m = (const void *)q; q += a->nm * sizeof *m; const VkBufferMemoryBarrier2KHR *b = (const void *)q; q += a->nb * sizeof *b; const VkImageMemoryBarrier2KHR *im = (const void *)q;
+        VkDependencyInfoKHR di = { .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO_KHR, .dependencyFlags = a->dep,
+            .memoryBarrierCount = a->nm, .pMemoryBarriers = a->nm ? m : NULL,
+            .bufferMemoryBarrierCount = a->nb, .pBufferMemoryBarriers = a->nb ? b : NULL,
+            .imageMemoryBarrierCount = a->ni, .pImageMemoryBarriers = a->ni ? im : NULL };
+        r_vkCmdPipelineBarrier2KHR(cb, &di); break; }
     case OP_vkCmdCopyBuffer: { const a_copybuf *a = (const void *)p; r_vkCmdCopyBuffer(cb, a->s, a->d, a->n, (const VkBufferCopy *)(p + sizeof *a)); break; }
     case OP_vkCmdCopyBufferToImage: { const a_b2i *a = (const void *)p; r_vkCmdCopyBufferToImage(cb, a->b, a->i, a->l, a->n, (const VkBufferImageCopy *)(p + sizeof *a)); break; }
     case OP_vkCmdCopyImageToBuffer: { const a_i2b *a = (const void *)p; r_vkCmdCopyImageToBuffer(cb, a->i, a->l, a->b, a->n, (const VkBufferImageCopy *)(p + sizeof *a)); break; }
@@ -250,7 +386,7 @@ static void dq_run(const dq_rec_hdr *h) {
         r_vkCmdClearAttachments(cb, a->na, at, a->nr, (const VkClearRect *)(at + a->na)); break; }
     case OP_vkCmdBeginRenderPass: { a_rpbegin a; memcpy(&a, p, sizeof a); const uint8_t *q = p + sizeof a;
         a.bi.pClearValues = a.bi.clearValueCount ? (const VkClearValue *)q : NULL; q += a.bi.clearValueCount * sizeof(VkClearValue);
-        if (a.has_ab) { a.ab.pAttachments = (const VkImageView *)q; a.bi.pNext = &a.ab; } else a.bi.pNext = NULL;
+        if (a.has_ab) { a.ab.pAttachments = a.ab.attachmentCount ? (const VkImageView *)q : NULL; a.ab.pNext = NULL; a.bi.pNext = &a.ab; } else a.bi.pNext = NULL;
         r_vkCmdBeginRenderPass(cb, &a.bi, a.c); break; }
     case OP_vkCmdEndRenderPass: r_vkCmdEndRenderPass(cb); break;
     case OP_vkCmdBeginRendering: { a_rbegin a; memcpy(&a, p, sizeof a);
@@ -260,6 +396,24 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdBindPipeline: { const a_bindpipe *a = (const void *)p; r_vkCmdBindPipeline(cb, a->bp, a->p); break; }
     case OP_vkCmdBindDescriptorSets: { const a_sets *a = (const void *)p; const VkDescriptorSet *s = (const void *)(p + sizeof *a);
         r_vkCmdBindDescriptorSets(cb, a->bp, a->l, a->first, a->n, s, a->ndyn, a->ndyn ? (const uint32_t *)(s + a->n) : NULL); break; }
+    case OP_vkCmdPushDescriptorSetKHR: { const a_pushdesc *a = (const void *)p; const uint8_t *q = p + sizeof *a;
+        const VkWriteDescriptorSet *src = (const void *)q; q += (size_t)a->nw * sizeof *src;
+        const VkDescriptorImageInfo *ii = (const void *)q; q += (size_t)a->ni * sizeof *ii;
+        const VkDescriptorBufferInfo *bi = (const void *)q; q += (size_t)a->nb * sizeof *bi;
+        const VkBufferView *tv = (const void *)q;
+        VkWriteDescriptorSet stw[64];
+        VkWriteDescriptorSet *wr = a->nw <= 64 ? stw : malloc((size_t)a->nw * sizeof *wr);
+        if (!wr) break;
+        uint32_t io = 0, bo = 0, to = 0;
+        for (uint32_t i = 0; i < a->nw; i++) {
+            wr[i] = src[i];
+            if (wr[i].pImageInfo) { wr[i].pImageInfo = ii + io; io += wr[i].descriptorCount; }
+            if (wr[i].pBufferInfo) { wr[i].pBufferInfo = bi + bo; bo += wr[i].descriptorCount; }
+            if (wr[i].pTexelBufferView) { wr[i].pTexelBufferView = tv + to; to += wr[i].descriptorCount; }
+        }
+        r_vkCmdPushDescriptorSetKHR(cb, a->bp, a->l, a->set, a->nw, wr);
+        if (wr != stw) free(wr);
+        break; }
     case OP_vkCmdBindVertexBuffers: { const a_range *a = (const void *)p; const VkBuffer *b = (const void *)(p + sizeof *a);
         r_vkCmdBindVertexBuffers(cb, a->first, a->n, b, (const VkDeviceSize *)(b + a->n)); break; }
     case OP_vkCmdBindIndexBuffer: { const a_index *a = (const void *)p; r_vkCmdBindIndexBuffer(cb, a->b, a->off, a->t); break; }
@@ -269,6 +423,7 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdSetStencilReference: { const a_stencil *a = (const void *)p; r_vkCmdSetStencilReference(cb, a->f, a->v); break; }
     case OP_vkCmdSetStencilCompareMask: { const a_stencil *a = (const void *)p; r_vkCmdSetStencilCompareMask(cb, a->f, a->v); break; }
     case OP_vkCmdSetStencilWriteMask: { const a_stencil *a = (const void *)p; r_vkCmdSetStencilWriteMask(cb, a->f, a->v); break; }
+    case OP_vkCmdSetDepthBounds: { const a_bounds *a = (const void *)p; r_vkCmdSetDepthBounds(cb, a->lo, a->hi); break; }
     case OP_vkCmdSetDepthBias: { const a_bias *a = (const void *)p; r_vkCmdSetDepthBias(cb, a->c, a->clamp, a->slope); break; }
     case OP_vkCmdSetLineWidth: { float w; memcpy(&w, p, sizeof w); r_vkCmdSetLineWidth(cb, w); break; }
     case OP_vkCmdDraw: { const a_draw *a = (const void *)p; r_vkCmdDraw(cb, a->a, a->b, a->c, a->d); break; }
@@ -291,6 +446,22 @@ static void dq_run(const dq_rec_hdr *h) {
     case OP_vkCmdBeginQuery: { const a_query *a = (const void *)p; r_vkCmdBeginQuery(cb, a->p, a->q, a->fl); break; }
     case OP_vkCmdEndQuery: { const a_query *a = (const void *)p; r_vkCmdEndQuery(cb, a->p, a->q); break; }
     case OP_FILL: dq_fill_run((const a_memfill *)(const void *)p); break;
+    case OP_EXT_STATE: r_ext_state(cb, (const void *)p); break;
+    case OP_EXT_INPUT: {
+        const a_range *a = (const void *)p;
+        const VkVertexInputBindingDescription2EXT *b = (const void *)(a + 1);
+        const VkVertexInputAttributeDescription2EXT *v = (const void *)(b + a->first);
+        r_vkCmdSetVertexInputEXT(cb, a->first, a->first ? b : NULL, a->n, a->n ? v : NULL);
+        break;
+    }
+    case OP_EXT_STRIDE: {
+        const a_range *a = (const void *)p;
+        const VkBuffer *b = (const void *)(a + 1);
+        const VkDeviceSize *o = (const void *)(b + a->n);
+        const VkDeviceSize *st = o + a->n;
+        r_vkCmdBindVertexBuffers2EXT(cb, a->first, a->n, b, o, NULL, st);
+        break;
+    }
     default: break;
     }
 }
@@ -332,7 +503,33 @@ static void *dq_recorder_main(void *arg) {
                 if (atomic_load_explicit(&g_dq_stat, memory_order_relaxed)) { const uint64_t t0 = atomic_exchange_explicit(&g_dq_t0, 0, memory_order_relaxed); if (t0) dq_hist_add(g_dq_hw, &g_dq_hw_max, dq_now_ns() - t0); }   // 读数：睡着后第一条记录等了多久
             }
         }
-        while (r != pub) { const dq_rec_hdr *h = (const dq_rec_hdr *)(g_dq_ring + r % dq_RING); atomic_store_explicit(&g_dq_cur_op, h->op, memory_order_relaxed); dq_run(h); r += h->size; atomic_store(&g_dq_rd, r); }   // seq_cst (a plain stlr on arm64): the read position is stored, then g_dq_draining is read, against the drainer's "count it, then read the position"
+        if (!atomic_load_explicit(&g_dq_opt, memory_order_relaxed)) {
+            while (r != pub) {
+                const dq_rec_hdr *h = (const dq_rec_hdr *)(g_dq_ring + (r & (dq_RING - 1)));
+                atomic_store_explicit(&g_dq_cur_op, h->op, memory_order_relaxed);
+                dq_run(h);
+                r += h->size;
+                atomic_store(&g_dq_rd, r);
+            }
+        } else {
+            uint32_t batch = 0;
+            while (r != pub) {
+                const dq_rec_hdr *h = (const dq_rec_hdr *)(g_dq_ring + (r & (dq_RING - 1)));
+                atomic_store_explicit(&g_dq_cur_op, h->op, memory_order_relaxed);
+                dq_run(h);
+                r += h->size;
+                if (++batch >= DQ_RD_BATCH) {
+                    atomic_store_explicit(&g_dq_rd, r, memory_order_release);
+                    __atomic_store_n(&g_dq_opt_rd, __atomic_load_n(&g_dq_opt_rd, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+                    // 新记录可能持续发布。等清空的线程在本批结束时就可复查读位置。
+                    if (atomic_load_explicit(&g_dq_draining, memory_order_acquire)) break;
+                    batch = 0;
+                    pub = atomic_load_explicit(&g_dq_pub, memory_order_acquire);
+                }
+            }
+            atomic_store(&g_dq_rd, r);   // seq_cst (stlr on arm64) before reading g_dq_draining (Dekker pair)
+            __atomic_store_n(&g_dq_opt_rd, __atomic_load_n(&g_dq_opt_rd, __ATOMIC_RELAXED) + 1, __ATOMIC_RELAXED);
+        }
         if (atomic_load(&g_dq_draining)) { pthread_mutex_lock(&g_dq_mu); pthread_cond_broadcast(&g_dq_dcv); pthread_mutex_unlock(&g_dq_mu); }
     }
     return NULL;
@@ -379,6 +576,25 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier(VkCommandBuffer cb
       dq_rec_end(base_); return; }
 direct: DQ_DIRECT(vkCmdPipelineBarrier, cb, src, dst, dep, nm, m, nb, b, ni, im);
 }
+static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPipelineBarrier2KHR(VkCommandBuffer cb, const VkDependencyInfoKHR *di) {
+    if (!di || di->pNext) goto direct;
+    for (uint32_t i = 0; i < di->memoryBarrierCount; i++) if (di->pMemoryBarriers[i].pNext) goto direct;
+    for (uint32_t i = 0; i < di->bufferMemoryBarrierCount; i++) if (di->pBufferMemoryBarriers[i].pNext) goto direct;
+    for (uint32_t i = 0; i < di->imageMemoryBarrierCount; i++) if (di->pImageMemoryBarriers[i].pNext) goto direct;
+    { const uint32_t nm = di->pMemoryBarriers ? di->memoryBarrierCount : 0;
+      const uint32_t nb = di->pBufferMemoryBarriers ? di->bufferMemoryBarrierCount : 0;
+      const uint32_t ni = di->pImageMemoryBarriers ? di->imageMemoryBarrierCount : 0;
+      DQ_BEGIN(OP_vkCmdPipelineBarrier2KHR, a_barrier2,
+               DQ_ARR(VkMemoryBarrier2KHR, di->pMemoryBarriers, nm) +
+               DQ_ARR(VkBufferMemoryBarrier2KHR, di->pBufferMemoryBarriers, nb) +
+               DQ_ARR(VkImageMemoryBarrier2KHR, di->pImageMemoryBarriers, ni));
+      *a = (a_barrier2){di->dependencyFlags, nm, nb, ni};
+      dq_put(&at_, di->pMemoryBarriers, DQ_ARR(VkMemoryBarrier2KHR, di->pMemoryBarriers, nm));
+      dq_put(&at_, di->pBufferMemoryBarriers, DQ_ARR(VkBufferMemoryBarrier2KHR, di->pBufferMemoryBarriers, nb));
+      dq_put(&at_, di->pImageMemoryBarriers, DQ_ARR(VkImageMemoryBarrier2KHR, di->pImageMemoryBarriers, ni));
+      dq_rec_end(base_); return; }
+direct: DQ_DIRECT(vkCmdPipelineBarrier2KHR, cb, di);
+}
 #define W_REGIONS(f, OP, T, R, sig, init, call) \
     static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f sig { { DQ_BEGIN(OP, T, DQ_ARR(R, rg, n)); *a = init; dq_put(&at_, rg, DQ_ARR(R, rg, n)); dq_rec_end(base_); return; } direct: DQ_DIRECT call; }
 W_REGIONS(vkCmdCopyBuffer, OP_vkCmdCopyBuffer, a_copybuf, VkBufferCopy, (VkCommandBuffer cb, VkBuffer s, VkBuffer d, uint32_t n, const VkBufferCopy *rg), ((a_copybuf){s, d, n}), (vkCmdCopyBuffer, cb, s, d, n, rg))
@@ -414,7 +630,7 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginRenderPass(VkCommandBuffer cb
     { size_t nc = DQ_ARR(VkClearValue, bi->pClearValues, bi->clearValueCount), nv = ab ? DQ_ARR(VkImageView, ab->pAttachments, ab->attachmentCount) : 0;
       DQ_BEGIN(OP_vkCmdBeginRenderPass, a_rpbegin, nc + nv); memset(a, 0, sizeof *a); a->bi = *bi; a->c = c;
       if (!bi->pClearValues) a->bi.clearValueCount = 0;
-      if (ab) { a->ab = *ab; a->has_ab = 1; }
+      if (ab) { a->ab = *ab; a->ab.pNext = NULL; if (!ab->pAttachments) a->ab.attachmentCount = 0; a->has_ab = 1; }
       dq_put(&at_, bi->pClearValues, nc); dq_put(&at_, ab ? ab->pAttachments : NULL, nv); dq_rec_end(base_); return; }
 direct: DQ_DIRECT(vkCmdBeginRenderPass, cb, bi, c);
 }
@@ -436,6 +652,25 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBindDescriptorSets(VkCommandBuffer
     { DQ_BEGIN(OP_vkCmdBindDescriptorSets, a_sets, DQ_ARR(VkDescriptorSet, s, n) + DQ_ARR(uint32_t, d, nd)); *a = (a_sets){bp, l, first, n, d ? nd : 0};
       dq_put(&at_, s, DQ_ARR(VkDescriptorSet, s, n)); dq_put(&at_, d, DQ_ARR(uint32_t, d, nd)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdBindDescriptorSets, cb, bp, l, first, n, s, nd, d); }
+static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdPushDescriptorSetKHR(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout l, uint32_t set, uint32_t nw, const VkWriteDescriptorSet *w) {
+    if (!nw || !w) return;
+    uint32_t ni = 0, nb = 0, nt = 0;
+    for (uint32_t i = 0; i < nw; i++) {
+        if (w[i].pNext) goto direct;
+        if (w[i].pImageInfo) ni += w[i].descriptorCount;
+        if (w[i].pBufferInfo) nb += w[i].descriptorCount;
+        if (w[i].pTexelBufferView) nt += w[i].descriptorCount;
+    }
+    { const size_t pay = (size_t)nw * sizeof(VkWriteDescriptorSet) + (size_t)ni * sizeof(VkDescriptorImageInfo) +
+                         (size_t)nb * sizeof(VkDescriptorBufferInfo) + (size_t)nt * sizeof(VkBufferView);
+      DQ_BEGIN(OP_vkCmdPushDescriptorSetKHR, a_pushdesc, pay);
+      *a = (a_pushdesc){bp, l, set, nw, ni, nb, nt};
+      dq_put(&at_, w, (size_t)nw * sizeof(VkWriteDescriptorSet));
+      for (uint32_t i = 0; i < nw; i++) if (w[i].pImageInfo) dq_put(&at_, w[i].pImageInfo, (size_t)w[i].descriptorCount * sizeof(VkDescriptorImageInfo));
+      for (uint32_t i = 0; i < nw; i++) if (w[i].pBufferInfo) dq_put(&at_, w[i].pBufferInfo, (size_t)w[i].descriptorCount * sizeof(VkDescriptorBufferInfo));
+      for (uint32_t i = 0; i < nw; i++) if (w[i].pTexelBufferView) dq_put(&at_, w[i].pTexelBufferView, (size_t)w[i].descriptorCount * sizeof(VkBufferView));
+      dq_rec_end(base_); return; }
+direct: DQ_DIRECT(vkCmdPushDescriptorSetKHR, cb, bp, l, set, nw, w); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkBuffer *b, const VkDeviceSize *o) {
     { DQ_BEGIN(OP_vkCmdBindVertexBuffers, a_range, DQ_ARR(VkBuffer, b, n) + DQ_ARR(VkDeviceSize, o, n)); *a = (a_range){first, n}; dq_put(&at_, b, DQ_ARR(VkBuffer, b, n)); dq_put(&at_, o, DQ_ARR(VkDeviceSize, o, n)); dq_rec_end(base_); return; }
     direct: DQ_DIRECT(vkCmdBindVertexBuffers, cb, first, n, b, o); }
@@ -446,6 +681,8 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetBlendConstants(VkCommandBuffer 
 #define W_STENCIL(f) static DQ_U VKAPI_ATTR void VKAPI_CALL w_##f(VkCommandBuffer cb, VkStencilFaceFlags fl, uint32_t v) { \
     { DQ_BEGIN(OP_##f, a_stencil, 0); *a = (a_stencil){fl, v}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(f, cb, fl, v); }
 W_STENCIL(vkCmdSetStencilReference) W_STENCIL(vkCmdSetStencilCompareMask) W_STENCIL(vkCmdSetStencilWriteMask)
+static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetDepthBounds(VkCommandBuffer cb, float lo, float hi) {
+    { DQ_BEGIN(OP_vkCmdSetDepthBounds, a_bounds, 0); *a = (a_bounds){lo, hi}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdSetDepthBounds, cb, lo, hi); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetDepthBias(VkCommandBuffer cb, float c, float clamp, float slope) {
     { DQ_BEGIN(OP_vkCmdSetDepthBias, a_bias, 0); *a = (a_bias){c, clamp, slope}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdSetDepthBias, cb, c, clamp, slope); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdSetLineWidth(VkCommandBuffer cb, float w) {
@@ -486,6 +723,41 @@ static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdBeginQuery(VkCommandBuffer cb, VkQ
     { DQ_BEGIN(OP_vkCmdBeginQuery, a_query, 0); *a = (a_query){p, q, fl}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdBeginQuery, cb, p, q, fl); }
 static DQ_U VKAPI_ATTR void VKAPI_CALL w_vkCmdEndQuery(VkCommandBuffer cb, VkQueryPool p, uint32_t q) {
     { DQ_BEGIN(OP_vkCmdEndQuery, a_query, 0); *a = (a_query){p, q, 0}; (void)at_; dq_rec_end(base_); return; } direct: DQ_DIRECT(vkCmdEndQuery, cb, p, q); }
+static DQ_U void w_ext_state(VkCommandBuffer cb, const a_ext_state *state) {
+    { DQ_BEGIN(OP_EXT_STATE, a_ext_state, 0); *a = *state; (void)at_; dq_rec_end(base_); return; }
+direct:
+    vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED); r_ext_state(cb, state);
+}
+static DQ_U void w_ext_input(VkCommandBuffer cb, uint32_t nb, const VkVertexInputBindingDescription2EXT *b,
+                             uint32_t na, const VkVertexInputAttributeDescription2EXT *v) {
+    { DQ_BEGIN(OP_EXT_INPUT, a_range, DQ_ARR(VkVertexInputBindingDescription2EXT, b, nb) + DQ_ARR(VkVertexInputAttributeDescription2EXT, v, na));
+      *a = (a_range){nb, na};
+      dq_put(&at_, b, DQ_ARR(VkVertexInputBindingDescription2EXT, b, nb));
+      dq_put(&at_, v, DQ_ARR(VkVertexInputAttributeDescription2EXT, v, na));
+      dq_rec_end(base_); return; }
+direct:
+    vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED);
+    r_vkCmdSetVertexInputEXT(cb, nb, nb ? b : NULL, na, na ? v : NULL);
+}
+static DQ_U void w_ext_stride(VkCommandBuffer cb, uint32_t first, uint32_t n,
+                              const VkBuffer *b, const VkDeviceSize *o, const VkDeviceSize *st) {
+    { DQ_BEGIN(OP_EXT_STRIDE, a_range, DQ_ARR(VkBuffer, b, n) + DQ_ARR(VkDeviceSize, o, n) + DQ_ARR(VkDeviceSize, st, n));
+      *a = (a_range){first, n};
+      dq_put(&at_, b, DQ_ARR(VkBuffer, b, n));
+      dq_put(&at_, o, DQ_ARR(VkDeviceSize, o, n));
+      dq_put(&at_, st, DQ_ARR(VkDeviceSize, st, n));
+      dq_rec_end(base_); return; }
+direct:
+    vk_dq_drain(); __atomic_fetch_add(&g_dq_direct, 1, __ATOMIC_RELAXED);
+    r_vkCmdBindVertexBuffers2EXT(cb, first, n, b, o, NULL, st);
+}
+static DQ_U void vk_dq_dynamic_init(const struct s2a_vk_device *dev) {
+#define DQ_EXT_COPY(f) r_##f = dev ? dev->f : NULL;
+    S2A_VK_EDS1_COMMANDS(DQ_EXT_COPY)
+    S2A_VK_EDS2_COMMANDS(DQ_EXT_COPY)
+    S2A_VK_VERTEX_INPUT_COMMANDS(DQ_EXT_COPY)
+#undef DQ_EXT_COPY
+}
 
 // 占着命令池或队列的调用：先等队列里的调用全做完
 static void dq_poll(void);
@@ -509,6 +781,14 @@ static void dq_tune(void) {
     const int kb = nvn_plat_flag("nvk_dq_wake_kb", 0);
     atomic_store_explicit(&g_dq_wake_bytes, kb > 0 ? (uint64_t)kb << 10 : 0, memory_order_relaxed);
     atomic_store_explicit(&g_dq_stat, nvn_plat_flag("nvk_gputime", 0) != 0, memory_order_relaxed);
+    const int opt = nvn_plat_flag("nvk_dq_opt", 0) != 0;
+    if (g_dq_ring) pthread_spin_lock(&g_dq_p.pl);
+    const int flush = !opt && g_dq_p.unpub;
+    if (flush) dq_opt_publish();
+    g_dq_p.opt = opt;
+    atomic_store_explicit(&g_dq_opt, opt, memory_order_relaxed);   // recorder has no producer lock
+    if (g_dq_ring) pthread_spin_unlock(&g_dq_p.pl);
+    if (flush) dq_wake();
 }
 // 开关（调试属性 nvk_dq，缺省开——11-17 旷野之息神庙场景调试包关 / 开 / 关交错：回放每帧 39.2 / 28.1 / 39.0 ms、帧率 18.4 / 23.5 / 18.4）：在提交处读——那里队列刚清空；别的线程这时还有没做完的记录也没关系，它之后的直接调用会先清空队列。
 static void dq_poll(void) {
@@ -526,7 +806,7 @@ static void vk_dq_init(VkDevice dev) {
     r_vkCmdDrawIndexedIndirectCount = (PFN_vkCmdDrawIndexedIndirectCount)vkGetDeviceProcAddr(dev, "vkCmdDrawIndexedIndirectCountKHR");
     dq_tune();   // 每次开会话都读
     if (g_dq_ring) return;   // 会话重开：队列和线程沿用
-    pthread_spin_init(&g_dq_pl, PTHREAD_PROCESS_PRIVATE);
+    pthread_spin_init(&g_dq_p.pl, PTHREAD_PROCESS_PRIVATE);
     uint8_t *ring = malloc(dq_RING);
     if (!ring) { VKLOG("【红】两级回放：队列内存分配失败，回放线程自己录"); return; }
     { pthread_condattr_t ca; pthread_condattr_init(&ca); pthread_condattr_setclock(&ca, CLOCK_MONOTONIC); pthread_cond_init(&g_dq_cv, &ca); pthread_condattr_destroy(&ca); }   // 录制线程起来之前：没有人睡在它上面
@@ -563,6 +843,24 @@ static DQ_U VKAPI_ATTR VkResult VKAPI_CALL w_vkResetDescriptorPool(VkDevice d, V
 
 uint64_t nvn_vk_dbg_dq_recs(void) { return __atomic_load_n(&g_dq_recs, __ATOMIC_RELAXED); }   // 用例读：至今交给录制线程的调用数
 uint64_t nvn_vk_dbg_dq_stat(int i) { return i >= 0 && i < DQS_N ? __atomic_load_n(&g_dq_st[i], __ATOMIC_RELAXED) : 0; }   // 用例读：等活读数（见 DQS_*；nvk_gputime 开着才计）
+// 只读诊断钩子：供契约用例核对 nvk_dq_opt 的 pub/rd 批量发布与 rd 本地缓存命中（队列空闲时调用）
+void nvn_vk_dbg_dq_opt_stat(uint64_t out[4], int reset) {
+    if (out) {
+        out[0] = __atomic_load_n(&g_dq_p.opt_pub, __ATOMIC_RELAXED);
+        out[1] = __atomic_load_n(&g_dq_opt_rd, __ATOMIC_RELAXED);
+        out[2] = __atomic_load_n(&g_dq_p.opt_rd_reload, __ATOMIC_RELAXED);
+        out[3] = __atomic_load_n(&g_dq_p.opt_flush, __ATOMIC_RELAXED);
+    }
+    if (reset && g_dq_ring) {
+        vk_dq_drain();
+        pthread_spin_lock(&g_dq_p.pl);
+        __atomic_store_n(&g_dq_p.opt_pub, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_dq_p.opt_rd_reload, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_dq_p.opt_flush, 0, __ATOMIC_RELAXED);
+        pthread_spin_unlock(&g_dq_p.pl);
+        __atomic_store_n(&g_dq_opt_rd, 0, __ATOMIC_RELAXED);
+    }
+}
 int nvn_vk_dbg_dq_thread_cpu_ns(uint64_t *ns) {   // 用例读：录制线程至今用掉的 CPU 纳秒（没起来返回 -1）
     clockid_t cid; struct timespec ts;
     if (!g_dq_ring || pthread_getcpuclockid(g_dq_rec_th, &cid) || clock_gettime(cid, &ts)) return -1;
@@ -582,6 +880,7 @@ int nvn_vk_dbg_dq_thread_cpu_ns(uint64_t *ns) {   // 用例读：录制线程至
 #define vkFreeCommandBuffers w_vkFreeCommandBuffers
 #define vkResetCommandBuffer w_vkResetCommandBuffer
 #define vkCmdPipelineBarrier w_vkCmdPipelineBarrier
+#define vkCmdPipelineBarrier2KHR w_vkCmdPipelineBarrier2KHR
 #define vkCmdWriteTimestamp w_vkCmdWriteTimestamp
 #define vkCmdPushConstants w_vkCmdPushConstants
 #define vkCmdBlitImage w_vkCmdBlitImage
@@ -598,12 +897,15 @@ int nvn_vk_dbg_dq_thread_cpu_ns(uint64_t *ns) {   // 用例读：录制线程至
 #define vkCmdCopyBufferToImage w_vkCmdCopyBufferToImage
 #define vkCmdCopyBuffer w_vkCmdCopyBuffer
 #define vkCmdBindDescriptorSets w_vkCmdBindDescriptorSets
+#define vkCmdPushDescriptorSetKHR w_vkCmdPushDescriptorSetKHR
 #define vkCmdSetViewport w_vkCmdSetViewport
 #define vkCmdSetStencilWriteMask w_vkCmdSetStencilWriteMask
 #define vkCmdSetStencilReference w_vkCmdSetStencilReference
 #define vkCmdSetStencilCompareMask w_vkCmdSetStencilCompareMask
 #define vkCmdSetScissor w_vkCmdSetScissor
+#define vkCmdSetDepthBounds w_vkCmdSetDepthBounds
 #define vkCmdSetDepthBias w_vkCmdSetDepthBias
+#define vkCmdSetLineWidth w_vkCmdSetLineWidth
 #define vkCmdSetBlendConstants w_vkCmdSetBlendConstants
 #define vkCmdResolveImage w_vkCmdResolveImage
 #define vkCmdFillBuffer w_vkCmdFillBuffer

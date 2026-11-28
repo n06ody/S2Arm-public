@@ -11,10 +11,13 @@
 
 char cs_create_device_why[256];
 uint32_t cs_enabled_ext_count;
-const char *cs_enabled_ext[32];
+const char *cs_enabled_ext[CS_MAX_ENABLED_EXT];
 uint32_t cs_queried_fmt_count;
 uint32_t cs_features2_calls, cs_properties2_calls;
 VkFormat cs_queried_fmt[256];
+int cs_deny_high_priority;
+uint32_t cs_create_device_calls;
+VkQueueGlobalPriorityEXT cs_queue_global_priority;
 
 const struct cs_shape *cs_shape(void) {
     static const struct cs_shape *picked;
@@ -109,22 +112,61 @@ static const char *feature_struct_bad(int st, const struct cs_shape *s) {
         return cs_any_ext(s, "VK_EXT_index_type_uint8", "VK_KHR_index_type_uint8") || eff >= VK_API_VERSION_1_4 ? NULL : "index_type_uint8 特性结构（VK_EXT/KHR_index_type_uint8）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT:
         return cs_has_ext(s, "VK_EXT_depth_clip_control") ? NULL : "depth_clip_control 特性结构（VK_EXT_depth_clip_control）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT:
+        return cs_has_ext(s, "VK_EXT_image_robustness") || eff >= VK_API_VERSION_1_3 ? NULL : "image_robustness 特性结构（1.3 核心 / VK_EXT_image_robustness）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR:
+        return cs_has_ext(s, "VK_KHR_zero_initialize_workgroup_memory") || eff >= VK_API_VERSION_1_3 ? NULL : "zero_initialize_workgroup_memory 特性结构（1.3 核心 / VK_KHR_zero_initialize_workgroup_memory）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT:
+        return cs_has_ext(s, "VK_EXT_scalar_block_layout") || eff >= VK_API_VERSION_1_2 ? NULL : "scalar_block_layout 特性结构（1.2 核心 / VK_EXT_scalar_block_layout）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_KHR:
+        return cs_has_ext(s, "VK_KHR_uniform_buffer_standard_layout") || eff >= VK_API_VERSION_1_2 ? NULL : "uniform_buffer_standard_layout 特性结构（1.2 核心 / VK_KHR_uniform_buffer_standard_layout）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT:
+        return cs_any_ext(s, "VK_EXT_line_rasterization", "VK_KHR_line_rasterization") ? NULL : "line_rasterization 特性结构（VK_EXT/KHR_line_rasterization）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR:
+        return cs_has_ext(s, VK_KHR_MAINTENANCE_4_EXTENSION_NAME) || eff >= VK_API_VERSION_1_3 ? NULL : "maintenance4 特性结构（1.3 核心 / VK_KHR_maintenance4）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR:
+        return cs_has_ext(s, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) || eff >= VK_API_VERSION_1_2 ? NULL : "shader_float16_int8 特性结构（1.2 核心 / VK_KHR_shader_float16_int8）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
         return cs_has_ext(s, "VK_EXT_custom_border_color") ? NULL : "custom_border_color 特性结构（VK_EXT_custom_border_color）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT:
         return cs_any_ext(s, "VK_EXT_vertex_attribute_divisor", "VK_KHR_vertex_attribute_divisor") || eff >= VK_API_VERSION_1_4 ? NULL : "vertex_attribute_divisor 特性结构（VK_EXT/KHR_vertex_attribute_divisor）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
         return cs_any_ext(s, "VK_EXT_swapchain_maintenance1", "VK_KHR_swapchain_maintenance1") ? NULL : "swapchain_maintenance1 特性结构（VK_EXT/KHR_swapchain_maintenance1）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) ? NULL : "EDS1 特性结构缺扩展";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME) ? NULL : "EDS2 特性结构缺扩展";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) ? NULL : "动态顶点输入特性结构缺扩展";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME) ? NULL : "image_2d_view_of_3d 特性结构（VK_EXT_image_2d_view_of_3d）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME) ? NULL : "texel_buffer_alignment 特性结构（VK_EXT_texel_buffer_alignment）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
         return cs_has_ext(s, "VK_KHR_timeline_semaphore") || eff >= VK_API_VERSION_1_2 ? NULL : "timeline 特性结构（1.2 核心 / VK_KHR_timeline_semaphore）";
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES:
         return cs_has_ext(s, "VK_EXT_descriptor_indexing") || eff >= VK_API_VERSION_1_2 ? NULL : "descriptor_indexing 特性结构（1.2 核心 / VK_EXT_descriptor_indexing）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME) || eff >= VK_API_VERSION_1_3
+            ? NULL : "pipeline_creation_cache_control 特性结构（1.3 核心 / VK_EXT_pipeline_creation_cache_control）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME) || eff >= VK_API_VERSION_1_2 ? NULL : "host_query_reset 特性结构（1.2 核心 / VK_EXT_host_query_reset）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT:
+        return cs_has_ext(s, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME) ? NULL : "list_restart 特性结构（VK_EXT_primitive_topology_list_restart）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR:
+        return cs_has_ext(s, VK_KHR_8BIT_STORAGE_EXTENSION_NAME) || eff >= VK_API_VERSION_1_2 ? NULL : "8bit_storage 特性结构（1.2 核心 / VK_KHR_8bit_storage）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+        return eff >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_16bit_storage") ? NULL : "16bit_storage 特性结构（1.1 核心 / VK_KHR_16bit_storage）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES:
+        return eff >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_variable_pointers") ? NULL : "variable_pointers 特性结构（1.1 核心 / VK_KHR_variable_pointers）";
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES:
+        return eff >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_multiview") ? NULL : "multiview 特性结构（1.1 核心 / VK_KHR_multiview）";
     default: return NULL;
     }
 }
 // 扩展特性结构：只有设备列出了扩展才答它的位。越过有效版本 / 扩展挂进链 = 规范不允许（真驱动多半忽略、位停在 0），直接判红，
 //   不像真平台那样安静地答 0 把错误读数放过去（#1879 复审：4444 结构、index_uint8、应用 1.1 下按设备版本挂 1.2 结构）
-static void features_chain(void *next, int for_create, const struct cs_shape *s) {
+static void features_chain(void *next, int for_create, const struct cs_shape *s, const VkPhysicalDeviceFeatures *en_core) {
     for (VkBaseOutStructure *b = next; b; b = b->pNext) {
         const char *bad = feature_struct_bad((int)b->sType, s);
         if (bad) cs_reject(s, bad);
@@ -133,6 +175,51 @@ static void features_chain(void *next, int for_create, const struct cs_shape *s)
         switch ((int)b->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
             BIT(((VkPhysicalDeviceShaderDrawParametersFeatures *)b)->shaderDrawParameters, s->shaderDrawParameters, "shaderDrawParameters"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceExtendedDynamicStateFeaturesEXT *)b)->extendedDynamicState,
+                s->extendedDynamicState, "extendedDynamicState"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT: {
+            VkPhysicalDeviceExtendedDynamicState2FeaturesEXT *eds2 = (void *)b;
+            BIT(eds2->extendedDynamicState2, s->extendedDynamicState2, "extendedDynamicState2");
+            BIT(eds2->extendedDynamicState2LogicOp, s->extendedDynamicState2LogicOp, "extendedDynamicState2LogicOp");
+            BIT(eds2->extendedDynamicState2PatchControlPoints, s->extendedDynamicState2PatchControlPoints,
+                "extendedDynamicState2PatchControlPoints"); break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT *)b)->vertexInputDynamicState,
+                s->vertexInputDynamicState, "vertexInputDynamicState"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
+            VkPhysicalDevice16BitStorageFeatures *s16 = (void *)b;
+            const int ok11 = cs_eff_api(s) >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_16bit_storage");
+            BIT(s16->storageBuffer16BitAccess, s->storageBuffer16BitAccess && ok11, "storageBuffer16BitAccess");
+            BIT(s16->uniformAndStorageBuffer16BitAccess, s->uniformAndStorageBuffer16BitAccess && ok11, "uniformAndStorageBuffer16BitAccess");
+            BIT(s16->storagePushConstant16, s->storagePushConstant16 && ok11, "storagePushConstant16");
+            BIT(s16->storageInputOutput16, s->storageInputOutput16 && ok11, "storageInputOutput16");
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES: {
+            VkPhysicalDeviceVariablePointersFeatures *vp = (void *)b;
+            const int ok11 = cs_eff_api(s) >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_variable_pointers");
+            if (for_create && vp->variablePointers && !vp->variablePointersStorageBuffer) {
+                ok = 0; what = "variablePointers(requires variablePointersStorageBuffer)";
+            }
+            BIT(vp->variablePointersStorageBuffer, s->variablePointersStorageBuffer && ok11, "variablePointersStorageBuffer");
+            BIT(vp->variablePointers, s->variablePointers && ok11, "variablePointers");
+            break;
+        }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES: {
+            VkPhysicalDeviceMultiviewFeatures *mv = (void *)b;
+            const int ok11 = cs_eff_api(s) >= VK_API_VERSION_1_1 || cs_has_ext(s, "VK_KHR_multiview");
+            if (for_create && mv->multiviewGeometryShader && (!mv->multiview || !en_core || !en_core->geometryShader)) {
+                ok = 0; what = "multiviewGeometryShader(requires multiview + geometryShader)";
+            }
+            if (for_create && mv->multiviewTessellationShader && (!mv->multiview || !en_core || !en_core->tessellationShader)) {
+                ok = 0; what = "multiviewTessellationShader(requires multiview + tessellationShader)";
+            }
+            BIT(mv->multiview, s->multiview && ok11, "multiview");
+            BIT(mv->multiviewGeometryShader, s->multiviewGeometryShader && ok11, "multiviewGeometryShader");
+            BIT(mv->multiviewTessellationShader, s->multiviewTessellationShader && ok11, "multiviewTessellationShader");
+            break;
+        }
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
             BIT(((VkPhysicalDeviceTimelineSemaphoreFeatures *)b)->timelineSemaphore, s->timelineSemaphore && cs_has_ext(s, "VK_KHR_timeline_semaphore"), "timelineSemaphore"); break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT:
@@ -142,6 +229,29 @@ static void features_chain(void *next, int for_create, const struct cs_shape *s)
             BIT(((VkPhysicalDevice4444FormatsFeaturesEXT *)b)->formatA4R4G4B4, s->formatA4R4G4B4 && cs_has_ext(s, "VK_EXT_4444_formats"), "formatA4R4G4B4"); break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT:
             BIT(((VkPhysicalDeviceDepthClipControlFeaturesEXT *)b)->depthClipControl, s->depthClipControl && cs_has_ext(s, "VK_EXT_depth_clip_control"), "depthClipControl"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceImageRobustnessFeaturesEXT *)b)->robustImageAccess, s->robustImageAccess && cs_has_ext(s, "VK_EXT_image_robustness"), "robustImageAccess"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR:
+            BIT(((VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR *)b)->shaderZeroInitializeWorkgroupMemory, s->shaderZeroInitializeWorkgroupMemory && cs_has_ext(s, "VK_KHR_zero_initialize_workgroup_memory"), "shaderZeroInitializeWorkgroupMemory"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceScalarBlockLayoutFeaturesEXT *)b)->scalarBlockLayout, s->scalarBlockLayout && cs_has_ext(s, "VK_EXT_scalar_block_layout"), "scalarBlockLayout"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_KHR:
+            BIT(((VkPhysicalDeviceUniformBufferStandardLayoutFeaturesKHR *)b)->uniformBufferStandardLayout, s->uniformBufferStandardLayout && cs_has_ext(s, "VK_KHR_uniform_buffer_standard_layout"), "uniformBufferStandardLayout"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT: {
+            VkPhysicalDeviceLineRasterizationFeaturesEXT *lr = (void *)b;
+            const int e = cs_any_ext(s, "VK_EXT_line_rasterization", "VK_KHR_line_rasterization");
+            BIT(lr->rectangularLines, s->rectangularLines && e, "rectangularLines");
+            BIT(lr->bresenhamLines, s->bresenhamLines && e, "bresenhamLines");
+            BIT(lr->smoothLines, s->smoothLines && e, "smoothLines");
+            BIT(lr->stippledRectangularLines, s->stippledRectangularLines && e, "stippledRectangularLines");
+            BIT(lr->stippledBresenhamLines, s->stippledBresenhamLines && e, "stippledBresenhamLines");
+            BIT(lr->stippledSmoothLines, s->stippledSmoothLines && e, "stippledSmoothLines"); break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR:
+            BIT(((VkPhysicalDeviceMaintenance4FeaturesKHR *)b)->maintenance4, s->maintenance4 && cs_has_ext(s, VK_KHR_MAINTENANCE_4_EXTENSION_NAME), "maintenance4"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR: {
+            VkPhysicalDeviceShaderFloat16Int8FeaturesKHR *sf = (void *)b; const int e = cs_has_ext(s, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+            BIT(sf->shaderFloat16, s->shaderFloat16 && e, "shaderFloat16");
+            BIT(sf->shaderInt8, s->shaderInt8 && e, "shaderInt8"); break; }
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT: {
             VkPhysicalDeviceCustomBorderColorFeaturesEXT *c = (void *)b; const int e = cs_has_ext(s, "VK_EXT_custom_border_color");
             BIT(c->customBorderColors, s->customBorderColors && e, "customBorderColors");
@@ -161,6 +271,29 @@ static void features_chain(void *next, int for_create, const struct cs_shape *s)
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
             // 档案里的位（真机档：device_caps.c 只在特性也开着时把扩展写进 enabledExtensions，转换时据此记 1）
             BIT(((VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT *)b)->swapchainMaintenance1, s->swapchainMaintenance1 && cs_any_ext(s, "VK_EXT_swapchain_maintenance1", "VK_KHR_swapchain_maintenance1"), "swapchainMaintenance1"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT:
+            BIT(((VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT *)b)->pipelineCreationCacheControl,
+                s->pipelineCreationCacheControl && cs_has_ext(s, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME),
+                "pipelineCreationCacheControl"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceHostQueryResetFeaturesEXT *)b)->hostQueryReset, s->hostQueryReset && cs_has_ext(s, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME), "hostQueryReset"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT:
+            BIT(((VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT *)b)->primitiveTopologyListRestart, s->primitiveTopologyListRestart && cs_has_ext(s, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME), "primitiveTopologyListRestart"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT: {
+            VkPhysicalDeviceImage2DViewOf3DFeaturesEXT *v = (void *)b;
+            const int e = cs_has_ext(s, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME);
+            BIT(v->image2DViewOf3D, s->image2DViewOf3D && e, "image2DViewOf3D");
+            BIT(v->sampler2DViewOf3D, s->sampler2DViewOf3D && e, "sampler2DViewOf3D"); break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT:
+            BIT(((VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT *)b)->texelBufferAlignment, s->texelBufferAlignment && cs_has_ext(s, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME), "texelBufferAlignment"); break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR: {
+            VkPhysicalDevice8BitStorageFeaturesKHR *s8 = (void *)b;
+            const int e = cs_has_ext(s, VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+            BIT(s8->storageBuffer8BitAccess, s->storageBuffer8BitAccess && e, "storageBuffer8BitAccess");
+            BIT(s8->uniformAndStorageBuffer8BitAccess, s->uniformAndStorageBuffer8BitAccess && e, "uniformAndStorageBuffer8BitAccess");
+            BIT(s8->storagePushConstant8, s->storagePushConstant8 && e, "storagePushConstant8");
+            break;
+        }
         default: break;   // 别的结构（placed 映射等）：没有读数，保持调用方清零的 0（= 无）
         }
 #undef BIT
@@ -168,7 +301,7 @@ static void features_chain(void *next, int for_create, const struct cs_shape *s)
     }
 }
 VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceFeatures2(VkPhysicalDevice p, VkPhysicalDeviceFeatures2 *f) {
-    (void)p; cs_features2_calls++; f->features = cs_shape()->features; features_chain(f->pNext, 0, cs_shape());
+    (void)p; cs_features2_calls++; f->features = cs_shape()->features; features_chain(f->pNext, 0, cs_shape(), NULL);
 }
 VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice p, VkPhysicalDeviceProperties2 *out) {
     (void)p; cs_properties2_calls++; const struct cs_shape *s = cs_shape();
@@ -202,18 +335,55 @@ VKAPI_ATTR void VKAPI_CALL vkGetPhysicalDeviceProperties2(VkPhysicalDevice p, Vk
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT:
             if (!cs_has_ext(s, "VK_EXT_external_memory_host")) cs_reject(s, "主机内存导入属性缺扩展");
             ((VkPhysicalDeviceExternalMemoryHostPropertiesEXT *)b)->minImportedHostPointerAlignment = s->host_align; break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_PROPERTIES_EXT: {
+            if (!cs_has_ext(s, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME)) cs_reject(s, "texel_buffer_alignment 属性缺扩展");
+            VkPhysicalDeviceTexelBufferAlignmentPropertiesEXT *tp = (void *)b;
+            tp->storageTexelBufferOffsetAlignmentBytes = 16;
+            tp->storageTexelBufferOffsetSingleTexelAlignment = VK_TRUE;
+            tp->uniformTexelBufferOffsetAlignmentBytes = 16;
+            tp->uniformTexelBufferOffsetSingleTexelAlignment = VK_TRUE; break; }
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES_EXT:
+            if (!cs_any_ext(s, "VK_EXT_line_rasterization", "VK_KHR_line_rasterization")) cs_reject(s, "线光栅化属性缺扩展");
+            ((VkPhysicalDeviceLineRasterizationPropertiesEXT *)b)->lineSubPixelPrecisionBits = s->line_subpixel_bits; break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES_KHR:
+            if (!cs_has_ext(s, VK_KHR_MAINTENANCE_4_EXTENSION_NAME) && cs_eff_api(s) < VK_API_VERSION_1_3) cs_reject(s, "maintenance4 属性缺扩展");
+            ((VkPhysicalDeviceMaintenance4PropertiesKHR *)b)->maxBufferSize = s->max_buffer_size; break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR: {
+            if (!cs_has_ext(s, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) && cs_eff_api(s) < VK_API_VERSION_1_2)
+                cs_reject(s, "float_controls 属性缺扩展（1.2 核心 / VK_KHR_shader_float_controls）");
+            VkPhysicalDeviceFloatControlsPropertiesKHR *fc = (void *)b;
+            fc->shaderDenormPreserveFloat32 = s->fctrl_denorm_preserve_f32;
+            fc->shaderDenormFlushToZeroFloat32 = s->fctrl_denorm_ftz_f32;
+            fc->shaderSignedZeroInfNanPreserveFloat32 = s->fctrl_sz_inf_nan_f32;
+            fc->shaderRoundingModeRTEFloat32 = s->fctrl_rte_f32;
+            fc->shaderRoundingModeRTZFloat32 = s->fctrl_rtz_f32; break; }
         default: break;   // 没有读数的结构（如 placed 对齐）保持调用方清零的 0。
         }
     }
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice p, const VkDeviceCreateInfo *ci, const VkAllocationCallbacks *a, VkDevice *out) {
     (void)p; (void)a; const struct cs_shape *s = cs_shape();
-    cs_create_device_why[0] = 0; cs_enabled_ext_count = 0;
+    cs_create_device_calls++;
+    cs_create_device_why[0] = 0; cs_enabled_ext_count = 0; cs_queue_global_priority = (VkQueueGlobalPriorityEXT)0;
+    int enabled_gp_ext = 0;
     for (uint32_t i = 0; i < ci->enabledExtensionCount; i++) {
-        if (cs_enabled_ext_count < 32) cs_enabled_ext[cs_enabled_ext_count++] = ci->ppEnabledExtensionNames[i];
+        if (cs_enabled_ext_count < CS_MAX_ENABLED_EXT) cs_enabled_ext[cs_enabled_ext_count++] = ci->ppEnabledExtensionNames[i];
+        if (!strcmp(ci->ppEnabledExtensionNames[i], VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME)) enabled_gp_ext = 1;
         if (!cs_has_ext(s, ci->ppEnabledExtensionNames[i])) {
             snprintf(cs_create_device_why, sizeof cs_create_device_why, "启用了设备没列出的扩展 %s（形态档 %s）", ci->ppEnabledExtensionNames[i], s->name);
             return VK_ERROR_EXTENSION_NOT_PRESENT;
+        }
+    }
+    for (uint32_t q = 0; q < ci->queueCreateInfoCount; q++) {
+        for (const VkBaseInStructure *b = ci->pQueueCreateInfos[q].pNext; b; b = b->pNext) {
+            if (b->sType == VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT) {
+                if (q != 0) cs_reject(s, "global_priority 只能请求主队列");
+                if (!cs_has_ext(s, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) || !enabled_gp_ext)
+                    cs_reject(s, "global_priority 队列结构缺扩展 VK_EXT_global_priority");
+                cs_queue_global_priority = ((const VkDeviceQueueGlobalPriorityCreateInfoEXT *)b)->globalPriority;
+                if (cs_deny_high_priority && cs_queue_global_priority == VK_QUEUE_GLOBAL_PRIORITY_HIGH_EXT)
+                    return VK_ERROR_NOT_PERMITTED_EXT;
+            }
         }
     }
     if (ci->pEnabledFeatures) {
@@ -224,7 +394,7 @@ VKAPI_ATTR VkResult VKAPI_CALL vkCreateDevice(VkPhysicalDevice p, const VkDevice
                 return VK_ERROR_FEATURE_NOT_PRESENT;
             }
     }
-    features_chain((void *)ci->pNext, 1, s);
+    features_chain((void *)ci->pNext, 1, s, ci->pEnabledFeatures);
     if (cs_create_device_why[0]) return VK_ERROR_FEATURE_NOT_PRESENT;
     *out = (VkDevice)H(0x3000); return VK_SUCCESS;
 }
@@ -238,9 +408,38 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyCommandPool(VkDevice d, VkCommandPool c, con
 static VKAPI_ATTR void VKAPI_CALL fake_draw_count(VkCommandBuffer c, VkBuffer b, VkDeviceSize o, VkBuffer cb, VkDeviceSize co, uint32_t m, uint32_t st) {
     (void)c; (void)b; (void)o; (void)cb; (void)co; (void)m; (void)st;
 }
+static VKAPI_ATTR void VKAPI_CALL fake_dyn_cmd(void) {}
+static VKAPI_ATTR void VKAPI_CALL fake_reset_query_pool(VkDevice d, VkQueryPool qp, uint32_t first, uint32_t count) {
+    (void)d; (void)qp; (void)first; (void)count;
+}
+static VKAPI_ATTR void VKAPI_CALL fake_set_line_stipple(VkCommandBuffer c, uint32_t f, uint16_t p) { (void)c; (void)f; (void)p; }
+static VKAPI_ATTR void VKAPI_CALL fake_dev_buf_mr(VkDevice d, const VkDeviceBufferMemoryRequirements *i, VkMemoryRequirements2 *o) {
+    (void)d; (void)i; (void)o;
+}
+static VKAPI_ATTR void VKAPI_CALL fake_dev_img_mr(VkDevice d, const VkDeviceImageMemoryRequirements *i, VkMemoryRequirements2 *o) {
+    (void)d; (void)i; (void)o;
+}
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice d, const char *name) {
     (void)d;
+    const struct cs_shape *s = cs_shape();
     if (!strcmp(name, "vkCmdDrawIndirectCountKHR") || !strcmp(name, "vkCmdDrawIndexedIndirectCountKHR")) return (PFN_vkVoidFunction)fake_draw_count;
+    if (cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) &&
+        (!strcmp(name, "vkCmdSetCullModeEXT") || !strcmp(name, "vkCmdSetFrontFaceEXT") ||
+         !strcmp(name, "vkCmdSetPrimitiveTopologyEXT") || !strcmp(name, "vkCmdSetDepthTestEnableEXT") ||
+         !strcmp(name, "vkCmdSetDepthWriteEnableEXT") || !strcmp(name, "vkCmdSetDepthCompareOpEXT") ||
+         !strcmp(name, "vkCmdSetStencilTestEnableEXT") || !strcmp(name, "vkCmdSetStencilOpEXT") ||
+         !strcmp(name, "vkCmdBindVertexBuffers2EXT")))
+        return (PFN_vkVoidFunction)fake_dyn_cmd;
+    if (cs_has_ext(s, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME) &&
+        (!strcmp(name, "vkCmdSetRasterizerDiscardEnableEXT") || !strcmp(name, "vkCmdSetDepthBiasEnableEXT") ||
+         !strcmp(name, "vkCmdSetPrimitiveRestartEnableEXT")))
+        return (PFN_vkVoidFunction)fake_dyn_cmd;
+    if (cs_has_ext(s, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) && !strcmp(name, "vkCmdSetVertexInputEXT"))
+        return (PFN_vkVoidFunction)fake_dyn_cmd;
+    if (!strcmp(name, "vkResetQueryPoolEXT")) return (PFN_vkVoidFunction)fake_reset_query_pool;
+    if (!strcmp(name, "vkCmdSetLineStippleEXT")) return (PFN_vkVoidFunction)fake_set_line_stipple;
+    if (!strcmp(name, "vkGetDeviceBufferMemoryRequirementsKHR")) return (PFN_vkVoidFunction)fake_dev_buf_mr;
+    if (!strcmp(name, "vkGetDeviceImageMemoryRequirementsKHR")) return (PFN_vkVoidFunction)fake_dev_img_mr;
     return NULL;
 }
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance i, const char *name) {
@@ -253,6 +452,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance i, con
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateBuffer(VkDevice d, const VkBufferCreateInfo *c, const VkAllocationCallbacks *a, VkBuffer *b) { (void)d; (void)c; (void)a; (void)b; NOT_HERE("vkCreateBuffer"); }
 VKAPI_ATTR void VKAPI_CALL vkDestroyBuffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks *a) { (void)d; (void)b; (void)a; NOT_HERE("vkDestroyBuffer"); }
 VKAPI_ATTR void VKAPI_CALL vkGetBufferMemoryRequirements(VkDevice d, VkBuffer b, VkMemoryRequirements *r) { (void)d; (void)b; (void)r; NOT_HERE("vkGetBufferMemoryRequirements"); }
+VKAPI_ATTR VkResult VKAPI_CALL vkCreateImage(VkDevice d, const VkImageCreateInfo *c, const VkAllocationCallbacks *a, VkImage *i) { (void)d; (void)c; (void)a; (void)i; NOT_HERE("vkCreateImage"); }
+VKAPI_ATTR void VKAPI_CALL vkDestroyImage(VkDevice d, VkImage i, const VkAllocationCallbacks *a) { (void)d; (void)i; (void)a; NOT_HERE("vkDestroyImage"); }
+VKAPI_ATTR void VKAPI_CALL vkGetImageMemoryRequirements(VkDevice d, VkImage i, VkMemoryRequirements *r) { (void)d; (void)i; (void)r; NOT_HERE("vkGetImageMemoryRequirements"); }
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice d, const VkMemoryAllocateInfo *i, const VkAllocationCallbacks *a, VkDeviceMemory *m) { (void)d; (void)i; (void)a; (void)m; NOT_HERE("vkAllocateMemory"); }
 VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) { (void)d; (void)m; (void)a; NOT_HERE("vkFreeMemory"); }
 VKAPI_ATTR VkResult VKAPI_CALL vkBindBufferMemory(VkDevice d, VkBuffer b, VkDeviceMemory m, VkDeviceSize o) { (void)d; (void)b; (void)m; (void)o; NOT_HERE("vkBindBufferMemory"); }

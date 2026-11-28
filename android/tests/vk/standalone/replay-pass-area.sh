@@ -94,8 +94,8 @@ for old, new in (
      '((!omit_area_guard("zero") && att[i].loadOp != VK_ATTACHMENT_LOAD_OP_LOAD) || att[i].storeOp != VK_ATTACHMENT_STORE_OP_STORE)'),
     ('x0 -= x0 % granularity.width; y0 -= y0 % granularity.height;',
      'if (omit_area_guard("align")) return (VkRect2D){{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1-x0), (uint32_t)(y1-y0)}};\n    x0 -= x0 % granularity.width; y0 -= y0 % granularity.height;'),
-    ('if (!d->area_w || !d->area_h) return 1;',
-     'if (omit_area_guard("draw") || !d->area_w || !d->area_h) return 1;'),
+    ('if (!d->area_w || !d->area_h) return PASS_AREA_UNCHANGED;',
+     'if (omit_area_guard("draw") || !d->area_w || !d->area_h) return PASS_AREA_UNCHANGED;'),
 ):
     backend = replace_once(backend, old, new)
 (out / "rp_pass_withdrawn.c").write_text("#include <stdlib.h>\n" + core)
