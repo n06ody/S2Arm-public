@@ -8,7 +8,7 @@
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/../../../.." && pwd)
 mode=${1:-}
-case "$mode" in ''|--negative-synth|--negative-fetch|--negative-output|--negative-clip-control) ;; *) exit 64 ;; esac
+case "$mode" in ''|--negative-synth|--negative-fetch|--negative-output|--negative-clip-control|--negative-mrt-memo) ;; *) exit 64 ;; esac
 out="$repo/build/vk-libpack-vsdepth"
 mkdir -p "$out/shaders"
 : "${S2A_LAVAPIPE_ICD:?lavapipe required}" "${S2A_VK_LAYER_DIR:?validation required}"
@@ -16,9 +16,10 @@ glslc_bin=${GLSLC:-glslc}
 for s in libpack_depth.vert libpack_clip_control.vert libpack_support.frag; do
     "$glslc_bin" --target-env=vulkan1.1 "$repo/android/tests/vk/shaders/$s" -o "$out/shaders/$s.spv"
 done
-for kind in float uint; do
-    variant=0; if [[ $kind == uint ]]; then variant=1; fi
+variant=0
+for kind in float uint sint mixed; do
     "$glslc_bin" --target-env=vulkan1.1 "-DMRT_CLASS=$variant" "$repo/android/tests/vk/shaders/libpack_mrt_outputs.frag" -o "$out/shaders/mrt-$kind.spv"
+    variant=$((variant+1))
 done
 python3 - "$out/shaders" <<'PYMRT'
 import base64, json, sys
@@ -57,6 +58,9 @@ if mode == '--negative-synth':
 elif mode == '--negative-output':
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
     before, after = 'uint32_t written = f->color_writes & e->outputs.components;', 'uint32_t written = 0;'
+elif mode == '--negative-mrt-memo':
+    path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
+    before, after = 'if (color && (color->uint_locations | color->sint_locations)) {', 'if (0 && color && (color->uint_locations | color->sint_locations)) {'
 elif mode == '--negative-fetch':
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
     before, after = '(!ckey && stages != 0x1u && stages != 0x3u && stages != 0x7u)', '(!ckey && stages != 0x3u && stages != 0x7u)'
@@ -71,6 +75,7 @@ PY
         --negative-synth) src[6]="$out/libpack_mutant.c" ;;
         --negative-fetch) src[4]="$out/nvk_shader_mutant.c" ;;
         --negative-output) src[4]="$out/nvk_shader_mutant.c"; args=(mrt-float) ;;
+        --negative-mrt-memo) src[4]="$out/nvk_shader_mutant.c"; args=(mrt-vf) ;;
         --negative-clip-control) src[1]="$out/rp_draw_mutant.c"; args=(--clip-control) ;;
     esac
     binary="$out/test-${mode#--}"; log="$out/${mode#--}.log"
@@ -94,6 +99,7 @@ if [ -n "$mode" ]; then
         if ! grep -qx 'libpack clip control: failures=1' "$log"; then cat "$log"; exit 1; fi
     fi
     if [[ $mode == --negative-output ]]; then expect='MRT admission: compatible=0 rc=0 compiler=0'; fi
+    if [[ $mode == --negative-mrt-memo ]]; then expect='MRT variants: attachment set 1 hits LibPack without compiling'; fi
     if [ "$rc" = 0 ] || ! grep -q 'device: llvmpipe' "$log" || ! grep -q "FAIL .*: $expect" "$log" || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
     echo '【负对照开始】'
     echo "libpack-vsdepth $mode: PASS（撤改后红在「${expect}」）"
@@ -109,10 +115,21 @@ echo '【绿】图形 LibPack 只有 vs 的深度程序：取库命中、深度�
 echo '【绿】同段只切近裁模式的深度读回 1/0.25/1，只切深度夹取的对照为 1/0/1'
 for kind in float uint; do
     log="$out/mrt-$kind.log"
-    timeout 120 "$binary" "$out/shaders" "mrt-$kind" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    S2A_TEST_FOUT_CAPTURE=1 timeout 120 "$binary" "$out/shaders" "mrt-$kind" > "$log" 2>&1 || { cat "$log"; exit 1; }
     if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
     grep '^libpack MRT .*integer_pixels=48 failures=0$' "$log"
+    if [ "$kind" = float ]; then
+        grep -Eq $'libpack_fout_want\t[0-9a-f]{16}\te\t0$' "$log"
+    elif grep -q 'libpack_fout_want' "$log"; then
+        echo '【红】整数输出库件已匹配，仍错误记录为缺失变体' >&2
+        exit 1
+    fi
 done
+log="$out/mrt-vf.log"
+timeout 120 "$binary" "$out/shaders" mrt-vf > "$log" 2>&1 || { cat "$log"; exit 1; }
+if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
+grep -qx 'libpack MRT variants: draws=7 pixels=336 compiler=0 failures=0' "$log"
+tail -n 1 "$log"
 work=$(mktemp -d "$out/warm.XXXXXX")
 cp "$out/shaders/libpack_depth.vert.spv" "$out/shaders/libpack_support.frag.spv" "$work"
 python3 - "$work" <<'PYWARM'
@@ -128,10 +145,17 @@ program = dict(contract='s2a-direct-program-content-v1', kind='graphics', identi
                stages=[dict(stage='vs', spirv=spirv)], bindings=[], c0Reads=[], supportReads=[])
 (root / 'warm-ordinary.json').write_text(json.dumps(dict(schema='s2a-direct-program-v1', content=program)))
 PYWARM
+for slots in 1 2 4; do
+    log="$out/submit-$slots.log"
+    timeout 120 "$binary" "$work" "submit-$slots" > "$log" 2>&1 || { cat "$log"; exit 1; }
+    if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log"; then cat "$log"; exit 1; fi
+    grep -qx "submit compile slots=$slots depth_pixels=16 failures=0" "$log"
+    echo "【绿】提交前瞻 $slots 槽：只现编一次、零跳画、深度读回 16/16，validation 0 条"
+done
 for arm in donor late aligned different reuse; do
     log="$out/warm-$arm.log"
     timeout 120 "$binary" "$work" "warm-$arm" > "$log" 2>&1 || { cat "$log"; exit 1; }
     if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-|resolve_fast_path_mismatch|快路径给的程序与慢路径不一致' "$log"; then cat "$log"; exit 1; fi
     grep '^libpack warm .*depth_pixels=16 failures=0$' "$log"
 done
-for mutant in synth fetch output clip-control; do bash "$0" "--negative-$mutant"; done
+for mutant in synth fetch output clip-control mrt-memo; do bash "$0" "--negative-$mutant"; done

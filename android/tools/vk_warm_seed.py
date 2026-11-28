@@ -25,7 +25,8 @@ import shutil
 import struct
 import sys
 
-PROG_MAGIC, PROG_VERSION, PROG_HDR, PROG_ENTRY = 0x31575053, 2, 60, 88   # 同 android/native/nvn/nvn_vk_prog_warm.c：版本 2 = 变长条目（88 字节头 + 有效阶段的 c1 整段，各补齐到 4）
+PROG_MAGIC, PROG_VERSION, PROG_HDR, PROG_ENTRY = 0x31575053, 3, 60, 112
+PROG_STAGES, PROG_C1_OK, PROG_C1_LEN, PROG_USES = 5, 76, 80, 100
 PROG_C1_MIN, PROG_C1_MAX = 0x100, 0x10000   # NVK_PROG_REC_C1_MIN / MAX
 PIPE_MAGIC, PIPE_FORMAT, PIPE_DESC, PIPE_HDR = b'S2APW1\0\0', 1, 352, 32
 PIPE_ENTRY = 32 + PIPE_DESC + 4
@@ -58,9 +59,9 @@ def prog_check(name, b, records=None):
         if off + PROG_ENTRY > end: raise ValueError('长度与条数不符')
         e = b[off:off + PROG_ENTRY]; off += PROG_ENTRY; ids.add(e[:32])
         c1_start = off
-        for st in range(3):
-            cl = struct.unpack_from('<I', e, 64 + 4 * st)[0]
-            if not (e[60] >> st) & 1:
+        for st in range(PROG_STAGES):
+            cl = struct.unpack_from('<I', e, PROG_C1_LEN + 4 * st)[0]
+            if not (e[PROG_C1_OK] >> st) & 1:
                 if cl: raise ValueError('条目 c1 长度与有效位不符')
                 continue
             if not PROG_C1_MIN <= cl <= PROG_C1_MAX: raise ValueError('条目 c1 长度越界')

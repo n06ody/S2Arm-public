@@ -59,12 +59,13 @@ static int move_linear(const nvn_texdesc *d, unsigned level, unsigned layer, uin
     for (uint32_t y = 0; y < rows; y++) { if (to_linear) memcpy(lin + (size_t)y * pitch, mem + y * sp, row_bytes); else memcpy(mem + y * sp, lin + (size_t)y * pitch, row_bytes); }
     return 0;
 }
-static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, int to_linear) {
+static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *bl, uint8_t *lin, size_t pitch, int to_linear, int level_local) {
     if ((d->flags & (0x10 | 0x40)) && d->target != 10) return move_linear(d, level, layer, bl, lin, pitch, to_linear);
     uint32_t row_bytes, rows, slices, bpb; uint64_t base; unsigned th, td;
     if (nvn_deswizzle_geom(d, level, layer, &row_bytes, &rows, &slices, &base, &th, &td, &bpb)) return -1;
     if (pitch < row_bytes) return -1;
-    bl += base; uint32_t lb = nvn_tex_level_gobs(d, level) * 64;   // the row as laid out (padded in a sparse texture's tiled levels)
+    if (!level_local) bl += base;
+    uint32_t lb = nvn_tex_level_gobs(d, level) * 64;   // the row as laid out (padded in a sparse texture's tiled levels)
     if (lb < row_bytes) lb = row_bytes;
     // A whole GOB column's four 16-byte pieces (x%64 = 0/16/32/48) lie inside one GOB, at the x terms of the layout formula only:
     //   the y terms of gob_off are common to all four, so from the column's start (gob_off(0, y)) they sit at gob_off(16, 0) / gob_off(32, 0) / gob_off(48, 0)
@@ -92,8 +93,11 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
 }
 
 int nvn_deswizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, void *dst, size_t dst_pitch) {
-    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1);
+    return move(d, level, layer, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 0);
+}
+int nvn_deswizzle_level(const nvn_texdesc *d, unsigned level, const void *src, void *dst, size_t dst_pitch) {
+    return move(d, level, 0, (uint8_t *)src, (uint8_t *)dst, dst_pitch, 1, 1);
 }
 int nvn_swizzle(const nvn_texdesc *d, unsigned level, unsigned layer, const void *src, size_t src_pitch, void *dst) {
-    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0);
+    return move(d, level, layer, (uint8_t *)dst, (uint8_t *)src, src_pitch, 0, 0);
 }

@@ -28,7 +28,11 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--cc", default=os.environ.get("CC", "cc"))
     parser.add_argument("--objects-only", action="store_true")
+    parser.add_argument("--land-probe", action="store_true",
+                        help="run the direct NVN page probe through the same real Linux XSTACK")
     args = parser.parse_args()
+    if args.objects_only and args.land_probe:
+        parser.error("--land-probe requires Linux AArch64 execution")
     out = args.out.resolve()
     if out == ROOT or ROOT in out.parents:
         parser.error("--out must be outside the checkout")
@@ -37,6 +41,11 @@ def main():
                FAULT / "tests/register_probe.S", FAULT / "tests/guest_stack.S",
                NATIVE / "guest_signal.c", NATIVE / "redzone.S"]
     inputs = sources + [FAULT / "fault.h", FAULT / "sigframe_compat.h", NATIVE / "guest_signal.h", Path(__file__).resolve()]
+    if args.land_probe:
+        sources += [ROOT / "graphics/nvn/gfx/nvn/nvn_dirty.c",
+                    NATIVE / "nvn/nvn_host_hooks.c", ROOT / "runtime/src/direct_host.c"]
+        inputs += sources[-3:] + [ROOT / "graphics/nvn/gfx/nvn/nvn_dirty.h",
+                                  ROOT / "runtime/include/s2a_direct_host.h"]
     before = {str(p.relative_to(ROOT)): digest(p) for p in inputs}
     receipt = {"kind": "object-compile" if args.objects_only else "linux-aarch64-signal-fixture",
                "source_sha256": before, "host": platform.platform(), "commands": [],
@@ -57,7 +66,11 @@ def main():
     if not compiler:
         raise RuntimeError("compiler not found")
     run([compiler, "--version"], "compiler")
-    flags = [compiler, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-I", str(FAULT)]
+    language = "-std=gnu11" if args.land_probe else "-std=c11"
+    flags = [compiler, language, "-O2", "-Wall", "-Wextra", "-Werror", "-pthread", "-I", str(FAULT)]
+    if args.land_probe:
+        flags += ["-DS2A_NVN_PROBE_FIXTURE", "-I", str(ROOT), "-I", str(ROOT / "runtime/include"),
+                  "-I", str(ROOT / "graphics/track")]
     if args.objects_only:
         for i, source in enumerate(sources):
             run(flags + ["-c", str(source), "-o", str(out / f"{i}-{source.name}.o")], f"compile-{i}")

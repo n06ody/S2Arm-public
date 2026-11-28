@@ -939,6 +939,38 @@ static void query(uint64_t addr, s2a_meminfo *o) {   // 持 g_mu
 }
 int s2a_mem_query(uint64_t addr, s2a_meminfo *out) { GMU_LOCK(); query(addr, out); GMU_UNLOCK(); return 0; }
 
+#if defined(__ANDROID__)
+// Probe only normal, live, uniquely backed RW heap pages. The scope at the
+// top of svc_mem closes probe admission before a VM mutation; keeping g_mu
+// here also serializes the query with alias creation.
+size_t s2a_android_mem_land_probe_heap(const void *addr, size_t len,
+                                       size_t (*visit)(const void *, size_t, void *), void *opaque) {
+    const size_t page = plat_page_size();
+    const uintptr_t a = (uintptr_t)addr;
+    if (!visit || !page || !len || len > UINTPTR_MAX - a || a > UINTPTR_MAX - (page - 1)) return 0;
+    const uintptr_t first = (a + page - 1) & ~(page - 1);
+    const uintptr_t last = (a + len) & ~(page - 1);
+    if (last <= first || !GMU_TRYLOCK()) return 0;
+    size_t armed = 0;
+    const uintptr_t heap = (uintptr_t)g_heap;
+    if (heap && first >= heap && last - heap <= g_heap_cur &&
+        plat_backing_refs(first, last - first) == 0) {
+        uintptr_t p = first;
+        while (p < last) {
+            s2a_meminfo info;
+            query(p, &info);
+            if (info.state != ST_HEAP || info.attr != 0 || info.perm != (PROT_READ | PROT_WRITE) ||
+                info.base > p || info.size > UINT64_MAX - info.base || info.base + info.size <= p)
+                break;
+            p = info.base + info.size;
+        }
+        if (p >= last) armed = visit((const void *)first, last - first, opaque);
+    }
+    GMU_UNLOCK();
+    return armed;
+}
+#endif
+
 // 诊断只记进程内首个失败；状态来自已有账本，不代表宿主内核页表。
 typedef struct {
     uint64_t dst, src, size, result, pc, stack_base, stack_size;
@@ -1577,9 +1609,16 @@ static int backing_prepare_locked(uint64_t a, uint64_t n) {
 }
 // #1281 NVN 稀疏虚拟池的长寿别名入口（hle_nvn.c 的 Android 块调用）。
 // 回 1 = 已 ref；0 = 源不在背板区（池存储是宿主内存）；-EFAULT = 源页已死；其它负数 = -errno。
+#if defined(__ANDROID__)
+extern void nvn_dirty_read_probe_pin_export(const void *, size_t, int) __attribute__((weak));
+#endif
 int s2a_mem_backing_alias_ref(uint64_t src, uint64_t n) {
     GMU_LOCK();
     int result = backing_alias_ref_locked(src, n);
+#if defined(__ANDROID__)
+    if (result == 1 && nvn_dirty_read_probe_pin_export)
+        nvn_dirty_read_probe_pin_export((const void *)(uintptr_t)src, (size_t)n, 1);
+#endif
     GMU_UNLOCK();
     return result;
 }
@@ -2683,11 +2722,22 @@ void s2a_mem_session_reset(void) {
     GMU_UNLOCK();
 }
 
+#if defined(__ANDROID__)
+extern int nvn_dirty_read_probe_vm_begin(void) __attribute__((weak));
+extern void nvn_dirty_read_probe_vm_end(void) __attribute__((weak));
+#endif
+
 // 替页与栈搬移SVC进入安全点；普通查询与时钟不承担停全局线程的成本。
 int svc_mem(int num, uint64_t *regs, uint64_t orig) {
 #if (defined(__ANDROID__) || defined(__OHOS__))
     // 0x02 SetMemoryPermission 也改表（宿主保护 + 权限账，审计 P1-10）：要与换页串行，但不替页，只取串行 epoch、不停全体
     int backing = num == 0x01 || num == 0x02 || num == 0x2C || num == 0x2D || num == 0x04 || num == 0x05 || num == 0x13 || num == 0x14 || num == 0x4c || num == 0x51 || num == 0x52;
+#if defined(__ANDROID__)
+    // Disarm before the writer rendezvous: a parked thread may own an
+    // XSTACK restore. Keep new observations out until the SVC is finished.
+    const int probe_vm = backing && nvn_dirty_read_probe_vm_begin && nvn_dirty_read_probe_vm_end &&
+                         nvn_dirty_read_probe_vm_begin();
+#endif
     atomic_store_explicit(&g_mem_svc_live, 1, memory_order_relaxed);   // 游戏线程已在跑：此后改表要在 VM epoch 里（vm_mutation_check）
     int fast = num == 0x2C && physical_growth_empty(regs[0], regs[1]);
     g_phys_retry = 0;
@@ -2714,7 +2764,12 @@ int svc_mem(int num, uint64_t *regs, uint64_t orig) {
         }
     }
     if (writer_error) {
-        if (writer_error == ECANCELED && s2a_svc_stopping()) s2a_android_guest_park_forever();
+        if (writer_error == ECANCELED && s2a_svc_stopping()) {
+#if defined(__ANDROID__)
+            if (probe_vm) nvn_dirty_read_probe_vm_end();
+#endif
+            s2a_android_guest_park_forever();
+        }
         // 宿主停车/锁协议失败不是客体地址错误；不能伪造D401让游戏继续使用未完成映射。
         if (num == 0x04 && map_failure_claim()) {
             map_failure f = map_failure_new(regs[0], regs[1], regs[2], 0, orig, writer_error, "writer-admission-fatal");
@@ -2724,6 +2779,9 @@ int svc_mem(int num, uint64_t *regs, uint64_t orig) {
     }
     if (backing && s2a_svc_stopping()) {
         s2a_android_guest_writers_end();
+#if defined(__ANDROID__)
+        if (probe_vm) nvn_dirty_read_probe_vm_end();
+#endif
         s2a_android_guest_park_forever();
     }
     g_phys_fast = fast && !writer_error;
@@ -2745,6 +2803,9 @@ int svc_mem(int num, uint64_t *regs, uint64_t orig) {
     fast = 0;
     ++g_phys_retry;
     }
+#if defined(__ANDROID__)
+    if (probe_vm) nvn_dirty_read_probe_vm_end();
+#endif
     return handled;
 #else
     int backing = num == 0x01 || num == 0x02 || num == 0x2C || num == 0x2D || num == 0x04 || num == 0x05 || num == 0x13 || num == 0x14 || num == 0x4c || num == 0x51 || num == 0x52;   // 同安卓那张表

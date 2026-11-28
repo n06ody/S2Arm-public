@@ -59,15 +59,16 @@ namespace S2A.DirectCompiler
         public readonly string RuntimeCompilerAbi;
         public readonly uint DirectAbi;
         public readonly Capabilities Caps;
+        public readonly bool TessellationShader;
         // Translation may describe the guest's 48 KiB shared-memory contract;
         // the physical limit remains separately in Caps for the spill decision.
         public readonly Capabilities TranslationCaps;
         public readonly SupportLayout Support = SupportLayout.Compile();
 
-        private DirectProfile(string hash, string closure, string compilerAbi, uint directAbi, Capabilities caps, Capabilities translationCaps)
+        private DirectProfile(string hash, string closure, string compilerAbi, uint directAbi, Capabilities caps, Capabilities translationCaps, bool tessellationShader)
         {
             ProfileHash = hash; TranslatorClosure = closure; RuntimeCompilerAbi = compilerAbi;
-            DirectAbi = directAbi; Caps = caps; TranslationCaps = translationCaps;
+            DirectAbi = directAbi; Caps = caps; TranslationCaps = translationCaps; TessellationShader = tessellationShader;
         }
 
         public static DirectProfile Parse(JsonElement e, string where)
@@ -113,7 +114,7 @@ namespace S2A.DirectCompiler
                 "supportsR4G4B4A4Format", "supportsScaledVertexFormats", "supportsSnormBufferTextureFormat",
                 "supports5BitComponentFormat", "supportsSparseBuffer", "supportsBlendEquationAdvanced",
                 "supportsFragmentShaderInterlock", "supportsFragmentShaderOrderingIntel", "supportsGeometryShader",
-                "supportsGeometryShaderPassthrough", "supportsGeometryShaderOcclusionQuery", "supportsTransformFeedback", "supportsImageLoadFormatted",
+                "supportsGeometryShaderPassthrough", "supportsGeometryShaderOcclusionQuery", "supportsTessellationShader", "supportsTransformFeedback", "supportsImageLoadFormatted",
                 "supportsLayerVertexTessellation", "supportsMismatchingViewFormat", "supportsCubemapView",
                 "supportsNonConstantTextureOffset", "supportsQuads", "supportsSeparateSampler", "supportsShaderBallot",
                 "supportsShaderBarrierDivergence", "supportsShaderFloat64", "supportsShaderNonUniformIndexing",
@@ -220,7 +221,7 @@ namespace S2A.DirectCompiler
                 parsed.S2AVertexPull || parsed.RequiresLinkedVaryingInterface)
                 throw new DirectCompileException("UNSUPPORTED_PROFILE",
                     cw + " enables a stage/feature the first direct backend does not implement");
-            return new DirectProfile(hash, closure, compilerAbi, directAbi, parsed, translation);
+            return new DirectProfile(hash, closure, compilerAbi, directAbi, parsed, translation, JsonStrict.OptionalBool(caps, "supportsTessellationShader", cw, false));
         }
     }
 }

@@ -67,7 +67,8 @@ def same_program(base, off):
     a, ac1 = base
     b, bc1 = off
     # 比对身份、阶段、键、c1 状态/长度与常量原文；库来源、使用次数和顺序是每局的观测值。
-    return a[:61] == b[:61] and a[64:76] == b[64:76] and ac1 == bc1
+    return (a[:seed.PROG_C1_OK + 1] == b[:seed.PROG_C1_OK + 1]
+            and a[seed.PROG_C1_LEN:seed.PROG_USES] == b[seed.PROG_C1_LEN:seed.PROG_USES] and ac1 == bc1)
 
 
 def stage_companion(source, destination, name, original, original_pipes):

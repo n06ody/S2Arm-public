@@ -25,7 +25,7 @@ for f in graphics/nvn/replay/rp_res.c graphics/nvn/replay/rp_pass.c graphics/nvn
 done
 cc -D_DEFAULT_SOURCE -D_POSIX_C_SOURCE=200809L -std=c11 -O1 -g -Wall -Wextra -Werror -Wno-unused-parameter \
     -ffunction-sections -fdata-sections -DS2A_ANDROID_VK_BACKEND_NVN_VK=1 "${inc[@]}" "${src[@]}" \
-    -Wl,--gc-sections -Wl,--wrap=nvn_gpu_pass_begin -lvulkan -lpthread -lm -o "$out/test"
+    -Wl,--gc-sections -Wl,--wrap=nvn_gpu_pass_begin -Wl,--wrap=vkCreateRenderPass -lvulkan -lpthread -lm -o "$out/test"
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
 cat > "$out/vk_layer_settings.txt" <<'SETTINGS'
@@ -43,9 +43,27 @@ for dq in 0 1; do
             cat "$log"
             exit 1
         fi
-        echo "clear-only Vulkan: DQ=$dq arm=$arm cases=6 VUID=0 SYNC-HAZARD=0"
+        echo "clear-only Vulkan: DQ=$dq arm=$arm cases=6 trim/reupload=$arm/$arm VUID=0 SYNC-HAZARD=0"
+        log="$out/color-dq$dq-arm$arm.log"
+        if ! timeout 90 "$out/test" "$out/shaders" "$arm" "$arm" --color-rect > "$log" 2>&1 ||
+           grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+           ! grep -q 'color-rect Vulkan cases=7 failures=0' "$log"; then
+            cat "$log"
+            exit 1
+        fi
+        echo "PASS color-rect: DQ=$dq arm=$arm cases=7 VUID=0 SYNC-HAZARD=0"
     done
 done
+# The same real reupload and pixel checks work with the diagnostic disabled.
+log="$out/co-diag-off.log"
+if ! S2A_TEST_CO_DIAG_OFF=1 timeout 90 "$out/test" "$out/shaders" 1 1 > "$log" 2>&1 ||
+   grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+   ! grep -q 'clear-only Vulkan cases=6 failures=0' "$log" ||
+   ! grep -q 'CO trim/reupload events=0/0' "$log"; then
+    cat "$log"
+    exit 1
+fi
+echo 'PASS clear-only reupload with diagnostic off and pixels unchanged'
 # Withdraw the optimization while preserving the workload, pixels and expectations.
 set +e
 timeout 90 "$out/test" "$out/shaders" 0 1 > "$out/withdrawn.log" 2>&1
@@ -58,3 +76,13 @@ if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/withd
     exit 1
 fi
 echo '【绿】纯清除 Vulkan 裁减/回退，双 DQ 读回及撤回负控，VVL 同步校验零错误'
+log="$out/color-withdrawn.log"
+rc=0
+timeout 90 "$out/test" "$out/shaders" 0 1 --color-rect > "$log" 2>&1 || rc=$?
+if [ "$rc" -ne 1 ] || grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$log" ||
+   ! grep -q 'cropped clear expected=1 got=0' "$log" ||
+   ! grep -q 'color-rect Vulkan cases=7 failures=1' "$log"; then
+    cat "$log"
+    exit 1
+fi
+echo 'PASS color-rect withdrawal: LOAD restored, pixels unchanged'

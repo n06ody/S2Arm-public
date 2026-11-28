@@ -257,7 +257,11 @@ static void index_tests(void) {
 }
 
 int main(void) {
-    char tmpl[] = "/tmp/s2a-pcache-XXXXXX";
+    char tmpl[512];
+    const char *scratch = getenv("TMPDIR");
+    if (!scratch) scratch = "/tmp";
+    int path_len = snprintf(tmpl, sizeof tmpl, "%s/s2a-pcache-XXXXXX", scratch);
+    if (path_len < 0 || (size_t)path_len >= sizeof tmpl) return 1;
     char *dir = mkdtemp(tmpl);
     if (!dir) { printf("FAIL: mkdtemp\n"); return 1; }
     snprintf(g_dir, sizeof g_dir, "%s/cache", dir);
@@ -382,6 +386,7 @@ int main(void) {
     }
     CHECK(s2a_program_cache_store(g_dir, id, payload, sizeof payload, why, sizeof why) == 0, "restore entry");
 
+    CHECK(s2a_program_cache_start() == 0, "program cache session writer starts");
     // --- 异步写：不阻塞，drain 之后可见 ---
     // 注意：上面故意构造的坏文件会让 failures 增加，这是被拒绝的证据，不能当成功路径的失败。
     uint64_t failures_before = s2a_program_cache_failures();
@@ -411,6 +416,8 @@ int main(void) {
     sync_failure_tests();
     index_tests();
 
+    CHECK(s2a_program_cache_stop(5000) == 0, "writer stops after draining");
+    CHECK(s2a_program_cache_store_async(g_dir, id, payload, sizeof payload) != 0, "stopped writer rejects new work");
     // 清场
     char cmd[700];
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", dir);

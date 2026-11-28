@@ -782,6 +782,11 @@ internal static unsafe class Program
     {
         byte[][] requests = { graphicsRequest, computeRequest };
         byte[][] expected = requests.Select(request => DirectShaderCompiler.Compile(request)).ToArray();
+        long cpu = 0;
+        var probe = new DirectShaderCompiler.PhaseProbe(() => ++cpu);
+        Check(DirectShaderCompiler.Compile(graphicsRequest, probe).SequenceEqual(expected[0]) &&
+              probe.RequestSha != null && probe.Parse.CpuNs > 0 && probe.SpirvCpuNs > 0 && probe.Serialize.CpuNs > 0,
+              "phase collection leaves result bytes exact and observes request, SPIR-V and serialization");
         using var start = new Barrier(requests.Length);
         var failures = new string[requests.Length];
         var threads = new Thread[requests.Length];
@@ -826,8 +831,88 @@ internal static unsafe class Program
             "unmanaged provider returns both reference results across 16 parallel rounds " + string.Join(" ", failures));
     }
 
+    private static void CompareResultTiming(string inputs, string output)
+    {
+        var files = Directory.GetFiles(inputs, "*.json")
+            .Where(file => Path.GetFileName(file) != "profile.json").OrderBy(file => file).ToArray();
+        if (files.Length != 13) throw new InvalidOperationException("expected 13 Track D fixtures");
+        foreach (string arm in new[] { "json", "binary" }) Directory.CreateDirectory(Path.Combine(output, arm));
+        var requests = files.Select(file =>
+        {
+            byte[] data = File.ReadAllBytes(file);
+            using var doc = JsonDocument.Parse(data);
+            return (Data: data, Session: doc.RootElement.GetProperty("session").GetUInt64(),
+                Generation: doc.RootElement.GetProperty("generation").GetUInt64(), Name: Path.GetFileName(file));
+        }).ToArray();
+        var expected = requests.Select(input => DirectShaderCompiler.Compile(input.Data)).ToArray();
+        var emit = (delegate* unmanaged<nint, DirectBytes, int>)&Emit;
+        var encode = (delegate* unmanaged<DirectBytes, nint, nint, int>)&DirectCompileNative.EncodeLegacy;
+        double Ms(long ticks) => 1000.0 * ticks / System.Diagnostics.Stopwatch.Frequency;
+        for (int round = -8; round < 64; ++round)
+        for (int i = 0; i < files.Length; ++i)
+        for (int order = 0; order < 2; ++order)
+        {
+            bool binary = ((round + i + order) & 1) == 1;
+            string arm = binary ? "binary" : "json";
+            delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int> call =
+                binary ? &DirectCompileNative.CompileBinary : &DirectCompileNative.Compile;
+            var input = requests[i];
+            var phase = new DirectShaderCompiler.ResultTiming();
+            DirectShaderCompiler.Timing = phase;
+            _emitted = null;
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            int rc;
+            try
+            {
+                fixed (byte* data = input.Data)
+                    rc = call(input.Session, input.Generation,
+                        new DirectBytes { Data = (nint)data, Bytes = (ulong)input.Data.Length }, (nint)emit, 0);
+            }
+            finally { DirectShaderCompiler.Timing = null; }
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            var wire = _emitted;
+            if (rc != 0 || wire == null || (binary && !wire.AsSpan(0, 8).SequenceEqual("S2ADRB1\0"u8)))
+                throw new InvalidOperationException("C ABI output differed for " + input.Name);
+            long diskEncode = 0;
+            if (binary)
+            {
+                start = System.Diagnostics.Stopwatch.GetTimestamp();
+                fixed (byte* ptr = wire)
+                    rc = encode(new DirectBytes { Data = (nint)ptr, Bytes = (ulong)wire.Length }, (nint)emit, 0);
+                diskEncode = System.Diagnostics.Stopwatch.GetTimestamp() - start;
+            }
+            if (rc != 0 || _emitted == null || !_emitted.AsSpan().SequenceEqual(expected[i]))
+                throw new InvalidOperationException("Legacy bytes did not round-trip for " + input.Name);
+            if (round == 0) File.WriteAllBytes(Path.Combine(output, arm, input.Name), wire);
+            if (round >= 0)
+                Console.WriteLine(JsonSerializer.Serialize(new { Arm = arm, Round = round, Kind = input.Name,
+                    Total = Ms(elapsed), Metadata = Ms(phase.Metadata), Encode = Ms(phase.Encode),
+                    DiskEncode = Ms(diskEncode), Bytes = wire.Length }));
+        }
+    }
+
     private static void Main(string[] args)
     {
+        if (args.Length == 3 && args[0] == "--emit-live-result")
+        {
+            byte[] request = File.ReadAllBytes(args[1]);
+            using var doc = JsonDocument.Parse(request);
+            ulong session = doc.RootElement.GetProperty("session").GetUInt64();
+            ulong generation = doc.RootElement.GetProperty("generation").GetUInt64();
+            var call = (delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.CompileBinary;
+            var emit = (delegate* unmanaged<nint, DirectBytes, int>)&Emit;
+            fixed (byte* data = request)
+                if (call(session, generation, new DirectBytes { Data = (nint)data, Bytes = (ulong)request.Length }, (nint)emit, 0) != 0)
+                    throw new InvalidOperationException("binary provider rejected the fixture");
+            File.WriteAllBytes(args[2], _emitted);
+            return;
+        }
+
+        if (args.Length == 3 && args[0] == "--compare-result-timing")
+        {
+            CompareResultTiming(args[1], args[2]);
+            return;
+        }
         string sampledSpvDir = args.Length == 2 && args[0] == "--emit-sampled" ? Path.GetFullPath(args[1]) : null;
         if (sampledSpvDir != null) Directory.CreateDirectory(sampledSpvDir);
         // GPU oracle: transform the exact reference shader with production code.

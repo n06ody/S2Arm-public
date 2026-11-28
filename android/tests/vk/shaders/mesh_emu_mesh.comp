@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Exchange {
+    uint h[];
+};
+
+layout(set = 0, binding = 1, std140) uniform FirstWg {
+    uvec4 first_wg;
+};
+
+void main() {
+    uint tg = gl_WorkGroupID.x;
+    if (tg >= h[4]) return;
+    uint col = 0u;
+    if (h[3] > 0u) {
+        uint dm_e = h[h[2] + tg];
+        uint t = dm_e >> 10;
+        uint j = dm_e & 1023u;
+        uint task_id = h[h[1] + t * h[5]];
+        col = task_id * 2u + j;
+    } else {
+        col = first_wg.x + tg;
+    }
+    if (col >= 8u) return;
+    float x0 = -1.0 + float(col) * 0.25;
+    float x1 = x0 + 0.25;
+    vec4 p[4] = vec4[4](
+        vec4(x0, -1.0, 0.0, 1.0),
+        vec4(x1, -1.0, 0.0, 1.0),
+        vec4(x0,  1.0, 0.0, 1.0),
+        vec4(x1,  1.0, 0.0, 1.0)
+    );
+    uint vbase = h[11] + tg * 16u;
+    for (uint k = 0u; k < 4u; k++) {
+        uint vo = vbase + k * 4u;
+        h[vo + 0u] = floatBitsToUint(p[k].x);
+        h[vo + 1u] = floatBitsToUint(p[k].y);
+        h[vo + 2u] = floatBitsToUint(p[k].z);
+        h[vo + 3u] = floatBitsToUint(p[k].w);
+    }
+    uint ibase = atomicAdd(h[13], 6u);
+    uint io = h[12] + ibase;
+    uint v0 = tg * 4u;
+    h[io + 0u] = v0 + 0u;
+    h[io + 1u] = v0 + 1u;
+    h[io + 2u] = v0 + 2u;
+    h[io + 3u] = v0 + 2u;
+    h[io + 4u] = v0 + 1u;
+    h[io + 5u] = v0 + 3u;
+}

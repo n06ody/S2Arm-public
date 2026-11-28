@@ -24,17 +24,8 @@ static uint16_t feedback_writes(struct nvn_gpu_cmd_s *c) {
     uint16_t writes = 0;
     for (uint32_t i = 0; i < 8; i++)
         if (p->cfmt[i] && ((p->chmask.mask >> (4 * i)) & 15)) writes |= 1u << i;
-    if (p->dfmt && p->ds.dt && p->ds.dw) writes |= 1u << 8;
-    if (p->sfmt && p->ds.st) {
-        uint32_t front = c->has_dyn ? c->dyn.st_wmask[0] & 255 : 255;
-        uint32_t back = c->has_dyn ? c->dyn.st_wmask[1] & 255 : 255;
-        if ((front && (vk_stencil_op(p->ds.fail_f) != VK_STENCIL_OP_KEEP ||
-                       vk_stencil_op(p->ds.zfail_f) != VK_STENCIL_OP_KEEP ||
-                       vk_stencil_op(p->ds.zpass_f) != VK_STENCIL_OP_KEEP)) ||
-            (back && (vk_stencil_op(p->ds.fail_b) != VK_STENCIL_OP_KEEP ||
-                      vk_stencil_op(p->ds.zfail_b) != VK_STENCIL_OP_KEEP ||
-                      vk_stencil_op(p->ds.zpass_b) != VK_STENCIL_OP_KEEP))) writes |= 1u << 8;
-    }
+    const uint8_t ds = pass_ds_writes(c);
+    if ((p->dfmt && (ds & NVN_GPU_DS_DEPTH)) || (p->sfmt && (ds & NVN_GPU_DS_STENCIL))) writes |= 1u << 8;
     return writes;
 }
 // from_pool = 1：这个视图来自整池数组（NVN_RB_TEXP，整张贴图池一个绑定），不是着色器声明过的某个具体绑定。
@@ -73,8 +64,55 @@ static void feedback_pool_skip_note(const struct nvn_gpu_cmd_s *c, const struct 
     if (!__atomic_exchange_n(&g_fb_skip_full, 1u, __ATOMIC_RELAXED))
         nvn_plat_log(NVN_PLAT_LOG_INFO, "gpu", "整池数组免拷快照：不同（管线、图）已记满，之后不再逐条记（计数见分时行 pskip）");
 }
-static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set,
-                        uint16_t writes, uint16_t *read_mask, int from_pool, int *skipped) {
+static int feedback_tex_in_active_pool(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *tex) {
+    if (!c->pool_active || !tex) return 0;
+    const uint64_t img = (uint64_t)(uintptr_t)tex->image;
+    if (!img) return 0;
+    for (int st = 0; st < 5; st++) {
+        for (uint32_t i = 0; i < c->pipe->stage_nent[st] && i < 64; i++) {
+            nvn_gpu_pool_table t = c->pool_binds[st][i];
+            if (!t || t->kind != NVN_GPU_POOL_IMAGE) continue;
+            if (t->ikey) {
+                if (pool_img_first(t, img) != UINT32_MAX) return 1;
+            } else {
+                for (uint32_t j = 0; j <= t->count; j++) {
+                    struct nvn_gpu_view_s *pv = t->objects[j];
+                    if (pv && pv->tex && pv->tex->image == tex->image) return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+// 遍内反馈环自依赖屏障（VK_DEPENDENCY_BY_REGION_BIT）：
+// 同步通道内前序附件写（含 CLEAR / draw / clear_rect）→ 片元着色器采样读（RAW），
+// 以及前序反馈环片元读 → 后续附件写（WAR）。阶段与访问掩码严格落入 make_pass / make_pipeline_pass 的 subpass 0→0 自依赖子集。
+static void feedback_loop_barrier(struct nvn_gpu_cmd_s *c) {
+    VkMemoryBarrier b;
+    memset(&b, 0, sizeof b);
+    b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(c->cb,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                         VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_DEPENDENCY_BY_REGION_BIT,
+                         1, &b, 0, NULL, 0, NULL);
+}
+static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint32_t set, int stage,
+                        uint16_t writes, uint16_t *read_mask, uint16_t *loop_mask,
+                        int *need_loop_barrier, int from_pool, int *skipped) {
     uint16_t attached = 0;
     const nvn_gpu_pass_desc *d = &c->pass_desc;
     for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
@@ -84,6 +122,17 @@ static int feedback_add(struct nvn_gpu_cmd_s *c, struct nvn_gpu_view_s *v, uint3
     if (from_pool && (attached & writes) && feedback_pool_skip_allowed(c)) { feedback_pool_skip_note(c, v); *skipped = 1; return 1; }
     if (c->feedback_read_on && !(attached & writes)) {
         *read_mask |= attached;
+        return 1;
+    }
+    // #14：VK_EXT_attachment_feedback_loop_layout 遍内自采样反馈环路径（零快照拷贝，稳态零 pass 分裂）。
+    // 仅片元阶段（self-dependency 限于 framebuffer-space stages）、非整池绑定、且建图已带 ATTACHMENT_FEEDBACK_LOOP_BIT_EXT、
+    // 且当前激活的整池数组不含该图（整池描述符固定声明 GENERAL）时走此路；其余全部零退化回落既有快照池。
+    if (c->feedback_loop_on && !from_pool && stage == NVN_GPU_SH_FS &&
+        v && v->tex && v->tex->fb_loop_usage &&
+        !feedback_tex_in_active_pool(c, v->tex)) {
+        v->tex->fb_loop_seen = 1;
+        *loop_mask |= attached;
+        *need_loop_barrier = 1;
         return 1;
     }
     c->desc_dirty |= 1u << set;
@@ -209,8 +258,8 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     if (vr != VK_SUCCESS) {
         set_sticky(c, NVN_GPU_E_UNSUPPORTED, "feedback vkCreateImageView failed %d", vr); if (fresh) nvn_gpu_tex_release(t); return 0;
     }
-    image_barrier(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    image_barrier_xfer(c, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT_KHR);
+    image_barrier_xfer(c, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT_KHR);
     if (!rc_is(c->sticky, NVN_GPU_OK)) { if (fresh) nvn_gpu_tex_release(t); return 0; }
     for (uint32_t lv = v->base_level; lv < v->base_level + v->levels; lv++) {
         // 3D 图像的 arrayLayer 必须为 0；范围位于 z，保留整级的全部切片。
@@ -232,7 +281,11 @@ static int feedback_make(struct nvn_gpu_cmd_s *c, struct feedback_copy *f) {
     if (fresh) nvn_gpu_tex_release(t); // cmd 引用保活到 fence；raw view 在 finish_cmd 中先释放
     return rc_is(c->sticky, NVN_GPU_OK);
 }
-static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int copy) {
+static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, uint16_t loop_mask, int copy) {
+    if (c->pass_desc.terminal_discard) {
+        nvn_gpu_cmd_reject(c, "attachment discard proof violated by feedback continuation");
+        return 0;
+    }
     // 同一个 Vulkan 查询不能跨 VkRenderPass，NVN 的遮挡计数可以：活动的查询在旧通道末尾（nvn_gpu_pass_end）结束，新通道里换一个续段槽接着数，
     // 读回时并回原槽（occl_spare_*），样本数连续。不截断查询后假报成功：续段槽要不到（保险丝到顶 / 分配或建池失败）时，
     // 只这一个查询续不下去（occl_spare_reserve 已记下，它的读数按未完成处理），拆通道照做、整段不失败。
@@ -242,18 +295,23 @@ static int feedback_restart(struct nvn_gpu_cmd_s *c, uint16_t read_mask, int cop
     const int cont_ok = occ >= 0 && occl_spare_reserve(c, occ, &cont);
     if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[2], 1, __ATOMIC_RELAXED);
     nvn_gpu_pass_desc d = c->pass_desc;
+    d.trace_origin = copy ? NVN_GPU_PASS_TRACE_FEEDBACK_COPY : NVN_GPU_PASS_TRACE_FEEDBACK_READ;
     d.area_w = d.area_h = 0;
+    d.ds_read_only = 0;
     for (uint32_t i = 0; i < d.ncolor && i < 8; i++) if (d.color[i].view) {
         d.color[i].load = NVN_GPU_LOAD_LOAD;
     }
     if (d.depth.view) d.depth.load = NVN_GPU_LOAD_LOAD;
     if (d.stencil.view) d.stencil.load = NVN_GPU_LOAD_LOAD;
-    nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；只读的新物理通道从 LOAD 开始（活动的遮挡查询在这里结束）
+    nvn_gpu_pass_end(c); // CLEAR / 前面几笔写已落地；新物理通道从 LOAD 开始（活动的遮挡查询在这里结束）
     if (cont_ok) occl_spare_reset(c, &cont);   // 通道外：新要的续段块整块重置（重置只能在通道外）
     if (copy) for (struct feedback_copy *f = c->feedback; f != c->feedback_stop; f = f->next)
         if (!feedback_make(c, f)) return 0;
     c->feedback_read_mask = read_mask;
+    c->feedback_loop_mask = loop_mask;
+    c->in_feedback_restart = 1;
     nvn_gpu_pass_begin(c, &d);
+    c->in_feedback_restart = 0;
     if (cont_ok && rc_is(c->sticky, NVN_GPU_OK)) occl_spare_begin(c, occ, &cont);   // 新通道里接着数
     return rc_is(c->sticky, NVN_GPU_OK);
 }
@@ -286,6 +344,8 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
     // 每笔由实际采样集合重建：不再采样（包括没有描述符组）就退出 NONE。
     // 不遗留旧槽位的只读状态，避免另一附件别名到同一范围并开始写时漏恢复。
     uint16_t read_mask = 0;
+    uint16_t loop_mask = 0;
+    int need_loop_barrier = 0;
     int pool_skipped = 0;   // 这一笔里整池数组与写着的附件重叠而免拷的视图有没有（读数）
     for (int st = 0; st < 5; st++) {
         for (uint32_t i = 0; i < c->nbinds[st]; i++) {
@@ -295,7 +355,7 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             if (e->cls != b->cls) continue;
             struct nvn_gpu_view_s *v = b->cls == NVN_GPU_RES_TEX_SAMP ? b->u.ts.view :
                 (b->cls == NVN_GPU_RES_TEX || b->cls == NVN_GPU_RES_IMAGE) ? b->u.view : NULL;
-            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, writes, &read_mask, 0, &pool_skipped)) return 0;
+            if (b->cls != NVN_GPU_RES_IMAGE && !feedback_add(c, v, e->set, st, writes, &read_mask, &loop_mask, &need_loop_barrier, 0, &pool_skipped)) return 0;
         }
         if (c->pool_active) for (uint32_t i = 0; i < c->pipe->stage_nent[st] && i < 64; i++) {
             nvn_gpu_pool_table t = c->pool_binds[st][i];
@@ -303,7 +363,7 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
             const uint32_t set = c->pipe->stage_ents[st][i].set;
             if (!t->ikey) {   // 没有按图索引的表：逐项扫
                 for (uint32_t j = 0; j <= t->count; j++)
-                    if (!feedback_add(c, t->objects[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->objects[j], set, st, writes, &read_mask, &loop_mask, &need_loop_barrier, 1, &pool_skipped)) return 0;
                 continue;
             }
             // 有索引：只看和本通道附件同一张图的视图（附件至多 9 个，深度与模板常同图，查过的图不重复查）
@@ -317,15 +377,47 @@ static int feedback_prepare(struct nvn_gpu_cmd_s *c, int compute) {
                 uint32_t q = 0; while (q < k && !(att[q]->tex && (uint64_t)(uintptr_t)att[q]->tex->image == img)) q++;
                 if (!img || q < k) continue;
                 for (uint32_t j = pool_img_first(t, img); j != UINT32_MAX; j = t->unext[j])
-                    if (!feedback_add(c, t->uviews[j], set, writes, &read_mask, 1, &pool_skipped)) return 0;
+                    if (!feedback_add(c, t->uviews[j], set, st, writes, &read_mask, &loop_mask, &need_loop_barrier, 1, &pool_skipped)) return 0;
             }
         }
     }
+    // 若当前物理通道已有附件处于 ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT，而本笔绑定的整池数组包含该图
+    // （整池描述符固定声明 GENERAL），需退出该槽的反馈环布局以保持布局一致。
+    uint16_t pool_conflicts = 0;
+    if (c->feedback_loop_mask && c->pool_active) {
+        const nvn_gpu_pass_desc *d = &c->pass_desc;
+        for (uint32_t i = 0; i < d->ncolor && i < 8; i++)
+            if ((c->feedback_loop_mask & (1u << i)) && d->color[i].view &&
+                feedback_tex_in_active_pool(c, d->color[i].view->tex))
+                pool_conflicts |= 1u << i;
+        struct nvn_gpu_view_s *dsv = d->depth.view ? d->depth.view : d->stencil.view;
+        if ((c->feedback_loop_mask & (1u << 8)) && dsv && feedback_tex_in_active_pool(c, dsv->tex))
+            pool_conflicts |= 1u << 8;
+    }
+    uint16_t next_loop_mask = (uint16_t)((c->feedback_loop_mask | loop_mask) & ~read_mask & ~pool_conflicts);
+    if (g.draw_fast) c->fb_pool_skipped = pool_skipped != 0;
     if (pool_skipped && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[3], 1, __ATOMIC_RELAXED);
     if (read_mask && g_draw_tm) __atomic_fetch_add(&g_feedback_stats[0], 1, __ATOMIC_RELAXED);
-    if (c->feedback == c->feedback_stop && read_mask == c->feedback_read_mask) {
-        if (pool_skipped) return pass_ensure_area(c, (VkRect2D){{0, 0}, {c->pass_w, c->pass_h}});
+    const int need_restart = (c->feedback != c->feedback_stop) ||
+                             (read_mask != c->feedback_read_mask) ||
+                             (next_loop_mask != c->feedback_loop_mask);
+    if (!need_restart) {
+        if (pool_skipped && !pass_ensure_area(c, (VkRect2D){{0, 0}, {c->pass_w, c->pass_h}})) return 0;
+        if (need_loop_barrier) {
+            feedback_loop_barrier(c);
+            c->feedback_loop_sampled |= loop_mask;
+            if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[4], 1, __ATOMIC_RELAXED);
+        } else if (c->feedback_loop_sampled & writes) {
+            // 前序反馈环采样读 → 本笔普通写：发遍内 WAR 自依赖屏障，避免写早于前序片元读。
+            feedback_loop_barrier(c);
+            c->feedback_loop_sampled &= (uint16_t)~writes;
+        }
         return 1;
     }
-    return feedback_restart(c, read_mask, 1);
+    if (!feedback_restart(c, read_mask, next_loop_mask, c->feedback != c->feedback_stop)) return 0;
+    if (need_loop_barrier) {
+        c->feedback_loop_sampled |= loop_mask;
+        if (g_draw_tm) __atomic_fetch_add(&g_feedback_stats[4], 1, __ATOMIC_RELAXED);
+    }
+    return 1;
 }

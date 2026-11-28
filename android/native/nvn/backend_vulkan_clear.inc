@@ -242,6 +242,7 @@ static VkPipeline clr_pipe_get(struct nvn_gpu_cmd_s *c, const struct clr_key *k)
 
 // 在当前通道里画一笔清除。slot >= 0：颜色槽 slot 的 cmask 那几个通道写成 value；do_depth：深度写成 d->depth_value；
 // smask != 0：模板的那几位写成 sval。三样可以同一笔做。
+// 本管线没有描述符组，不录制 vkCmdBindDescriptorSets；nvn_gpu_clear_rect 据此保留原绑定。
 static void clr_draw(struct nvn_gpu_cmd_s *c, int slot, uint32_t cmask, const void *value16, int do_depth, uint32_t smask, uint32_t sval, const nvn_gpu_clear *d) {
     struct clr_key k;
     memset(&k, 0, sizeof k);

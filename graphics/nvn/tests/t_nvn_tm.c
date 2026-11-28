@@ -66,7 +66,7 @@ static void clk_end(void) { g_clk_fake = 0; }
 // 最小程序：没有绑定项（同 t_nvn_res.c 的 res_prog_min）
 static void tm_prog_min(void) {
     memset(&g_fprog, 0, sizeof g_fprog);
-    for (int st = 0; st < RP_PROG_STAGES; st++) for (int i = 0; i < RP_PROG_ENT_MAX; i++) g_fprog.ent[st][i].src_reg2 = UINT16_MAX;
+    for (int st = 0; st < RP_PROG_INLINE_STAGES; st++) for (int i = 0; i < RP_PROG_ENT_MAX; i++) g_fprog.ent[st][i].src_reg2 = UINT16_MAX;
     g_fprog.sh[0] = &g_fsh[0]; g_fprog.sh[1] = &g_fsh[1]; g_fprog.support_bytes = 2608; g_fprog.color_out_mask = 0xffffffffu;
 }
 #endif

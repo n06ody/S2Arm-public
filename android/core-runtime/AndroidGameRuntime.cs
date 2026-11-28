@@ -37,6 +37,7 @@ namespace S2A.Android.Aot
         [DllImport("s2a_native")] private static extern int s2a_android_vk_session_stop();
         [DllImport("s2a_native")] private static extern ulong s2a_android_vk_present_count();
         [DllImport("s2a_native")] private static extern ulong s2a_android_nvn_present_count();
+        [DllImport("s2a_native")] private static extern delegate* unmanaged<ulong, ulong, int, void> s2a_android_nvn_land_pin_provider();
         // t-direct-frametimes：逐帧帧时间局末转储（generic 经此触发；direct 已由 adapter shutdown 转过，空记录无输出）。
         [DllImport("s2a_native")] private static extern void s2a_frame_log_dump();
         // 手机六轴 / 震动（#528 第 10 项，android/native/phone_feedback.c）：宿主函数地址登记给服务层（主程序句柄查不到本库导出）
@@ -134,6 +135,15 @@ namespace S2A.Android.Aot
                 nint compile = 0;
                 unsafe { compile = (nint)(delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.Compile; }
                 int bind = session.BindCompiler(compile);
+                if (bind == DirectAbi.Ok)
+                {
+                    unsafe
+                    {
+                        bind = session.BindBinaryCompiler(
+                            (nint)(delegate* unmanaged<ulong, ulong, DirectBytes, nint, nint, int>)&DirectCompileNative.CompileBinary,
+                            (nint)(delegate* unmanaged<DirectBytes, nint, nint, int>)&DirectCompileNative.EncodeLegacy);
+                    }
+                }
                 if (bind != DirectAbi.Ok)
                 {
                     Console.Error.WriteLine($"[s2a] direct services rejected: compiler bind failed ({bind})");
@@ -270,6 +280,9 @@ namespace S2A.Android.Aot
 
                 stage = ServiceError.Provider;
                 Native.UseLinked(request->NativeOwner);
+                // Register before any service can return a guest view. The
+                // provider returns null for builds/runs without this probe.
+                GuestMemory.HostAddressHook = directSession != null ? s2a_android_nvn_land_pin_provider() : null;
                 // UseLinked also serves diagnostics, where all optional exports
                 // may be absent. A game requires this complete owner group before
                 // constructing the GPU/HLE composition.

@@ -10,11 +10,19 @@
 nvn_gpu_tex rp_tex_resolve(const tex_t *t, nvn_gpu_cmd c);
 // 拷贝端点必须保留源格式语义，调用方已结束通道。
 nvn_gpu_tex rp_tex_resolve_plain(const tex_t *t, nvn_gpu_cmd c);
+void rp_bc7_note_region(nvn_gpu_cmd c, nvn_gpu_tex storage, const tex_t *t);
 void rp_res_xfer_aborted(uint64_t sub);
 void rp_res_byte_upload_failed(void);
+extern int rp_tex_upload_diag_enabled;   // 用原子读写，首笔上传锁存会话配置
+void rp_tex_upload_diag_submit(nvn_gpu_cmd cmd, uint64_t fence);   // fence=0：丢弃录制
+void rp_tex_upload_diag_done(const nvn_gpu_done *done);
+void rp_tex_upload_diag_window(uint64_t frames);   // frames=0：会话末窗
+
 // 宿主整段读贴图存储的入口：整段在它的内存池里 → t->mem；伸出池子（真机：存储偏移 -1）→ 副本，池内照拷、池外按 0，*part 交调用方 free。
 //   NULL = 副本分配失败。线程：任意（不取锁）。
 const uint8_t *rp_tex_src(const tex_t *t, uint8_t **part);
+int rp_tex_sparse_cpu(const tex_t *t);
+int rp_tex_deswizzle_sparse_level(const tex_t *t, unsigned level, unsigned layer, void *linear, size_t pitch);
 // 贴图号 → 视图（登记时带视图记录的按它建，否则默认视图）。号没登记 / 池外 → NULL。线程：[提交]。
 // t_out 可为 NULL；非 NULL 时取到登记就在锁内把登记快照拷进调用方的 *t_out，没取到清零（serial 为 0）。
 //   不交出登记表内地址：客体线程登记更大的号会让表扩容换地址（#1581）。
@@ -101,6 +109,8 @@ nvn_gpu_view rp_view_for_plain(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
 // 由调用方在开通道前用 rp_tex_take_zero 取走并把这个附件的载入方式改成清零（显卡做，CPU 不搬一整张零）。
 // 没被取走的待清零，下一次任何别的用途取它时照旧填零。
 nvn_gpu_view rp_view_for_attach(const tex_t *t, const view_t *v, nvn_gpu_cmd c);
+// 需要换后端存储的附件应在本笔取得采样/存储视图之前准备。
+int rp_tex_prepare_sparse_attachment(const tex_t *t, nvn_gpu_cmd c);
 int rp_tex_take_zero(const tex_t *t);   // 1 = 这张图待清零，已取走：调用方必须让它在这个通道里整张清成零
 // 上屏用的默认视图：不经可淘汰的视图缓存（上屏线程与提交线程共用一份环会互相淘汰；
 // iOS 的 present 直接拿贴图对象，没有这层缓存）。调用方用完即 release，后端段按引用保活。
@@ -131,6 +141,8 @@ nvn_gpu_samp rp_sampler_for_query(void);
 nvn_gpu_pool_table rp_pool_table(nvn_gpu_cmd c, int samp, int base, uint32_t n, uint8_t dtt, uint8_t dcls, const char **why);
 // 这张贴图的内容从此以 GPU 为准（当了渲染目标 / 被拷贝写 / 被着色器写）：不再从游戏内存重传。
 void rp_tex_mark_gpu_written(const tex_t *t);
+// 诊断纯清除通道裁掉的附件身份，关联后继上传。调用方检查诊断开关。
+void rp_tex_note_co_trim(const tex_t *t);
 // 只读查询：这个序号被前端标过「CPU 写过」（nvn_be_tex_cpu_written：WriteTexels、刷新范围盖到、导出等）。同步读回判内容在不在游戏内存里用。线程：任意。
 int rp_tex_cpu_written(uint64_t serial);
 // 调试：序号 → 后端贴图（没建过 = NULL）。

@@ -31,6 +31,10 @@
 // debug.s2a.nvk_warm 的假替身。平台开关在进程内不变（nvn_plat.h 契约），所以「关」与「开」用两次进程跑：
 // 本程序第二次带 NVK_WARM_OFF=1 起，断言起不来线程。
 static int g_flag = 1;
+static int g_reactive;
+static unsigned g_published;        // 只由预热线程更新和读取
+static unsigned g_built_recipes;
+static int g_hot_before_last_program;
 static int g_prog_total = 6, g_pipe_total = 4;
 static int g_prog_taken, g_pipe_taken;
 static atomic_int g_order_violation;    // 管线先于程序被取走 = 1
@@ -56,7 +60,11 @@ enum nvk_pipe_feedback_mode nvn_vk_pipe_creation_stats(struct nvk_pipe_creation_
     return NVK_PIPE_FEEDBACK_ON;
 }
 
-int nvn_plat_flag(const char *name, int dflt) { (void)dflt; return strcmp(name, "nvk_warm") == 0 ? g_flag : dflt; }
+int nvn_plat_flag(const char *name, int dflt) {
+    if (!strcmp(name, "nvk_warm")) return g_flag;
+    if (!strcmp(name, "nvk_warm_reactive")) return g_reactive;
+    return dflt;
+}
 void nvn_plat_log(int level, const char *cls, const char *text) {
     (void)cls;
     if (level == 2) atomic_store(&g_red_seen, 1);   // NVN_PLAT_LOG_RED = 2（graphics/nvn/replay/nvn_plat.h）
@@ -78,12 +86,17 @@ int nvk_prog_warm_take(struct nvk_prog_rec *out) {
     if (g_prog_taken >= g_prog_total) return 0;
     memset(out, 0, sizeof *out);
     out->identity[0] = (uint8_t)g_prog_taken++;
+    out->identity[1] = 1;
     out->stage_mask = 3;
     return 1;
 }
 static atomic_int g_prog_attempts[64];
 int nvk_prog_warm_build(const struct nvk_prog_rec *rec) {
     int id = rec->identity[0];
+    if (g_reactive) {
+        g_published |= 1u << id;
+        return 0;
+    }
     int n = atomic_fetch_add(&g_prog_attempts[id], 1);
     if (id == 3) return -1;                                  // 一条固定失败
     if (n < atomic_load(&g_retry_prog)) return 1;            // 前几条在途：应被重试
@@ -110,12 +123,32 @@ int nvk_pipe_warm_load(void) { return g_pipe_total; }
 int nvk_pipe_warm_pending(void) { return g_pipe_total - g_pipe_taken; }
 int nvk_pipe_warm_take(struct nvk_pipe_rec *out) {
     if (g_pipe_taken >= g_pipe_total) return 0;
-    if (g_prog_taken < g_prog_total) atomic_store(&g_order_violation, 1);   // 程序没走完就取管线 = 违约
+    if (!g_reactive && g_prog_taken < g_prog_total) atomic_store(&g_order_violation, 1);   // 程序没走完就取管线 = 违约
     memset(out, 0, sizeof *out);
-    out->prog_identity[0] = (uint8_t)g_pipe_taken++;
+    int index = g_pipe_taken++;
+    // 热序首项依赖最后一个程序，第二项依赖首个程序。
+    out->prog_identity[0] = (uint8_t)(g_reactive ? (index == 0 ? 5 : 0) : index);
+    out->prog_identity[1] = 1;
+    return 1;
+}
+int nvk_pipe_warm_take_program(const uint8_t identity[32], struct nvk_pipe_rec *out) {
+    if (identity[0] != 0 && identity[0] != 5) return 0;
+    if (g_built_recipes & (1u << identity[0])) return 0;
+    memset(out, 0, sizeof *out);
+    memcpy(out->prog_identity, identity, 32);
+    g_pipe_taken++;
     return 1;
 }
 int nvk_pipe_warm_build(const struct nvk_pipe_rec *rec) {
+    if (g_reactive) {
+        unsigned bit = 1u << rec->prog_identity[0];
+        if (!(g_published & bit)) return 1;  // 真实 owner 借不到已发布程序，只能等待
+        assert(!(g_built_recipes & bit));
+        g_built_recipes |= bit;
+        if (bit == 1 && !(g_published & (1u << 5))) g_hot_before_last_program = 1;
+        atomic_fetch_add(&g_pipe_built, 1);
+        return 0;
+    }
     if (rec->prog_identity[0] == 1) return -1;               // 一条固定失败
     atomic_fetch_add(&g_pipe_built, 1);
     return 0;
@@ -274,6 +307,17 @@ int main(void) {
     if (delay_us > 0) {
         t_stop_budget_slow();
         printf("nvk warm scheduler test: ok（慢落盘 3 秒）\n");
+        return 0;
+    }
+    if (getenv("NVK_WARM_TEST_REACTIVE")) {
+        g_reactive = 1;
+        g_pipe_total = 2;
+        nvk_warm_start();
+        for (int i = 0; i < 2000 && atomic_load(&g_pipe_built) < 2; i++) usleep(1000);
+        assert(nvk_warm_stop() == 0);
+        assert(g_built_recipes == ((1u << 5) | 1u));
+        assert(g_hot_before_last_program);
+        puts("预热：两个配方各建一次，已发布程序的热点先于无关程序清单结束");
         return 0;
     }
     t_order_and_counts();

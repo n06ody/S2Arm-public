@@ -101,6 +101,7 @@ void rp_op_clear_tex(nvn_gpu_cmd c, const p_clear_tex *o, const void *rec) {
         if (transfer) nvn_gpu_clear_view(c, gpu, cl.value.f, cl.value.u, is_int);
         else {
             nvn_gpu_pass_desc pass = {0}; pass.ncolor = 1; pass.w = w; pass.h = h; pass.layers = 1;
+            pass.trace_origin = NVN_GPU_PASS_TRACE_CLEAR;
             pass.color[0].view = gpu; pass.color[0].load = whole ? NVN_GPU_LOAD_CLEAR : NVN_GPU_LOAD_LOAD;
             pass.color[0].store = NVN_GPU_STORE_STORE;
             if (whole) memcpy(&pass.color[0].clear, &cl.value, sizeof pass.color[0].clear);

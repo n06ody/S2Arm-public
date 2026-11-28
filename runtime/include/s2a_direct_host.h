@@ -10,9 +10,11 @@
 extern "C" {
 #endif
 
-// 缺页钩子：信号上下文里调，返回 1 = 已处理（页已解开），重执行即可；0 = 不是它的页。钩子本身须信号安全（只用原子与 mprotect，不分配、不加锁）
+// 缺页钩子：信号上下文里调。1 = 已处理或已改道；0 = 未领；负值 = 已领但无法安全处理，走原崩溃路径。
+// 钩子本身须信号安全，不分配、不加锁。
 typedef int (*s2a_fault_hook_fn)(void *addr, int is_write, void *uctx);
 void s2a_fault_hook_register(s2a_fault_hook_fn fn);
+int s2a_direct_fault(void *addr, int is_write, void *uctx);
 // 写前回调：宿主写 [addr, addr+len) 之前调，正常上下文。回写回调期间也会调到：回调里不许再写游戏内存、不许拿 RegionHandle 的锁
 typedef void (*s2a_guest_write_prep_fn)(uint64_t addr, uint64_t len);
 void s2a_guest_write_prep_register(s2a_guest_write_prep_fn fn);

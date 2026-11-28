@@ -1,0 +1,137 @@
+diff --git a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+index 1846bcfb0253e696e594333355e83b7c880b7528..bddfedf28060435bd41ea7d7eca1040e00d69166 100644
+--- a/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
++++ b/src/Ryujinx.Graphics.Shader/CodeGen/Spirv/CodeGenContext.cs
+@@ -58,6 +58,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+         private readonly Dictionary<AstOperand, Instruction> _locals = new();
+         private readonly Dictionary<int, Instruction> _funcArgs = new();
+         private readonly Dictionary<int, (StructuredFunction, Instruction)> _functions = new();
++        private Instruction _storageWindowMask;
+ 
+         private class BlockState
+         {
+@@ -227,6 +228,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+                 {
+                     IrOperandType.Argument => GetArgument(type, operand),
+                     IrOperandType.Constant => GetConstant(type, operand),
++                    IrOperandType.StorageWindowMask => GetStorageWindowMask(type),
+                     IrOperandType.LocalVariable => GetLocal(type, operand),
+                     IrOperandType.Undefined => GetUndefined(type),
+                     _ => throw new ArgumentException($"Invalid operand type \"{operand.Type}\"."),
+@@ -283,6 +285,16 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
+             };
+         }
+ 
++        private Instruction GetStorageWindowMask(AggregateType type)
++        {
++            if (_storageWindowMask == null)
++            {
++                _storageWindowMask = SpecConstant(TypeU32(), uint.MaxValue);
++                Name(_storageWindowMask, "s2a_storage_window_mask");
++            }
++            return BitcastIfNeeded(type, AggregateType.U32, _storageWindowMask);
++        }
++
+         public Instruction GetLocalPointer(AstOperand local)
+         {
+             return _locals[local];
+diff --git a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+index 6ae1d4fcd7a7b31477b4794c24cb04629999fc61..bf0d282184bab2214c228aa9b21d1eea84402803 100644
+--- a/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
++++ b/src/Ryujinx.Graphics.Shader/IGpuAccessor.cs
+@@ -270,6 +270,9 @@ namespace Ryujinx.Graphics.Shader
+             return false;
+         }
+ 
++        /// <summary>Emit the storage-window mask for Vulkan library loading to specialize.</summary>
++        bool QueryS2ALateStorageBufferAlignment() => false;
++
+         /// <summary>
+         /// Queries host's gather operation precision bits for biasing their coordinates. Zero means no bias.
+         /// </summary>
+diff --git a/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/OperandType.cs b/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/OperandType.cs
+index 7dbd9d25d47f6e846d77a70678d6a81f0952d3ec..e3944a8dfd61d5b6dccc3617840b7dd177e078d9 100644
+--- a/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/OperandType.cs
++++ b/src/Ryujinx.Graphics.Shader/IntermediateRepresentation/OperandType.cs
+@@ -9,5 +9,6 @@ namespace Ryujinx.Graphics.Shader.IntermediateRepresentation
+         LocalVariable,
+         Register,
+         Undefined,
++        StorageWindowMask,
+     }
+ }
+diff --git a/src/Ryujinx.Graphics.Shader/StructuredIr/OperandInfo.cs b/src/Ryujinx.Graphics.Shader/StructuredIr/OperandInfo.cs
+index 638a5298fe619ca54cf8935af4df5e5de948a96b..1eab11f8e44bd1ea7d9cda7439e924826f374ec8 100644
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/OperandInfo.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/OperandInfo.cs
+@@ -24,6 +24,7 @@ namespace Ryujinx.Graphics.Shader.StructuredIr
+             {
+                 OperandType.Argument => AggregateType.S32,
+                 OperandType.Constant => AggregateType.S32,
++                OperandType.StorageWindowMask => AggregateType.U32,
+                 OperandType.Undefined => AggregateType.S32,
+                 _ => throw new ArgumentException($"Invalid operand type \"{type}\"."),
+             };
+diff --git a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+index 327e5e59294e5e61c232b6ec735c5db96db12ee6..2e599f07a59b4bd4a84c54dc4159e8b3bdb283b8 100644
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -52,6 +52,11 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+ 
+     static class GlobalToStorage
+     {
++        private static Operand StorageWindowMask(IGpuAccessor gpuAccessor) =>
++            gpuAccessor.QueryS2ALateStorageBufferAlignment()
++                ? new Operand(OperandType.StorageWindowMask, 0)
++                : Const(-gpuAccessor.QueryHostStorageBufferOffsetAlignment());
++
+         private const int DriverReservedCb = 0;
+ 
+         enum LsMemoryType
+@@ -586,9 +591,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+ 
+             if (gpuAccessor.QueryHasUnalignedStorageBuffer())
+             {
+-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
+-
+-                windowStart = context.BitwiseAnd(baseAddressLow, Const(-alignment));
++                windowStart = context.BitwiseAnd(baseAddressLow, StorageWindowMask(gpuAccessor));
+             }
+ 
+             Operand offset = context.ISubtract(globalAddressLow, windowStart);
+@@ -786,9 +789,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+ 
+                 SearchResult result = new(sbCbSlot, sbCbOffset);
+ 
+-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
+-
+-                Operand baseAddressMasked = context.BitwiseAnd(baseAddrLow, Const(-alignment));
++                Operand baseAddressMasked = context.BitwiseAnd(baseAddrLow, StorageWindowMask(gpuAccessor));
+                 Operand hostOffset = context.ISubtract(globalAddressLow, baseAddressMasked);
+ 
+                 if (!clamp)
+@@ -1604,9 +1605,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
+                 Operand baseAddressMasked = Local();
+                 Operand hostOffset = Local();
+ 
+-                int alignment = gpuAccessor.QueryHostStorageBufferOffsetAlignment();
+-
+-                Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, Const(-alignment));
++                Operation maskOp = new(Instruction.BitwiseAnd, baseAddressMasked, baseAddress, StorageWindowMask(gpuAccessor));
+                 Operation subOp = new(Instruction.Subtract, hostOffset, globalAddress, baseAddressMasked);
+ 
+                 node.List.AddBefore(node, maskOp);
+diff --git a/src/Spv.Generator/Autogenerated/CoreGrammar.cs b/src/Spv.Generator/Autogenerated/CoreGrammar.cs
+index 086e783fb988449b9157fe8b9cb142d25db562b9..c04ae7f5416b69e777d9856b2e63e22f23e3df70 100644
+--- a/src/Spv.Generator/Autogenerated/CoreGrammar.cs
++++ b/src/Spv.Generator/Autogenerated/CoreGrammar.cs
+@@ -663,7 +663,8 @@ namespace Spv.Generator
+             Instruction result = NewInstruction(Op.OpSpecConstant, GetNewId(), resultType);
+ 
+             result.AddOperand(value);
+-            AddToFunctionDefinitions(result);
++            // Specialization constants are module declarations with independent IDs.
++            _globals.Add(result);
+ 
+             return result;
+         }

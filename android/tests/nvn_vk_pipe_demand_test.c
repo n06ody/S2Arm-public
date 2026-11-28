@@ -1,5 +1,6 @@
 // nvn_vk_pipe_demand 宿主集成测：fake 建管线驱动 demand 后台线程。
 // 覆盖：kick→PENDING→后台建→READY；后台失败；不同着色器配方隔离；超时 stop 保留 worker 并阻止重启，回收后可安全重开。
+#include <assert.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -13,21 +14,60 @@
 #include "nvn_vk_pipe_demand.h"
 
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static nvn_gpu_pipe g_installed;
-static nvn_gpu_pipe_desc g_inst_desc;
-static int g_has_inst;
+// 各配方可同时驻留。只有显式清空缓存的用例才模拟淘汰。
+static struct {
+    nvn_gpu_pipe_desc desc;
+    nvn_gpu_pipe pipe;
+} g_installed[16];
+static size_t g_installed_count;
 static int g_fail_next;
 static int g_build_calls;
+static int g_try_cached_enable, g_try_cached_calls;
+static nvn_gpu_pipe g_try_cached_pipe;
+static int g_probe_hold, g_probe_entered;
 static int g_gate_hold, g_gate_entered;
 static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;
 
-int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
+static size_t installed_slot(const nvn_gpu_pipe_desc *desc) {
+    for (size_t i = 0; i < g_installed_count; i++) {
+        if (memcmp(desc, &g_installed[i].desc, sizeof *desc) == 0) return i;
+    }
+    return g_installed_count;
+}
+
+static void install_pipe(const nvn_gpu_pipe_desc *desc, nvn_gpu_pipe pipe) {
+    size_t slot = installed_slot(desc);
+    assert(slot < sizeof g_installed / sizeof g_installed[0]);
+    g_installed[slot].desc = *desc;
+    g_installed[slot].pipe = pipe;
+    if (slot == g_installed_count) g_installed_count++;
+}
+
+int nvn_vk_pipe_try_cached(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
+    (void)d;
     if (out) *out = NULL;
     pthread_mutex_lock(&g_mu);
-    int hit = g_has_inst && d && memcmp(d, &g_inst_desc, sizeof *d) == 0;
-    if (hit && out) *out = g_installed;
+    g_try_cached_calls++;
+    while (g_probe_hold) {
+        g_probe_entered = 1;
+        pthread_cond_broadcast(&g_cv);
+        pthread_cond_wait(&g_cv, &g_mu);
+    }
+    int hit = g_try_cached_enable && g_try_cached_pipe != NULL;
+    if (hit && out) *out = g_try_cached_pipe;
     pthread_mutex_unlock(&g_mu);
     return hit;
+}
+
+int nvn_gpu_pipe_lookup(const nvn_gpu_pipe_desc *d, nvn_gpu_pipe *out) {
+    if (!out) return 0;
+    *out = NULL;
+    if (!d) return 0;
+    pthread_mutex_lock(&g_mu);
+    size_t slot = installed_slot(d);
+    if (slot < g_installed_count) *out = g_installed[slot].pipe;
+    pthread_mutex_unlock(&g_mu);
+    return *out != NULL;
 }
 static _Thread_local int demand_worker;
 void nvk_pipe_demand_worker_enter(void) { demand_worker = 1; }
@@ -42,7 +82,7 @@ nvn_gpu_rc nvn_gpu_pipe_get(const nvn_gpu_pipe_desc *d, int mode, nvn_gpu_pipe *
     }
     int fail = g_fail_next || !demand_worker;
     nvn_gpu_pipe built = (nvn_gpu_pipe)(uintptr_t)(0x9000 + g_build_calls);
-    if (!fail) { g_inst_desc = *d; g_installed = built; g_has_inst = 1; }
+    if (!fail) install_pipe(d, built);
     if (out) *out = fail ? NULL : built;
     pthread_mutex_unlock(&g_mu);
     nvn_gpu_rc r; r.code = fail ? NVN_GPU_E_COMPILE : NVN_GPU_OK;
@@ -81,6 +121,47 @@ static int wait_gate_entered(uint32_t ms) {
 }
 static void gate_release(void) {
     pthread_mutex_lock(&g_mu); g_gate_hold = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+}
+static int wait_probe_entered(uint32_t ms) {
+    struct timespec until; clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += (time_t)(ms / 1000); until.tv_nsec += (long)(ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    pthread_mutex_lock(&g_mu);
+    while (!g_probe_entered) if (pthread_cond_timedwait(&g_cv, &g_mu, &until) != 0) break;
+    int entered = g_probe_entered;
+    pthread_mutex_unlock(&g_mu);
+    return entered;
+}
+static void probe_release(void) {
+    pthread_mutex_lock(&g_mu); g_probe_hold = 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+}
+struct kick_thread_arg {
+    const nvn_gpu_pipe_desc *desc;
+    const uint8_t *ident;
+    int rc;
+    nvn_gpu_pipe pipe;
+    _Atomic int done;
+};
+static void *kick_thread_main(void *opaque) {
+    struct kick_thread_arg *arg = opaque;
+    arg->rc = nvn_vk_pipe_demand_kick(arg->desc, arg->ident, &arg->pipe);
+    atomic_store_explicit(&arg->done, 1, memory_order_release);
+    return NULL;
+}
+struct wait_thread_arg {
+    const nvn_gpu_pipe_desc *desc;
+    const uint8_t *ident;
+    uint32_t wait_ms;
+    int rc;
+    nvn_gpu_pipe pipe;
+    _Atomic int done;
+};
+static void *wait_thread_main(void *opaque) {
+    struct wait_thread_arg *arg = opaque;
+    char why[128] = "";
+    arg->rc = nvn_vk_pipe_demand_wait(arg->desc, arg->ident, arg->wait_ms, &arg->pipe, why, sizeof why);
+    atomic_store_explicit(&arg->done, 1, memory_order_release);
+    return NULL;
 }
 static int wait_demand_idle(uint32_t ms) {
     uint64_t end = mono_ns() + (uint64_t)ms * 1000000ull;
@@ -244,7 +325,7 @@ int main(void) {
     CHECK(outC != outA, "P0: diff-shader recipe must NOT get A's pipeline object");
 
     // 后台失败
-    pthread_mutex_lock(&g_mu); g_fail_next = 1; g_has_inst = 0; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); g_fail_next = 1; g_installed_count = 0; pthread_mutex_unlock(&g_mu);
     nvn_gpu_pipe_desc b; memset(&b, 0, sizeof b); b.st[0].sh = g_prog.sh[0]; b.prim = 4;
     k = nvn_vk_pipe_demand_kick(&b, idB, &cached);
     CHECK(k == NVK_DEMAND_PENDING, "fail-recipe kick PENDING");
@@ -264,7 +345,7 @@ int main(void) {
     nvn_gpu_pipe_desc slow; memset(&slow, 0, sizeof slow);
     slow.st[0].sh = (nvn_gpu_shader)(uintptr_t)0x31; slow.prim = 8;
     uint8_t idSlow[32]; set_ident(idSlow, 0xD4);
-    pthread_mutex_lock(&g_mu); g_fail_next = 0; g_has_inst = 0; g_gate_hold = 1; g_gate_entered = 0; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); g_fail_next = 0; g_installed_count = 0; g_gate_hold = 1; g_gate_entered = 0; pthread_mutex_unlock(&g_mu);
     k = nvn_vk_pipe_demand_kick(&slow, idSlow, &cached);
     CHECK(k == NVK_DEMAND_PENDING, "gated build kick PENDING");
     if (!wait_gate_entered(HANG_MS)) {
@@ -366,6 +447,133 @@ int main(void) {
     CHECK(nvn_vk_pipe_demand_kick(&next, idNext, &cached) == NVK_DEMAND_PENDING, "restart after reap accepts new work");
     CHECK(nvn_vk_pipe_demand_wait(&next, idNext, 2000, &out, why, sizeof why) == 0 && out != NULL, "restarted generation builds successfully");
     check_cold_pair();
+    {   // cache_control 非阻塞直出正控与 cold_kick 旁路负控
+        nvn_gpu_pipe_desc cp; memset(&cp, 0, sizeof cp);
+        cp.st[0].sh = (nvn_gpu_shader)(uintptr_t)0x51; cp.prim = 4;
+        uint8_t idC[32], shaC[32]; set_ident(idC, 0xF1); set_ident(shaC, 0xF2);
+        struct nvn_pipe_demand_stats s0, s1;
+        nvn_vk_pipe_demand_stats(&s0);
+        pthread_mutex_lock(&g_mu);
+        g_try_cached_enable = 1;
+        g_try_cached_pipe = (nvn_gpu_pipe)(uintptr_t)0xCAFE;
+        int c0 = g_try_cached_calls;
+        int b0 = g_build_calls;
+        pthread_mutex_unlock(&g_mu);
+        nvn_gpu_pipe got_c = NULL;
+        CHECK(nvn_vk_pipe_demand_kick(&cp, idC, &got_c) == NVK_DEMAND_READY && got_c == (nvn_gpu_pipe)(uintptr_t)0xCAFE,
+              "try_cached hit returns READY immediately without background kick");
+        nvn_vk_pipe_demand_stats(&s1);
+        CHECK(s1.kicked == s0.kicked && s1.cache_hits == s0.cache_hits + 1 && g_build_calls == b0 && g_try_cached_calls == c0 + 1,
+              "try_cached hit increments cache_hits and does not wake worker");
+        int c_before_cold = g_try_cached_calls;
+        nvn_gpu_pipe got_cold = NULL;
+        CHECK(nvn_vk_pipe_demand_cold_kick(&cp, idC, shaC, &got_cold) == NVK_DEMAND_PENDING && !got_cold,
+              "cold_kick bypasses foreground try_cached probe");
+        CHECK(g_try_cached_calls == c_before_cold, "cold_kick does not invoke nvn_vk_pipe_try_cached");
+        pthread_mutex_lock(&g_mu); g_try_cached_enable = 0; g_try_cached_pipe = NULL; pthread_mutex_unlock(&g_mu);
+    }
+    {   // 在途合并后置探测：同配方未命中进后台、编译完成前连续 kick N 次，try_cached 只调 1 次且 dedup 涨 N-1
+        nvn_gpu_pipe_desc dd; memset(&dd, 0, sizeof dd);
+        dd.st[0].sh = (nvn_gpu_shader)(uintptr_t)0x52; dd.prim = 5;
+        uint8_t idD[32]; set_ident(idD, 0xF3);
+        pthread_mutex_lock(&g_mu);
+        g_try_cached_enable = 0; g_try_cached_pipe = NULL;
+        g_installed_count = 0; g_fail_next = 0;
+        g_gate_hold = 1; g_gate_entered = 0;
+        int c0 = g_try_cached_calls;
+        pthread_mutex_unlock(&g_mu);
+        struct nvn_pipe_demand_stats s0, s1;
+        nvn_vk_pipe_demand_stats(&s0);
+        nvn_gpu_pipe p = NULL;
+        CHECK(nvn_vk_pipe_demand_kick(&dd, idD, &p) == NVK_DEMAND_PENDING && !p,
+              "dedup-probe: first miss queues background build");
+        CHECK(wait_gate_entered(HANG_MS), "dedup-probe: background worker enters build gate");
+        const int extra = 5;
+        for (int i = 0; i < extra; i++) {
+            p = (nvn_gpu_pipe)(uintptr_t)0x1;
+            CHECK(nvn_vk_pipe_demand_kick(&dd, idD, &p) == NVK_DEMAND_PENDING && !p,
+                  "dedup-probe: repeat kick while in-flight stays PENDING");
+        }
+        pthread_mutex_lock(&g_mu); int c1 = g_try_cached_calls; pthread_mutex_unlock(&g_mu);
+        nvn_vk_pipe_demand_stats(&s1);
+        CHECK(c1 == c0 + 1, "dedup-probe: try_cached invoked only once across N kicks");
+        CHECK(s1.kicked == s0.kicked + 1, "dedup-probe: kicked increments only once");
+        CHECK(s1.dedup == s0.dedup + (uint64_t)extra, "dedup-probe: dedup increments by N-1");
+        gate_release();
+        CHECK(nvn_vk_pipe_demand_wait(&dd, idD, 2000, &p, why, sizeof why) == 0 && p != NULL,
+              "dedup-probe: background build completes cleanly after gate release");
+    }
+    {   // BUILDER 在 g_life_mu 锁外探测命中时：并发 follower 不阻塞、不重复探测，命中后正确发布并唤醒等待者
+        nvn_gpu_pipe_desc ph; memset(&ph, 0, sizeof ph);
+        ph.st[0].sh = (nvn_gpu_shader)(uintptr_t)0x53; ph.prim = 6;
+        uint8_t idH[32]; set_ident(idH, 0xF4);
+        pthread_mutex_lock(&g_mu);
+        g_try_cached_enable = 1;
+        g_try_cached_pipe = (nvn_gpu_pipe)(uintptr_t)0xBEEF;
+        g_installed_count = 0;
+        g_probe_hold = 1; g_probe_entered = 0;
+        int c0 = g_try_cached_calls, b0 = g_build_calls;
+        pthread_mutex_unlock(&g_mu);
+        struct nvn_pipe_demand_stats s0, s1;
+        nvn_vk_pipe_demand_stats(&s0);
+        struct kick_thread_arg karg = { .desc = &ph, .ident = idH };
+        pthread_t kth;
+        int k_started = pthread_create(&kth, NULL, kick_thread_main, &karg) == 0;
+        CHECK(k_started, "concurrent-probe-hit: create builder kick thread");
+        if (k_started) {
+            CHECK(wait_probe_entered(HANG_MS), "concurrent-probe-hit: builder reaches try_cached gate");
+            // 锁外探测：同配方并发 kick 必须立即以 FOLLOW/dedup 返回（若锁内探测会在此死锁）
+            struct kick_thread_arg farg = { .desc = &ph, .ident = idH };
+            pthread_t fth;
+            int f_started = pthread_create(&fth, NULL, kick_thread_main, &farg) == 0;
+            CHECK(f_started, "concurrent-probe-hit: create follower kick thread");
+            if (f_started) {
+                for (uint64_t end = mono_ns() + 1000000000ull;
+                     !atomic_load_explicit(&farg.done, memory_order_acquire) && mono_ns() < end;) {
+                    struct timespec ts = {0, 1000000L}; nanosleep(&ts, NULL);
+                }
+                CHECK(atomic_load_explicit(&farg.done, memory_order_acquire),
+                      "concurrent-probe-hit: follower kick does not block while builder probes");
+                if (!atomic_load_explicit(&farg.done, memory_order_acquire)) probe_release();
+                pthread_join(fth, NULL);
+                CHECK(farg.rc == NVK_DEMAND_PENDING && !farg.pipe,
+                      "concurrent-probe-hit: follower sees PENDING during in-flight probe");
+            }
+            struct wait_thread_arg warg = { .desc = &ph, .ident = idH, .wait_ms = 5000 };
+            pthread_t wth;
+            int w_started = pthread_create(&wth, NULL, wait_thread_main, &warg) == 0;
+            CHECK(w_started, "concurrent-probe-hit: create waiter thread");
+            struct timespec settle = {0, 5000000L}; nanosleep(&settle, NULL);
+            probe_release();
+            pthread_join(kth, NULL);
+            if (w_started) pthread_join(wth, NULL);
+            CHECK(karg.rc == NVK_DEMAND_READY && karg.pipe == (nvn_gpu_pipe)(uintptr_t)0xBEEF,
+                  "concurrent-probe-hit: builder returns READY with cached pipe");
+            if (w_started) {
+                CHECK(warg.rc == 0 && warg.pipe == (nvn_gpu_pipe)(uintptr_t)0xBEEF,
+                      "concurrent-probe-hit: concurrent waiter wakes with published cached pipe");
+            }
+            // 模拟驱动安装后的内存命中，后续存活请求不再探测。
+            pthread_mutex_lock(&g_mu);
+            install_pipe(&ph, karg.pipe);
+            pthread_mutex_unlock(&g_mu);
+            nvn_gpu_pipe again = NULL;
+            CHECK(nvn_vk_pipe_demand_kick(&ph, idH, &again) == NVK_DEMAND_READY && again == (nvn_gpu_pipe)(uintptr_t)0xBEEF,
+                  "concurrent-probe-hit: subsequent kick hits installed pipe");
+            pthread_mutex_lock(&g_mu); int c1 = g_try_cached_calls, b1 = g_build_calls; pthread_mutex_unlock(&g_mu);
+            nvn_vk_pipe_demand_stats(&s1);
+            CHECK(c1 == c0 + 1 && b1 == b0, "concurrent-probe-hit: single try_cached call and zero background builds");
+            CHECK(s1.cache_hits == s0.cache_hits + 1 && s1.dedup >= s0.dedup + 1,
+                  "concurrent-probe-hit: cache_hits +1 and follower counted as dedup");
+            pthread_mutex_lock(&g_mu);
+            g_installed_count = 0; g_try_cached_pipe = (nvn_gpu_pipe)(uintptr_t)0xBEE0;
+            pthread_mutex_unlock(&g_mu);
+            CHECK(nvn_vk_pipe_demand_kick(&ph, idH, &again) == NVK_DEMAND_READY && again == (nvn_gpu_pipe)(uintptr_t)0xBEE0,
+                  "reclaimed-ready: evicted result is restored by the new builder");
+            CHECK(g_try_cached_calls == c1 + 1, "reclaimed-ready: restores via exactly one probe");
+        }
+        pthread_mutex_lock(&g_mu); g_try_cached_enable = 0; g_try_cached_pipe = NULL; g_probe_hold = 0; pthread_mutex_unlock(&g_mu);
+    }
     nvn_vk_pipe_demand_stop();
     CHECK(nvn_vk_pipe_demand_quiescent(), "final stop leaves no joinable worker");
     CHECK(nvn_vk_pipe_demand_worker_count() == 0, "final stop leaves no active worker");

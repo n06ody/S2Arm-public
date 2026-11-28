@@ -5,6 +5,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "s2a_direct.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -12,6 +13,17 @@ extern "C" {
 
 // Shared production policy for direct runtime, captured facts and offline identity.
 // Historical decoder re-encoding retains the policy stored in its wire version.
+// 图形槽按 NVN 的 VS/FS/GS/TCS/TES 排列；细分必须成对，GS 或 FS 可留空。
+static inline int s2a_direct_graphics_stage_span(uint32_t mask) {
+    switch (mask) {
+        case 1u: return 1;
+        case 3u: return 2;
+        case 7u: return 3;
+        case 0x19u: case 0x1bu: case 0x1du: case 0x1fu: return 5;
+        default: return 0;
+    }
+}
+
 static inline int s2a_direct_requires_linked_varying_interface(uint32_t stage_mask) {
     return stage_mask == 3u;
 }
@@ -90,8 +102,8 @@ struct s2a_compile_texture_src {
     uint32_t array_length;
 };
 
-// Three graphics stages, each with 40 combined and 128 separate texture slots.
-#define S2A_COMPILE_TEXTURE_MAX 504
+// Five graphics stages, each with 40 combined and 128 separate texture slots.
+#define S2A_COMPILE_TEXTURE_MAX 840
 
 struct s2a_compile_request_input {
     uint64_t session;
@@ -101,7 +113,7 @@ struct s2a_compile_request_input {
     size_t profile_bytes;
     int direct_abi;
     const char *translator_closure;
-    struct s2a_compile_stage_src stages[3];
+    struct s2a_compile_stage_src stages[5];
     int stage_count;
     // Android new replay VS+FS pair opts in. Zero preserves legacy requests.
     int requires_linked_varying_interface;
@@ -134,6 +146,9 @@ int s2a_compile_request_build(const struct s2a_compile_request_input *in,
 // 返回 0 表示结果已复制；非 0 表示没拿到结果（此时 outcome->rc 是 compile_fn 的返回码）。
 int s2a_compile_request_execute(uint64_t session, uint64_t generation, const char *json, size_t json_len,
                                 struct s2a_compile_outcome *out);
+
+int s2a_compile_request_execute_live(uint64_t session, uint64_t generation, const char *json, size_t json_len,
+    s2a_direct_compile_fn binary, struct s2a_compile_outcome *out);
 
 void s2a_compile_outcome_free(struct s2a_compile_outcome *out);
 // 崩溃处理里调（异步信号安全，只 open / write / close）：本线程正在执行 s2a_compile_request_execute 时，

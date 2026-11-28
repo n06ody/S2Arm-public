@@ -419,14 +419,33 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT placed = { .sType = S2A_FSTYPE_PLACED_FEATURES };
     void *chain = NULL;
     f->draw_parameters.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES;
+    f->storage_16bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    f->var_ptrs.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VARIABLE_POINTERS_FEATURES;
+    f->multiview.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTIVIEW_FEATURES;
     f->timeline.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
     f->index_u8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INDEX_TYPE_UINT8_FEATURES_EXT;
     f->f4444.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_4444_FORMATS_FEATURES_EXT;
     f->dcc.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT;
+    f->eds1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT;
+    f->eds2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT;
+    f->vi.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT;
+    f->img_robust.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES_EXT;
+    f->zero_init_wg.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR;
+    f->scalar_layout.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES_EXT;
+    f->ubo_std.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES_KHR;
+    f->line_rast.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT;
+    f->maint4.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES_KHR;
+    f->f16i8.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
     f->border.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT;
     f->di.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES_EXT;
     f->vdiv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
     f->swapchain_m1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
+    f->pipe_cache_ctl.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_CREATION_CACHE_CONTROL_FEATURES_EXT;
+    f->hqr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT;
+    f->list_restart.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT;
+    f->view_2d_of_3d.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_2D_VIEW_OF_3D_FEATURES_EXT;
+    f->tba.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT;
+    f->storage_8bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR;
     // 低于 1.1 的设备：本实例按 1.1 建，Features2 / Properties2 对它不成立（后端也建不了它）——整条扩展查询链都不挂，只记核心查询
     // 已转正的扩展：设备版本够（timeline / 描述符索引 1.2）就算有，不要求再列扩展名。4444 例外：1.3 只转正了格式枚举，
     //   VkPhysicalDevice4444FormatsFeaturesEXT 没有核心版，没列扩展时挂进链不合规（驱动多半忽略，位停在 0 被当成「实测不支持」），只在列了扩展时挂
@@ -435,15 +454,35 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
     f->have_4444_fmt = listed(f, "VK_EXT_4444_formats") || api >= VK_API_VERSION_1_3;
     if (f->have_core11) {
         LINK(chain, &f->draw_parameters);
+        LINK(chain, &f->storage_16bit);
+        LINK(chain, &f->var_ptrs);
+        LINK(chain, &f->multiview);
         if ((f->have_timeline = listed(f, "VK_KHR_timeline_semaphore") || api >= VK_API_VERSION_1_2)) LINK(chain, &f->timeline);
         if ((f->have_index_u8 = listed(f, "VK_EXT_index_type_uint8") || listed(f, "VK_KHR_index_type_uint8"))) LINK(chain, &f->index_u8);   // KHR 版同一结构
         if ((f->have_4444 = listed(f, "VK_EXT_4444_formats"))) LINK(chain, &f->f4444);
         if ((f->have_dcc = listed(f, "VK_EXT_depth_clip_control"))) LINK(chain, &f->dcc);
+        // 记录物理设备支持位，独立于本会话是否启用扩展。
+        if ((f->have_eds1 = listed(f, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME))) LINK(chain, &f->eds1);
+        if ((f->have_eds2 = listed(f, VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME))) LINK(chain, &f->eds2);
+        if ((f->have_vi = listed(f, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME))) LINK(chain, &f->vi);
+        if ((f->have_img_robust = listed(f, VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) || api >= VK_API_VERSION_1_3)) LINK(chain, &f->img_robust);
+        if ((f->have_zero_init_wg = listed(f, VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) || api >= VK_API_VERSION_1_3)) LINK(chain, &f->zero_init_wg);
+        if ((f->have_scalar_layout = listed(f, VK_EXT_SCALAR_BLOCK_LAYOUT_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->scalar_layout);
+        if ((f->have_ubo_std = listed(f, VK_KHR_UNIFORM_BUFFER_STANDARD_LAYOUT_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->ubo_std);
+        if ((f->have_line_rast = listed(f, VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME) || listed(f, "VK_KHR_line_rasterization"))) LINK(chain, &f->line_rast);
+        if ((f->have_maint4 = listed(f, VK_KHR_MAINTENANCE_4_EXTENSION_NAME) || api >= VK_API_VERSION_1_3)) LINK(chain, &f->maint4);
+        if ((f->have_f16i8 = listed(f, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->f16i8);
         if ((f->have_placed = listed(f, "VK_EXT_map_memory_placed"))) LINK(chain, &placed);
         if ((f->have_border = listed(f, "VK_EXT_custom_border_color"))) LINK(chain, &f->border);
         if ((f->have_di = listed(f, VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->di);
         if ((f->have_vdiv = listed(f, "VK_EXT_vertex_attribute_divisor"))) LINK(chain, &f->vdiv);   // 只认 EXT：下面属性链挂的是 EXT 的属性结构（KHR 版属性结构是另一个类型）
         if ((f->have_swapchain_m1 = listed(f, "VK_EXT_swapchain_maintenance1") || listed(f, "VK_KHR_swapchain_maintenance1"))) LINK(chain, &f->swapchain_m1);
+        if ((f->have_pipe_cache_ctl = listed(f, VK_EXT_PIPELINE_CREATION_CACHE_CONTROL_EXTENSION_NAME))) LINK(chain, &f->pipe_cache_ctl);
+        if ((f->have_hqr = listed(f, VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->hqr);
+        if ((f->have_list_restart = listed(f, VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME))) LINK(chain, &f->list_restart);
+        if ((f->have_2d_of_3d = listed(f, VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME))) LINK(chain, &f->view_2d_of_3d);
+        if ((f->have_tba = listed(f, VK_EXT_TEXEL_BUFFER_ALIGNMENT_EXTENSION_NAME))) LINK(chain, &f->tba);
+        if ((f->have_8bit_storage = listed(f, VK_KHR_8BIT_STORAGE_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &f->storage_8bit);
     }
     if (chain) {
         VkPhysicalDeviceFeatures2 q = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = chain };
@@ -459,6 +498,9 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
     VkPhysicalDeviceSamplerFilterMinmaxPropertiesEXT mp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_FILTER_MINMAX_PROPERTIES_EXT };
     VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT vp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_PROPERTIES_EXT };
     VkPhysicalDeviceExternalMemoryHostPropertiesEXT hp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT };
+    VkPhysicalDeviceLineRasterizationPropertiesEXT lrp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_PROPERTIES_EXT };
+    VkPhysicalDeviceMaintenance4PropertiesKHR m4p = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_PROPERTIES_KHR };
+    VkPhysicalDeviceFloatControlsPropertiesKHR fcp = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES_KHR };
     VkPhysicalDeviceMapMemoryPlacedPropertiesEXT pp = { .sType = S2A_FSTYPE_PLACED_PROPERTIES };
     chain = NULL;
     // driverProperties 是 1.2 核心 / VK_KHR_driver_properties：有效版本 ≥ 1.2 或列了扩展才挂（同 vk_device.c）；没有 = 驱动身份未知（null）
@@ -470,6 +512,9 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
         if ((f->have_minmax = listed(f, "VK_EXT_sampler_filter_minmax"))) LINK(chain, &mp);
         if (f->have_vdiv) LINK(chain, &vp);
         if ((f->have_host_import = listed(f, "VK_EXT_external_memory_host"))) LINK(chain, &hp);
+        if (f->have_line_rast) LINK(chain, &lrp);
+        if (f->have_maint4) LINK(chain, &m4p);
+        if ((f->have_fctrl = listed(f, VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME) || api >= VK_API_VERSION_1_2)) LINK(chain, &fcp);
         if (f->have_placed) LINK(chain, &pp);
     }
     if (chain) {
@@ -485,6 +530,13 @@ static void query_vulkan(VkPhysicalDevice physical, struct s2a_dev_facts *f) {
     f->minmax_single = mp.filterMinmaxSingleComponentFormats; f->minmax_mapping = mp.filterMinmaxImageComponentMapping;
     f->vdiv_max = vp.maxVertexAttribDivisor;
     f->host_align = hp.minImportedHostPointerAlignment;
+    f->line_subpixel_bits = lrp.lineSubPixelPrecisionBits;
+    f->max_buffer_size = m4p.maxBufferSize;
+    f->fctrl_denorm_preserve_f32 = fcp.shaderDenormPreserveFloat32;
+    f->fctrl_denorm_ftz_f32 = fcp.shaderDenormFlushToZeroFloat32;
+    f->fctrl_sz_inf_nan_f32 = fcp.shaderSignedZeroInfNanPreserveFloat32;
+    f->fctrl_rte_f32 = fcp.shaderRoundingModeRTEFloat32;
+    f->fctrl_rtz_f32 = fcp.shaderRoundingModeRTZFloat32;
     f->placed_align = pp.minPlacedMemoryMapAlignment;
 
     // 逐格式：核心格式照常查；A4B4G4R4（VK_EXT_4444_formats 加的格式，1.3 转正）只在设备列出该扩展或设备 ≥ 1.3 时查，同 device_caps.c 的直查
@@ -687,11 +739,43 @@ static void emit_vulkan(struct jw *w, const struct s2a_dev_facts *f) {
         S2A_FACT_FEATURES(F)
 #undef F
 #define B(k, v) kv_add(t, &n, k, "%d", (v) ? 1 : 0)
-        if (f->have_core11) B("shaderDrawParameters", f->draw_parameters.shaderDrawParameters);
+        if (f->have_core11) {
+            B("shaderDrawParameters", f->draw_parameters.shaderDrawParameters);
+            B("storageBuffer16BitAccess", f->storage_16bit.storageBuffer16BitAccess);
+            B("uniformAndStorageBuffer16BitAccess", f->storage_16bit.uniformAndStorageBuffer16BitAccess);
+            B("storagePushConstant16", f->storage_16bit.storagePushConstant16);
+            B("storageInputOutput16", f->storage_16bit.storageInputOutput16);
+            B("variablePointersStorageBuffer", f->var_ptrs.variablePointersStorageBuffer);
+            B("variablePointers", f->var_ptrs.variablePointers);
+            B("multiview", f->multiview.multiview);
+            B("multiviewGeometryShader", f->multiview.multiviewGeometryShader);
+            B("multiviewTessellationShader", f->multiview.multiviewTessellationShader);
+        }
         if (f->have_timeline) B("timelineSemaphore", f->timeline.timelineSemaphore);
         if (f->have_index_u8) B("indexTypeUint8", f->index_u8.indexTypeUint8);
         if (f->have_4444) { B("formatA4B4G4R4", f->f4444.formatA4B4G4R4); B("formatA4R4G4B4", f->f4444.formatA4R4G4B4); }
         if (f->have_dcc) B("depthClipControl", f->dcc.depthClipControl);
+        if (f->have_eds1) B("extendedDynamicState", f->eds1.extendedDynamicState == VK_TRUE);
+        if (f->have_eds2) {
+            B("extendedDynamicState2", f->eds2.extendedDynamicState2 == VK_TRUE);
+            B("extendedDynamicState2LogicOp", f->eds2.extendedDynamicState2LogicOp == VK_TRUE);
+            B("extendedDynamicState2PatchControlPoints", f->eds2.extendedDynamicState2PatchControlPoints == VK_TRUE);
+        }
+        if (f->have_vi) B("vertexInputDynamicState", f->vi.vertexInputDynamicState == VK_TRUE);
+        if (f->have_img_robust) B("robustImageAccess", f->img_robust.robustImageAccess);
+        if (f->have_zero_init_wg) B("shaderZeroInitializeWorkgroupMemory", f->zero_init_wg.shaderZeroInitializeWorkgroupMemory);
+        if (f->have_scalar_layout) B("scalarBlockLayout", f->scalar_layout.scalarBlockLayout);
+        if (f->have_ubo_std) B("uniformBufferStandardLayout", f->ubo_std.uniformBufferStandardLayout);
+        if (f->have_line_rast) {
+            B("rectangularLines", f->line_rast.rectangularLines);
+            B("bresenhamLines", f->line_rast.bresenhamLines);
+            B("smoothLines", f->line_rast.smoothLines);
+            B("stippledRectangularLines", f->line_rast.stippledRectangularLines);
+            B("stippledBresenhamLines", f->line_rast.stippledBresenhamLines);
+            B("stippledSmoothLines", f->line_rast.stippledSmoothLines);
+        }
+        if (f->have_maint4) B("maintenance4", f->maint4.maintenance4);
+        if (f->have_f16i8) { B("shaderFloat16", f->f16i8.shaderFloat16); B("shaderInt8", f->f16i8.shaderInt8); }
         if (f->have_placed) { B("memoryMapPlaced", f->placed_map); B("memoryMapRangePlaced", f->placed_range); B("memoryUnmapReserve", f->placed_unmap_reserve); }
         if (f->have_border) { B("customBorderColors", f->border.customBorderColors); B("customBorderColorWithoutFormat", f->border.customBorderColorWithoutFormat); }
         if (f->have_di) {
@@ -707,6 +791,19 @@ static void emit_vulkan(struct jw *w, const struct s2a_dev_facts *f) {
             B("vertexAttributeInstanceRateZeroDivisor", f->vdiv.vertexAttributeInstanceRateZeroDivisor);
         }
         if (f->have_swapchain_m1) B("swapchainMaintenance1", f->swapchain_m1.swapchainMaintenance1);
+        if (f->have_pipe_cache_ctl) B("pipelineCreationCacheControl", f->pipe_cache_ctl.pipelineCreationCacheControl);
+        if (f->have_hqr) B("hostQueryReset", f->hqr.hostQueryReset);
+        if (f->have_list_restart) B("primitiveTopologyListRestart", f->list_restart.primitiveTopologyListRestart);
+        if (f->have_2d_of_3d) {
+            B("image2DViewOf3D", f->view_2d_of_3d.image2DViewOf3D);
+            B("sampler2DViewOf3D", f->view_2d_of_3d.sampler2DViewOf3D);
+        }
+        if (f->have_tba) B("texelBufferAlignment", f->tba.texelBufferAlignment);
+        if (f->have_8bit_storage) {
+            B("storageBuffer8BitAccess", f->storage_8bit.storageBuffer8BitAccess);
+            B("uniformAndStorageBuffer8BitAccess", f->storage_8bit.uniformAndStorageBuffer8BitAccess);
+            B("storagePushConstant8", f->storage_8bit.storagePushConstant8);
+        }
 #undef B
         kv_emit(w, t, n);
     }
@@ -733,7 +830,7 @@ static void emit_vulkan(struct jw *w, const struct s2a_dev_facts *f) {
     // properties：限值整组 + 扩展属性（只写查了的）
     jw_key(w, &first, "properties");
     {
-        struct kvn t[24]; size_t n = 0;
+        struct kvn t[32]; size_t n = 0;
         kv_add(t, &n, "deviceType", "%d", (int)f->props.deviceType);
         if (f->have_core11) {
             kv_add(t, &n, "maxMemoryAllocationSize", "%llu", (unsigned long long)f->max_alloc);
@@ -750,6 +847,15 @@ static void emit_vulkan(struct jw *w, const struct s2a_dev_facts *f) {
         }
         if (f->have_vdiv) kv_add(t, &n, "maxVertexAttribDivisor", "%u", f->vdiv_max);
         if (f->have_host_import) kv_add(t, &n, "minImportedHostPointerAlignment", "%llu", (unsigned long long)f->host_align);
+        if (f->have_line_rast) kv_add(t, &n, "lineSubPixelPrecisionBits", "%u", f->line_subpixel_bits);
+        if (f->have_maint4) kv_add(t, &n, "maxBufferSize", "%llu", (unsigned long long)f->max_buffer_size);
+        if (f->have_fctrl) {
+            kv_add(t, &n, "shaderDenormPreserveFloat32", "%d", f->fctrl_denorm_preserve_f32 ? 1 : 0);
+            kv_add(t, &n, "shaderDenormFlushToZeroFloat32", "%d", f->fctrl_denorm_ftz_f32 ? 1 : 0);
+            kv_add(t, &n, "shaderSignedZeroInfNanPreserveFloat32", "%d", f->fctrl_sz_inf_nan_f32 ? 1 : 0);
+            kv_add(t, &n, "shaderRoundingModeRTEFloat32", "%d", f->fctrl_rte_f32 ? 1 : 0);
+            kv_add(t, &n, "shaderRoundingModeRTZFloat32", "%d", f->fctrl_rtz_f32 ? 1 : 0);
+        }
         if (f->have_placed) kv_add(t, &n, "minPlacedMemoryMapAlignment", "%llu", (unsigned long long)f->placed_align);
         kv_add(t, &n, "limits", "%s", "");   // 占位：排序后在这里写整组限值
         qsort(t, n, sizeof *t, kvn_cmp);

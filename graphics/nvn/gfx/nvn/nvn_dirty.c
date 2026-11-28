@@ -41,7 +41,15 @@ static void dirty_tick_rate(uint64_t *num, uint64_t *den) { *num = 1; *den = 1; 
 // (the movie decoder thread writing a frame into texture storage, a disk read into a guest buffer) could set the state back to NONE, then the mprotect landed => the page read-only with state NONE: a game thread writing it got only
 // "re-execute" from the fault handler and spun forever; a host system call reading into it saw NONE in prep_write, skipped, and failed with EFAULT (reproduced by t_dirty_race).
 // BUSY lasts at most one mprotect (plus a few atomic writes when setting read-only). The wait is capped at BUSY_WAIT_MS and reports red beyond it: in the fault handler it then returns "not our page" so the crash handler reports truthfully
-enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_BUSY_WRITABLE = 3 };
+enum { PG_NONE = 0, PG_PROT = 1, PG_BUSY = 2, PG_BUSY_WRITABLE = 3,
+       PG_PROBE = 4, PG_PROBE_ARMING = 5, PG_PROBE_OPENING = 6 };
+static int page_busy(uint8_t state) {
+    return state == PG_BUSY || state == PG_BUSY_WRITABLE ||
+           state == PG_PROBE_ARMING || state == PG_PROBE_OPENING;
+}
+static int probe_page(uint8_t state) {
+    return state == PG_PROBE || state == PG_PROBE_ARMING || state == PG_PROBE_OPENING;
+}
 enum { BUSY_WAIT_MS = 2000 };
 // Tracked ranges = the memory pools (registered by MemoryPoolInitialize). After a pool is destroyed its live=0 slot is reused; the signal handler scans without locks.
 // The table grows in blocks of 1,024 slots, up to 262,144; a block is never moved or freed, so the signal handler reads it without locks. A pool past the end goes untracked: its textures count
@@ -63,8 +71,19 @@ typedef struct dirty_log {
     struct dirty_log *next;
     struct { _Atomic uint64_t seq; _Atomic uintptr_t a, b; } ev[];
 } dirty_log;
+struct probe_epoch_page {
+    _Atomic uint64_t serial;
+    _Atomic(struct nvn_dirty_deferred_source *) deferred;
+};
+struct probe_epochs {
+    struct probe_epochs *next;
+    uintptr_t base, end;
+    const _Atomic uint8_t *state;
+    struct probe_epoch_page page[];
+};
 typedef struct { uintptr_t base, end, mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; size_t cap; _Atomic int live;
                  _Atomic(dirty_log *) log;
+                 _Atomic(struct probe_epochs *) probe_epochs;
                  _Atomic uint64_t last; } range_t;   // last: the largest write generation of any page in the range (CAS max next to every gen store): a range not written since a stamp answers without its page scan
 static inline void last_max(range_t *r, uint64_t g) { uint64_t c = atomic_load(&r->last); while (c < g && !atomic_compare_exchange_weak(&r->last, &c, g)) {} }   // async-signal-safe: atomics only
 static _Atomic(range_t *) g_blk[NBLK];
@@ -240,10 +259,69 @@ static uint64_t g_tb_num, g_tb_den;   // obtained when the first pool is registe
 //   (11-02 BotW restart on an iPhone: SIGBUS on the first guest write to a pool page, main+0xd87c80)
 static _Atomic int g_hooks_on;
 static _Atomic int g_busy_red;
+static _Atomic(nvn_dirty_read_probe_redirect_fn) g_probe_redirect;
+static _Atomic(int (*)(void *)) g_probe_guest_pc;
+static _Atomic uint64_t g_probe_host_fault_read, g_probe_host_fault_write;
+static _Atomic uint64_t g_probe_armed, g_probe_read, g_probe_write, g_probe_host_read, g_probe_host_write;
+static _Atomic uint64_t g_probe_censored;
+static struct nvn_dirty_probe_access *g_probe_access;   // g_slot_mu
+static unsigned g_probe_vm_scopes;                     // g_slot_mu
+static struct probe_epochs *g_probe_epoch_tables;      // g_slot_mu; free only after signal users retire
+static size_t g_probe_epoch_bytes;
+static uint64_t g_probe_next_epoch;                    // monotonic across sessions
+static _Thread_local struct { uintptr_t page; uint64_t epoch; } g_probe_retry;
+enum { PROBE_EPOCH_BYTES_LIMIT = 32 * 1024 * 1024 };
+// Guest pointers may be exported before an NVN pool exists. Keep their
+// address intervals through pool reuse. Only drained session reset proves
+// that every outstanding managed view and native borrower has retired.
+enum { PROBE_EXPORT_CAP = 8192 };
+struct probe_export { uintptr_t lo, hi; };
+static struct probe_export g_probe_export[PROBE_EXPORT_CAP];  // sorted, disjoint; g_slot_mu
+static size_t g_probe_export_count;
+static _Atomic int g_probe_export_table_full;
+static _Atomic uint64_t g_probe_exports, g_probe_export_refused;
+static _Atomic uint64_t g_defer_published, g_defer_materialized, g_defer_replaced;
+static _Atomic uint64_t g_probe_fail, g_probe_mp_calls, g_probe_mp_ticks;
+
+void nvn_dirty_read_probe_set_redirect(nvn_dirty_read_probe_redirect_fn redirect) {
+    atomic_store_explicit(&g_probe_redirect, redirect, memory_order_release);
+}
+void nvn_dirty_read_probe_set_guest_pc(int (*is_guest_pc)(void *)) {
+    atomic_store_explicit(&g_probe_guest_pc, is_guest_pc, memory_order_release);
+}
+void nvn_dirty_read_probe_stats(struct nvn_dirty_read_probe_stats *out) {
+    uint64_t num = g_tb_num, den = g_tb_den;
+    if (!den) dirty_tick_rate(&num, &den);
+    *out = (struct nvn_dirty_read_probe_stats){
+        .armed = atomic_load(&g_probe_armed), .read = atomic_load(&g_probe_read),
+        .write = atomic_load(&g_probe_write), .host_read = atomic_load(&g_probe_host_read),
+        .host_write = atomic_load(&g_probe_host_write), .censored = atomic_load(&g_probe_censored),
+        .failed = atomic_load(&g_probe_fail), .mp_calls = atomic_load(&g_probe_mp_calls),
+        .mp_ns = atomic_load(&g_probe_mp_ticks) * num / den,
+        .host_fault_read = atomic_load(&g_probe_host_fault_read),
+        .host_fault_write = atomic_load(&g_probe_host_fault_write),
+        .export_calls = atomic_load(&g_probe_exports),
+        .export_refused_pages = atomic_load(&g_probe_export_refused),
+        .export_table_full = atomic_load(&g_probe_export_table_full),
+        .defer_published = atomic_load(&g_defer_published),
+        .defer_materialized = atomic_load(&g_defer_materialized),
+        .defer_replaced = atomic_load(&g_defer_replaced),
+    };
+}
+static int probe_mp(uintptr_t addr, size_t len, int prot) {
+    const uint64_t t = dirty_tick();
+    const int result = mp(addr, len, prot);
+    atomic_fetch_add(&g_probe_mp_ticks, dirty_tick() - t);
+    atomic_fetch_add(&g_probe_mp_calls, 1);
+    if (result) atomic_fetch_add(&g_probe_fail, 1);
+    return result;
+}
 // All guest fault handlers and graphics callbacks have been joined before this
 // entry. Old protections belong to the native window that is remapped next.
 void nvn_dirty_reset_session(void) {
     pthread_mutex_lock(&g_slot_mu);
+    if (atomic_load(&g_defer_published) != atomic_load(&g_defer_materialized) + atomic_load(&g_defer_replaced))
+        die("dirty writeback: session reset with retained producer pages");
     table_write_begin();
     span_reset();
     for (int b = 0; b < NBLK; b++) {
@@ -257,16 +335,34 @@ void nvn_dirty_reset_session(void) {
         free(r->state); free(r->gen); free(r);
     }
     while (g_all_logs) { dirty_log *l = g_all_logs; g_all_logs = l->next; free(l); }
+    while (g_probe_epoch_tables) {
+        struct probe_epochs *epochs = g_probe_epoch_tables;
+        g_probe_epoch_tables = epochs->next;
+        free(epochs);
+    }
+    g_probe_epoch_bytes = 0;
     g_log_bytes = 0; g_log_enabled = 0;
     atomic_store(&g_nr, 0); atomic_store(&g_live, 0); atomic_store(&g_live_peak, 0);
     atomic_store(&g_now, 1); atomic_store(&g_overflow_logged, 0); atomic_store(&g_busy_red, 0); atomic_store(&g_hooks_on, 0);
+    nvn_dirty_read_probe_set_redirect(NULL);
+    nvn_dirty_read_probe_set_guest_pc(NULL);
+    atomic_store(&g_probe_host_fault_read, 0); atomic_store(&g_probe_host_fault_write, 0);
+    atomic_store(&g_probe_armed, 0); atomic_store(&g_probe_read, 0); atomic_store(&g_probe_write, 0);
+    if (g_probe_access || g_probe_vm_scopes) die("dirty read probe: session reset while an access scope is outstanding");
+    atomic_store(&g_probe_host_read, 0); atomic_store(&g_probe_host_write, 0);
+    atomic_store(&g_probe_censored, 0); atomic_store(&g_probe_fail, 0);
+    atomic_store(&g_probe_mp_calls, 0); atomic_store(&g_probe_mp_ticks, 0);
+    g_probe_export_count = 0;
+    atomic_store(&g_probe_export_table_full, 0);
+    atomic_store(&g_probe_exports, 0); atomic_store(&g_probe_export_refused, 0);
+    atomic_store(&g_defer_published, 0); atomic_store(&g_defer_materialized, 0); atomic_store(&g_defer_replaced, 0);
     table_write_end();
     pthread_mutex_unlock(&g_slot_mu);
 }
 // Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, dirty_tick and sched_yield
 static int busy_wait(range_t *r, uintptr_t p) {
     uint64_t t0 = 0;
-    for (unsigned n = 1; atomic_load(&r->state[p]) == PG_BUSY || atomic_load(&r->state[p]) == PG_BUSY_WRITABLE; n++) {
+    for (unsigned n = 1; page_busy(atomic_load(&r->state[p])); n++) {
         if (n & 0x3ff) continue;
         uint64_t now = dirty_tick(); if (!t0) t0 = now;
         uint64_t num = g_tb_den ? g_tb_num : 1, den = g_tb_den ? g_tb_den : 1;
@@ -357,22 +453,346 @@ static void log_append(dirty_log *lg, uintptr_t a, uintptr_t b) {
     atomic_store_explicit(&e->b, b, memory_order_relaxed);
     atomic_store_explicit(&e->seq, i + 1, memory_order_release);
 }
+// Operates after signal return, or in a normal host preflight. All owners
+// of this page still use the same range state to serialize mprotect.
+enum { PROBE_READ, PROBE_WRITE, PROBE_HOST_READ, PROBE_HOST_WRITE,
+       PROBE_HOST_FAULT_READ, PROBE_HOST_FAULT_WRITE, PROBE_CENSOR };
+size_t nvn_dirty_land_defer_remaining(const struct nvn_dirty_deferred_source *source) {
+    return __atomic_load_n(&source->remaining, __ATOMIC_ACQUIRE);
+}
+
+static void deferred_page_put(struct nvn_dirty_deferred_source *source) {
+    __atomic_fetch_sub(&source->remaining, 1, __ATOMIC_RELEASE);
+}
+
+// PG_PROBE_OPENING owns the page. Copy through the private alias while the
+// guest mapping is still PROT_NONE. The last page can release the source
+// slot immediately after the copy, with no allocation or fence wait here.
+static void deferred_materialize(range_t *r, uintptr_t p) {
+    struct probe_epochs *epochs = atomic_load(&r->probe_epochs);
+    if (!epochs) return;
+    struct nvn_dirty_deferred_source *source = atomic_exchange(&epochs->page[p].deferred, NULL);
+    if (!source) return;
+    const size_t offset = r->base + (p << g_shift) - (uintptr_t)source->destination;
+    memcpy((uint8_t *)source->alias + offset, (const uint8_t *)source->completed_bytes + offset, g_pg);
+    atomic_fetch_add(&g_defer_materialized, 1);
+    deferred_page_put(source);
+}
+
+static int probe_open_page(range_t *r, uintptr_t p, int access) {
+    for (;;) {
+        uint8_t state = atomic_load(&r->state[p]);
+        if (!probe_page(state)) return 1;
+        if (state == PG_PROBE) {
+            if (atomic_compare_exchange_strong(&r->state[p], &state, PG_PROBE_OPENING)) break;
+        } else if (!busy_wait(r, p)) return 0;
+    }
+    const uintptr_t a = r->base + (p << g_shift);
+    if (access == PROBE_WRITE || access == PROBE_HOST_WRITE || access == PROBE_HOST_FAULT_WRITE) {
+        dirty_log *log = atomic_load_explicit(&r->log, memory_order_acquire);
+        if (log) log_append(log, a, a + g_pg);
+        const uint64_t gen = atomic_fetch_add(&g_now, 1) + 1;
+        atomic_store(&r->gen[p], gen);
+        last_max(r, gen);
+    }
+    deferred_materialize(r, p);
+    if (probe_mp(a, g_pg, PROT_READ | PROT_WRITE)) {
+        atomic_store(&r->state[p], PG_PROBE);
+        return 0;
+    }
+    if (access == PROBE_READ) atomic_fetch_add(&g_probe_read, 1);
+    else if (access == PROBE_WRITE) atomic_fetch_add(&g_probe_write, 1);
+    else if (access == PROBE_HOST_READ) atomic_fetch_add(&g_probe_host_read, 1);
+    else if (access == PROBE_HOST_WRITE) atomic_fetch_add(&g_probe_host_write, 1);
+    else if (access == PROBE_HOST_FAULT_READ) atomic_fetch_add(&g_probe_host_fault_read, 1);
+    else if (access == PROBE_HOST_FAULT_WRITE) atomic_fetch_add(&g_probe_host_fault_write, 1);
+    else atomic_fetch_add(&g_probe_censored, 1);
+    atomic_store(&r->state[p], PG_NONE);
+    return 1;
+}
+
+// Caller holds g_slot_mu: only the registered mapping owner can change state.
+// Other CPUs may simultaneously go through the atomic fault callback.
+static void probe_restore_span(uintptr_t lo, uintptr_t hi, int access) {
+    const int count = atomic_load(&g_nr);
+    for (int i = 0; i < count; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || hi <= r->base || lo >= r->end) continue;
+        const uintptr_t first = ((lo > r->base ? lo : r->base) - r->base) >> g_shift;
+        const uintptr_t last = ((hi < r->end ? hi : r->end) - 1 - r->base) >> g_shift;
+        for (uintptr_t p = first; p <= last; p++)
+            if (!probe_open_page(r, p, access))
+                die("dirty read probe: failed to restore %p", (void *)(r->base + (p << g_shift)));
+    }
+}
+
+int nvn_dirty_read_probe_vm_begin(void) {
+    if (!atomic_load_explicit(&g_probe_redirect, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&g_slot_mu);
+    g_probe_vm_scopes++;
+    const uint64_t armed = atomic_load(&g_probe_armed);
+    const uint64_t retired = atomic_load(&g_probe_read) + atomic_load(&g_probe_write) +
+        atomic_load(&g_probe_host_read) + atomic_load(&g_probe_host_write) + atomic_load(&g_probe_censored) +
+        atomic_load(&g_probe_host_fault_read) + atomic_load(&g_probe_host_fault_write);
+    if (armed > retired) probe_restore_span(0, UINTPTR_MAX, PROBE_CENSOR);
+    pthread_mutex_unlock(&g_slot_mu);
+    return 1;
+}
+
+void nvn_dirty_read_probe_vm_end(void) {
+    pthread_mutex_lock(&g_slot_mu);
+    if (!g_probe_vm_scopes) die("dirty read probe: VM scope end without begin");
+    g_probe_vm_scopes--;
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+void nvn_dirty_read_probe_access_begin(struct nvn_dirty_probe_access *access, const void *addr,
+                                       size_t len, int is_write) {
+    *access = (struct nvn_dirty_probe_access){0};
+    const uintptr_t lo = (uintptr_t)addr;
+    if (!len || len > UINTPTR_MAX - lo ||
+        !atomic_load_explicit(&g_probe_redirect, memory_order_acquire)) return;
+    pthread_mutex_lock(&g_slot_mu);
+    *access = (struct nvn_dirty_probe_access){g_probe_access, lo, lo + len};
+    g_probe_access = access;
+    probe_restore_span(lo, lo + len, is_write ? PROBE_HOST_WRITE : PROBE_HOST_READ);
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+void nvn_dirty_read_probe_access_end(struct nvn_dirty_probe_access *access) {
+    if (!access->hi) return;
+    pthread_mutex_lock(&g_slot_mu);
+    struct nvn_dirty_probe_access **pending = &g_probe_access;
+    while (*pending && *pending != access) pending = &(*pending)->next;
+    if (!*pending) die("dirty read probe: unknown host access scope");
+    *pending = access->next;
+    access->hi = 0;
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+// First export whose end is >= lo. Adjoining exports can share one
+// interval; arm checks below use strict intersection.
+static size_t probe_export_lower(uintptr_t lo) {
+    size_t a = 0, b = g_probe_export_count;
+    while (a < b) {
+        const size_t mid = a + (b - a) / 2;
+        if (g_probe_export[mid].hi < lo) a = mid + 1;
+        else b = mid;
+    }
+    return a;
+}
+
+void nvn_dirty_read_probe_pin_export(const void *addr, size_t len, int is_write) {
+    const uintptr_t lo = (uintptr_t)addr;
+    if (!len || len > UINTPTR_MAX - lo ||
+        !atomic_load_explicit(&g_probe_redirect, memory_order_acquire)) return;
+    const uintptr_t hi = lo + len;
+    pthread_mutex_lock(&g_slot_mu);
+    atomic_fetch_add(&g_probe_exports, 1);
+    if (!atomic_load(&g_probe_export_table_full)) {
+        uintptr_t begin = lo, end = hi;
+        const size_t a = probe_export_lower(lo);
+        size_t b = a;
+        while (b < g_probe_export_count && g_probe_export[b].lo <= end) {
+            if (g_probe_export[b].lo < begin) begin = g_probe_export[b].lo;
+            if (g_probe_export[b].hi > end) end = g_probe_export[b].hi;
+            b++;
+        }
+        if (a == b && g_probe_export_count == PROBE_EXPORT_CAP) {
+            atomic_store(&g_probe_export_table_full, 1);   // refuse further arms; still restore on every export
+        } else {
+            memmove(g_probe_export + a + 1, g_probe_export + b,
+                    (g_probe_export_count - b) * sizeof g_probe_export[0]);
+            g_probe_export[a] = (struct probe_export){begin, end};
+            g_probe_export_count = g_probe_export_count - (b - a) + 1;
+        }
+    }
+    probe_restore_span(lo, hi, is_write ? PROBE_HOST_WRITE : PROBE_HOST_READ);
+    pthread_mutex_unlock(&g_slot_mu);
+}
+
+static void resume_probe(void *argument) {
+    const uintptr_t packed = (uintptr_t)argument;
+    const uintptr_t page = packed & ~(g_pg - 1);
+    const int write = packed & 1;
+    const int access = packed & 2 ? PROBE_HOST_FAULT_READ + write : PROBE_READ + write;
+    const int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || page < r->base || page >= r->end) continue;
+        if (!probe_open_page(r, (page - r->base) >> g_shift, access))
+            die("dirty read probe: failed to restore %p", (void *)page);
+    }
+}
+
+static size_t probe_arm(const void *addr, size_t len, struct nvn_dirty_deferred_source *source) {
+    if (!atomic_load_explicit(&g_probe_redirect, memory_order_acquire) || !g_pg) return 0;
+    uintptr_t first = (uintptr_t)addr;
+    if (!len || len > UINTPTR_MAX - first || first > UINTPTR_MAX - (g_pg - 1)) return 0;
+    const uintptr_t last = (first + len) & ~(g_pg - 1);
+    first = (first + g_pg - 1) & ~(g_pg - 1);
+    if (last <= first) return 0;
+
+    pthread_mutex_lock(&g_slot_mu);
+    if (g_probe_vm_scopes) {
+        pthread_mutex_unlock(&g_slot_mu);
+        return 0;
+    }
+    size_t export = probe_export_lower(first);
+    if (export < g_probe_export_count && g_probe_export[export].hi == first) export++;
+    if (atomic_load(&g_probe_export_table_full) ||
+        (export < g_probe_export_count && g_probe_export[export].lo < last)) {
+        atomic_fetch_add(&g_probe_export_refused, (last - first) >> g_shift);
+        pthread_mutex_unlock(&g_slot_mu);
+        return 0;
+    }
+    for (const struct nvn_dirty_probe_access *a = g_probe_access; a; a = a->next)
+        if (a->lo < last && first < a->hi) {
+            pthread_mutex_unlock(&g_slot_mu);
+            return 0;
+        }
+    // Refuse any shared host page, including adjacent sub-page pools.
+    range_t *owner = NULL;
+    const int n = atomic_load(&g_nr);
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        if (!live_at(i) || last <= r->base || first >= r->end) continue;
+        if (owner || first < r->base || last > r->end) {
+            owner = NULL;
+            break;
+        }
+        owner = r;
+    }
+    size_t armed = 0;
+    if (owner) {
+        struct probe_epochs *epochs = atomic_load(&owner->probe_epochs);
+        if (!epochs) {
+            const size_t pages = (owner->end - owner->base) >> g_shift;
+            const size_t available = PROBE_EPOCH_BYTES_LIMIT - g_probe_epoch_bytes;
+            if (available >= sizeof *epochs && pages <= (available - sizeof *epochs) / sizeof epochs->page[0]) {
+                const size_t bytes = sizeof *epochs + pages * sizeof epochs->page[0];
+                epochs = calloc(1, bytes);
+                if (epochs) {
+                    epochs->next = g_probe_epoch_tables;
+                    epochs->base = owner->base;
+                    epochs->end = owner->end;
+                    epochs->state = owner->state;
+                    g_probe_epoch_tables = epochs;
+                    g_probe_epoch_bytes += bytes;
+                    atomic_store(&owner->probe_epochs, epochs);
+                }
+            }
+            if (!epochs) {
+                pthread_mutex_unlock(&g_slot_mu);
+                return 0;
+            }
+        }
+        const uintptr_t begin = (first - owner->base) >> g_shift;
+        const uintptr_t end = (last - owner->base) >> g_shift;
+        const int replace = source && source->replace_verified && atomic_load(&owner->state[begin]) == PG_PROBE;
+        const uint8_t prior = replace ? PG_PROBE : PG_NONE;
+        uintptr_t page = begin;
+        for (; page < end; page++) {
+            uint8_t state = prior;
+            if (!atomic_compare_exchange_strong(&owner->state[page], &state, PG_PROBE_ARMING)) break;
+            if (replace) {
+                const struct nvn_dirty_deferred_source *old = atomic_load(&epochs->page[page].deferred);
+                if (!old || old->version >= source->version) {
+                    atomic_store(&owner->state[page], prior);
+                    break;
+                }
+            }
+        }
+        int next = prior;
+        if (page == end) {
+            if (replace || !probe_mp(first, last - first, PROT_NONE)) {
+                armed = end - begin;
+                const uint64_t epoch = ++g_probe_next_epoch;
+                if (source) {
+                    __atomic_store_n(&source->remaining, armed, __ATOMIC_RELEASE);
+                    atomic_fetch_add(&g_defer_published, armed);
+                }
+                for (uintptr_t p = begin; p < end; p++) {
+                    atomic_store(&epochs->page[p].serial, epoch);
+                    if (source) {
+                        struct nvn_dirty_deferred_source *old = atomic_exchange(&epochs->page[p].deferred, source);
+                        if (old) deferred_page_put(old);
+                    }
+                }
+                if (replace) atomic_fetch_add(&g_defer_replaced, armed);
+                else atomic_fetch_add(&g_probe_armed, armed);
+                next = PG_PROBE;
+            } else if (probe_mp(first, last - first, PROT_READ | PROT_WRITE)) {
+                die("dirty read probe: failed to roll back %p +%zu", (void *)first, last - first);
+            }
+        }
+        for (uintptr_t p = begin; p < page; p++) atomic_store(&owner->state[p], next);
+    }
+    pthread_mutex_unlock(&g_slot_mu);
+    return armed;
+}
+
+size_t nvn_dirty_read_probe_arm(const void *addr, size_t len) {
+    return probe_arm(addr, len, NULL);
+}
+
+size_t nvn_dirty_land_defer_install(struct nvn_dirty_deferred_source *source, int completed) {
+    if (!completed || !source || !source->destination || !source->alias || !source->completed_bytes ||
+        !source->length || !source->version || !g_pg || nvn_dirty_land_defer_remaining(source)) return 0;
+    const uintptr_t destination = (uintptr_t)source->destination, alias = (uintptr_t)source->alias;
+    const uintptr_t bytes = (uintptr_t)source->completed_bytes;
+    if (((destination | alias | source->length) & (g_pg - 1)) ||
+        source->length > UINTPTR_MAX - destination || source->length > UINTPTR_MAX - alias ||
+        source->length > UINTPTR_MAX - bytes ||
+        (destination < alias + source->length && alias < destination + source->length) ||
+        (bytes < alias + source->length && alias < bytes + source->length) ||
+        (bytes < destination + source->length && destination < bytes + source->length)) return 0;
+    return probe_arm(source->destination, source->length, source);
+}
+
+int nvn_dirty_land_defer_flush(struct nvn_dirty_deferred_source *source) {
+    if (!nvn_dirty_land_defer_remaining(source)) return 1;
+    const uintptr_t begin = (uintptr_t)source->destination;
+    const uintptr_t end = begin + source->length;
+    pthread_mutex_lock(&g_slot_mu);
+    range_t *r = find_span_scan(begin, source->length);
+    struct probe_epochs *epochs = r ? atomic_load(&r->probe_epochs) : NULL;
+    if (epochs) {
+        for (uintptr_t p = (begin - r->base) >> g_shift; p < (end - r->base) >> g_shift; p++) {
+            // A fault may have taken the pointer before finishing its alias
+            // copy. Wait only for this CPU-owned page transition.
+            if (!busy_wait(r, p)) break;
+            if (atomic_load(&epochs->page[p].deferred) == source &&
+                !probe_open_page(r, p, PROBE_CENSOR)) break;
+        }
+    }
+    const int retired = nvn_dirty_land_defer_remaining(source) == 0;
+    pthread_mutex_unlock(&g_slot_mu);
+    return retired;
+}
+
 // 整段解除 first..last（含）：成功则整段记脏（代际推进）——共享块的另一半也必须看到写入，
 // 否则只更新发起方会让同块内另一张纹理读到旧内容（维护者指出的“两张纹理共块”反例）。
 // 先逐页认领（PROT→BUSY、NONE→BUSY_WRITABLE），挡住并发的加保护，再整段 mprotect：
 // 不能 mprotect 完再无条件写状态——另一线程刚把某页 NONE→BUSY→mprotect(READ)，本线程再写 NONE
 // 就留下“状态可写、内存只读”的漏检（维护方审 11-04 第 7 条）。
-static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
+static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last, int allow_probe) {
+    int probe_claimed = 0;
     for (uintptr_t k = first; k <= last; ) {
         uint8_t st = atomic_load(&r->state[k]);
         if (st == PG_PROT) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY)) continue; }
         else if (st == PG_NONE) { if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_BUSY_WRITABLE)) continue; }
+        else if (st == PG_PROBE && allow_probe) {
+            if (!atomic_compare_exchange_strong(&r->state[k], &st, PG_PROBE_OPENING)) continue;
+            probe_claimed = 1;
+        }
         else {
-            if (!busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
+            if (st == PG_PROBE || !busy_wait(r, k)) {   // 别人正在改且等超时：把已认领的页按认领前状态回退，不能留下永久 BUSY
                 for (uintptr_t j = first; j < k; j++) {
                     uint8_t js = atomic_load(&r->state[j]);
                     if (js == PG_BUSY) atomic_store(&r->state[j], PG_PROT);
                     else if (js == PG_BUSY_WRITABLE) atomic_store(&r->state[j], PG_NONE);
+                    else if (js == PG_PROBE_OPENING) atomic_store(&r->state[j], PG_PROBE);
                 }
                 return 0;
             }
@@ -385,24 +805,45 @@ static int unprotect_span_pages(range_t *r, uintptr_t first, uintptr_t last) {
         dirty_log *lg = atomic_load_explicit(&r->log, memory_order_acquire);
         if (lg) log_append(lg, begin, end);
     }
-    if (mp(begin, end - begin, PROT_READ | PROT_WRITE) != 0) {
+    if (probe_claimed)
+        for (uintptr_t k = first; k <= last; k++)
+            if (atomic_load(&r->state[k]) == PG_PROBE_OPENING) deferred_materialize(r, k);
+    const int rc = probe_claimed ? probe_mp(begin, end - begin, PROT_READ | PROT_WRITE) :
+                                   mp(begin, end - begin, PROT_READ | PROT_WRITE);
+    if (rc) {
         // 失败：不推进代际，按认领前状态回退，并标记跟踪不可靠（跨 VMA 的 mprotect 可能部分成功，不能假定整段未变）
         for (uintptr_t k = first; k <= last; k++) {
             uint8_t st = atomic_load(&r->state[k]);
             if (st == PG_BUSY) atomic_store(&r->state[k], PG_PROT);
             else if (st == PG_BUSY_WRITABLE) atomic_store(&r->state[k], PG_NONE);
+            else if (st == PG_PROBE_OPENING) {
+                // The enclosing syscall may have restored only part of the run.
+                // Resolve the owned probe page before allowing a dereference.
+                const uintptr_t address = r->base + (k << g_shift);
+                if (probe_mp(address, g_pg, PROT_READ | PROT_WRITE))
+                    die("dirty read probe: failed to restore %p", (void *)address);
+                atomic_fetch_add(&g_probe_censored, 1);
+                atomic_store(&r->state[k], PG_NONE);
+            }
         }
         atomic_store(&g_track_unreliable, 1);
         return 0;
     }
     const uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
-    for (uintptr_t k = first; k <= last; k++) { atomic_store(&r->gen[k], g); atomic_store(&r->state[k], PG_NONE); }
+    for (uintptr_t k = first; k <= last; k++) {
+        if (atomic_load(&r->state[k]) == PG_PROBE_OPENING) atomic_fetch_add(&g_probe_censored, 1);
+        atomic_store(&r->gen[k], g);
+        atomic_store(&r->state[k], PG_NONE);
+    }
     last_max(r, g);
     return 1;
 }
 // 解除 p 所在的整块。块边界以所属映射为基准（chunk_first/last_page），不越界保护相邻内存。
 static int unprotect_chunk(range_t *r, uintptr_t p) {
-    return unprotect_span_pages(r, chunk_first_page(r, p), chunk_last_page(r, p));
+    // A legacy write fault never pulls a neighboring deferred page into the
+    // signal handler. The separate read-probe lookup redirects deferred pages.
+    if (atomic_load(&g_probe_redirect)) return unprotect_span_pages(r, p, p, 0);
+    return unprotect_span_pages(r, chunk_first_page(r, p), chunk_last_page(r, p), 0);
 }
 // Unprotect one page of a range: if protected, unprotect and stamp it; if another thread is changing its protection, wait for it to finish and look again -- if the other side was setting read-only, the page is PROT after the wait and still has to be unprotected
 // (an unprotect-before-write never reaches the fault handler, so it must be done here). Returns 1 = this page is managed by this module; 0 = it is not, or the wait on BUSY timed out
@@ -410,7 +851,7 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     for (;;) {
         uint8_t st = atomic_load(&r->state[p]);
         if (st == PG_NONE) return atomic_load(&r->gen[p]) != 0;   // already writable (another thread just unprotected it) -> re-execute; pages never protected are not ours
-        if (st == PG_PROT) {
+        if (st == PG_PROT || st == PG_PROBE) {
             if (!unprotect_chunk(r, p)) return 0;   // 失败已回退状态并置“跟踪不可靠”，不能声称已处理
             if (count) atomic_fetch_add(count, 1);
             return 1;
@@ -419,9 +860,36 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
     }
 }
 static int on_fault(void *addr, int is_write, void *uc) {
-    (void)uc;
+    uintptr_t a = (uintptr_t)addr;
+    nvn_dirty_read_probe_redirect_fn redirect = atomic_load_explicit(&g_probe_redirect, memory_order_acquire);
+    if (redirect) {
+        const int n = atomic_load(&g_nr);
+        for (int i = 0; i < n; i++) {
+            range_t *r = rg(i);
+            if (!live_at(i)) continue;
+            const struct probe_epochs *epochs = atomic_load(&r->probe_epochs);
+            if (!epochs || a < epochs->base || a >= epochs->end) continue;
+            const uintptr_t p = (a - epochs->base) >> g_shift;
+            const uintptr_t base = a & ~(g_pg - 1);
+            if (probe_page(atomic_load(&epochs->state[p]))) {
+                int (*guest_pc)(void *) = atomic_load_explicit(&g_probe_guest_pc, memory_order_acquire);
+                const int host = guest_pc && !guest_pc(uc);
+                const uintptr_t packed = base | (uintptr_t)(host * 2 + (is_write != 0));
+                return redirect(uc, resume_probe, (void *)packed) == 1 ? 1 : -1;
+            }
+            // The kernel can deliver a fault after another thread already
+            // restored this page. Permit one retry for this exact arm epoch;
+            // a genuine access violation must still reach the normal handler.
+            const uint64_t epoch = atomic_load(&epochs->page[p].serial);
+            if (epoch && (g_probe_retry.page != base || g_probe_retry.epoch != epoch)) {
+                g_probe_retry.page = base;
+                g_probe_retry.epoch = epoch;
+                return 1;
+            }
+        }
+    }
     if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr; int ours = 0, n = atomic_load(&g_nr);
+    int ours = 0, n = atomic_load(&g_nr);
     for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
         { range_t *r = rg(i); if (live_at(i) && a >= r->base && a < r->end) ours |= release_page(r, (a - r->base) >> g_shift, &g_faults); }
     return ours;
@@ -446,12 +914,12 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         if (any_prot) {
             if (!open) { run_first = i; open = 1; }
         } else if (open) {
-            if (unprotect_span_pages(r, run_first, i - 1)) { if (count) atomic_fetch_add(count, i - run_first); }
+            if (unprotect_span_pages(r, run_first, i - 1, 1)) { if (count) atomic_fetch_add(count, i - run_first); }
             open = 0;
         }
         i = last + 1;
     }
-    if (open && unprotect_span_pages(r, run_first, lq)) { if (count) atomic_fetch_add(count, lq - run_first + 1); }
+    if (open && unprotect_span_pages(r, run_first, lq, 1)) { if (count) atomic_fetch_add(count, lq - run_first + 1); }
 }
 static void prep_write(void *addr, size_t len) {
     if (!len) return;
@@ -567,6 +1035,9 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     range_t *r = rg(slot);
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
+    // This newly registered range could share a physical host page with
+    // an observed range. End the exclusive observation before publishing it.
+    if (end > base && atomic_load(&g_probe_redirect)) probe_restore_span(base, end, PROBE_CENSOR);
     _Atomic uint8_t *state = r->state;
     _Atomic uint64_t *gen = r->gen;
     if (r->cap < np) {
@@ -615,6 +1086,7 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     }
     r->base = base; r->end = end; r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; atomic_store(&r->last, 0);   // every gen is 0 here (calloc / memset above)
     atomic_store_explicit(&r->log, lg, memory_order_release);
+    atomic_store(&r->probe_epochs, NULL);
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
     span_insert(base, end, (uint32_t)slot);
@@ -647,6 +1119,8 @@ void nvn_dirty_protect(const void *addr, size_t len) {
     uintptr_t run = 0; int open = 0;
     for (uintptr_t i = fp; i <= lq + 1; i++) {
         uint8_t st = PG_NONE;
+        if (i <= lq && probe_page(atomic_load(&r->state[i])) && !probe_open_page(r, i, PROBE_CENSOR))
+            die("dirty read probe: failed to restore %p", (void *)(r->base + (i << g_shift)));
         int took = i <= lq && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
         if (!took && open) {

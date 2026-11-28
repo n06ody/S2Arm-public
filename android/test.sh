@@ -341,6 +341,7 @@ s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --compute-warm-
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --diag-mutants
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --link-refused-file
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --live-compile-mutants
+s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --submit-compile
 # 图形阶段存储图像（#999）：句柄字 72..86 偶 → 图像槽 / 表外·奇字·数组不猜 / 声明落程序记录；解析与声明各改坏一处，graphics_image_layout_test 必红
 s2a_gate_step "$PY" "$android_dir/tests/nvk_shader_pool_test.py" --graphics-image-mutants
 # 计算程序装载：游戏 UBO 形态的类型 3 句柄进程序 usrc 表（#1594 片 10）：撤掉这一步、或对所有项都放，必红（真解析 + 生产 build_compute）
@@ -375,6 +376,8 @@ s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/shader_write_barrier_mutation_
 s2a_gate_step "$PY" "$repo_dir/graphics/nvn/tests/cbuf_prep_mutation_test.py"
 # 原创 Maxwell 经生产请求、真实编译器与生产结果解析；GPU 像素由 Vulkan 门禁另验。
 s2a_gate_step "$PY" "$android_dir/tests/gs_compiler_chain_test.py"
+# 细分请求保留 GS 空槽，用真实统一编译器生成并装载 TCS/TES。
+s2a_gate_step "$PY" "$android_dir/tests/tess_compiler_chain_test.py"
 # BUFFER texture: real producer, Maxwell compiler and SPIR-V parser.
 s2a_gate_step "$PY" "$android_dir/tests/tbuf_compiler_chain_test.py"
 s2a_gate_step "$PY" "$android_dir/tests/libpack_tbuf_withdraw_test.py"

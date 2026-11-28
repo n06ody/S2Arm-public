@@ -1,0 +1,11 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Data16 { uint16_t b[8]; };
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < 8u) {
+        uint x = uint(b[i]);
+        b[i] = uint16_t((x + i * 5u + 11u) & 0xffffu);
+    }
+}

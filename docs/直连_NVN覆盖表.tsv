@@ -90,7 +90,7 @@ nvnProgramFinalize	语义	已做	是	是
 nvnProgramSetDebugLabel	语义	已做	是	是	
 nvnProgramSetShaders	语义	已做	是	是	（回放选特化：WireShaders.Pick）：同一组客体代码有多份 Ryujinx 特化时，我方只按「透明测试开关」一个字段选（Pick 遇到第一份 alpha 相符的就返回），贴图目标 / 格式、深度比较、属性类型、早期深度等特化字段一概不比；注释自己写明只在丝之歌验证过「组内其余字段全同」，别款要补判据。直连层没有特化问题：一个控制段+代码一个 Metal 函数，格式差异在建管线时按当次状态现配（vfmt_for_ct / 影子输入）（中（差异本身确定；动森组内是否真有别的字段不同没量过，跑 DescribeVariants 才知道））；（回放首绘透明测试）：程序首次绘制时用当时的透明测试开关 at 调 GetOrCreate；若缓存里这组没有 at 那份特化，FromGroup 返回 null，pg.W=null 且 pg.Tried=true —— 之后透明测试关掉的绘制也永远跳过（不会再试另一份）。直连层不实现透明测试（只记录），不存在此问题（高（代码路径确定；动森是否触发未查日志））；（阶段识别时机）：我方在 SetShaders 当场读代码首字与 SPH 判阶段（StageKind），日志还解引用代码；直连层不在此读代码，代码区未映射时延后到首绘再算键（游戏特例：马力欧先给未映射地址、首绘前才填）（低）；（控制段长度 / 阶段数）：我方控制段固定拷 0x880；nx 取控制段 +0x20 自报长度（0x760..0x880 时用自报，SDK 10 的 3D 世界是 0x850）。阶段数 >6 我方截断并返回 1，nx 报红返回 0（低）
 nvnProgramSetShadersExt	语义	已做	是	是	
-nvnProgramSetSampleShading	红	已做	是	是	10-25 补：空实现 + 点名（仍按每像素一次着色）
+nvnProgramSetSampleShading	红	已做	是	是	Vulkan 支持强制逐样本；Metal 对强制开启仍报红
 nvnMemoryPoolBuilderSetDevice	语义	已做	是	是	
 nvnMemoryPoolBuilderSetDefaults	语义	已做	是	是	
 nvnMemoryPoolBuilderSetStorage	语义	已做	是	是	
@@ -420,7 +420,7 @@ nvnCommandBufferSetViewportSwizzles	语义	已做	是	是
 nvnCommandBufferSetScissor	语义	已做	是	是	
 nvnCommandBufferSetScissors	语义	已做	是	是	
 nvnCommandBufferSetDepthRange	语义	已做	是	是	
-nvnCommandBufferSetDepthBounds	空	已做	是	是	
+nvnCommandBufferSetDepthBounds	语义	已做	是	是	Vulkan 按已存深度做闭区间测试，缺 depthBounds 能力时启用报红；Metal 启用报红。
 nvnCommandBufferSetDepthRanges	语义	已做	是	是	
 nvnCommandBufferSetTiledCacheAction	语义	已做	是	是	
 nvnCommandBufferSetTiledCacheTileSize	语义	已做	是	是	
@@ -436,7 +436,7 @@ nvnCommandBufferSetPointSize	语义	已做	是	是
 nvnCommandBufferSetLineWidth	语义	已做	是	是	
 nvnCommandBufferSetPolygonOffsetClamp	语义	已做	是	是	
 nvnCommandBufferSetAlphaRef	语义	已做	是	是	
-nvnCommandBufferSetSampleMask	语义	已做	是	是	
+nvnCommandBufferSetSampleMask	红	已做	是	是	Vulkan 将掩码应用于绘制覆盖；Metal 对非全开掩码报红
 nvnCommandBufferSetRasterizerDiscard	语义	已做	是	是	回放丢弃：Op.RasterDiscard 落在 `case PointSize/LineWidth/RasterDiscard: break`，从不调 GAL SetRasterizerDiscard；直连层开启时该绘制不光栅化（只跑顶点 / 变换反馈）（高（差异）/ 低（动森是否调用未查））
 nvnCommandBufferSetDepthClamp	语义	已做	是	是	
 nvnCommandBufferSetConservativeRasterEnable	语义	已做	是	是	
@@ -530,7 +530,7 @@ nvnCommandBufferBindTexturesDeferred	语义	已做	是	是
 nvnCommandBufferBindUniformBuffersDeferred	红	已做	是	是	
 nvnCommandBufferOverrideSubtileSize	红	已做	是	是	
 nvnCommandBufferSetControlMemoryCallbackEnabled	红	已做	是	是	
-nvnCommandBufferSetProvokingVertexMode	红	未做	是	是	10-25 留未做：nvn.h 无原型、枚举值未知；Metal 平面插值固定取首顶点
+nvnCommandBufferSetProvokingVertexMode	红	已做	是	是	Android Vulkan 接入首／末顶点模式；末顶点要求 VK_EXT_provoking_vertex 和逐管线支持；Metal 平直插值固定取首顶点
 nvnCommandBufferSetZCullZF32CompressionEnable	红	已做	是	是	
 nvnDeviceSetAutomaticCheckpointsMask	空	已做	是	是	10-25 补：同上
 nvnProgramGetSubtileSize	红	已做	是	是	10-25 补：本层不用 tiled 存储 → 报 0 + 点名

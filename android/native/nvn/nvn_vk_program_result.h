@@ -100,6 +100,8 @@ int nvn_vk_program_graphics_stage_index(const char *name);
 int nvn_vk_program_parse_graphics(const uint8_t *bytes, size_t length, struct fd_program *out, char *why, size_t why_size);
 // 同上，allow_vs_only = 1 时也接受只有顶点阶段的程序（只写深度的绘制；新回放层用）。
 int nvn_vk_program_parse_graphics_stages(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size);
+/* Live provider adapters also admit the negotiated binary frame. */
+int nvn_vk_program_parse_graphics_live(const uint8_t *bytes, size_t length, struct fd_program *out, int allow_vs_only, char *why, size_t why_size);
 void nvn_vk_program_free(struct fd_program *program);
 /* 两段着色器接口对不对得上（出包预编库按阶段分别取、拼成一份程序，拼时不过链接）：
  *   上一段（顶点，或几何）带 Location 的 Output 位置集合，必须包含片元带 Location 的 Input 位置集合。
@@ -146,6 +148,8 @@ struct nvn_vk_compute_program {
 extern "C" {
 #endif
 int nvn_vk_program_parse_compute(const uint8_t *bytes, size_t length,
+    struct nvn_vk_compute_program *out, char *why, size_t why_size);
+int nvn_vk_program_parse_compute_live(const uint8_t *bytes, size_t length,
     struct nvn_vk_compute_program *out, char *why, size_t why_size);
 void nvn_vk_program_free_compute(struct nvn_vk_compute_program *program);
 #ifdef __cplusplus

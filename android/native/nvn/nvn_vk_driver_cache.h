@@ -23,6 +23,17 @@ extern "C" {
 // <uuid 32 hex>-v<版本>.bin；uuid 为 VkPhysicalDeviceProperties.pipelineCacheUUID。
 int nvk_driver_cache_name(const uint8_t uuid[16], char out[NVK_DRIVER_CACHE_NAME]);
 
+struct nvk_driver_cache_stamp {
+    size_t size;            // 0 = 没有已验证的磁盘版本
+    uint8_t digest[32];
+};
+
+// read 同时返回已核验的磁盘身份。store 成功后更新身份，1 = 内容一样，0 = 已原子写入。
+int nvk_driver_cache_read_stamp(const char *dir, const uint8_t uuid[16], void **data, size_t *size,
+                                struct nvk_driver_cache_stamp *stamp, char *why, size_t why_size);
+int nvk_driver_cache_store(const char *dir, const uint8_t uuid[16], const void *data, size_t size,
+                           struct nvk_driver_cache_stamp *stamp, char *why, size_t why_size);
+
 // 读：成功返回 0，*data = malloc 的负载（调用方 free），*size = 负载字节数。
 // 文件不存在返回 1（不是错误）；损坏/超限返回负数并写 why。
 int nvk_driver_cache_read(const char *dir, const uint8_t uuid[16], void **data, size_t *size,

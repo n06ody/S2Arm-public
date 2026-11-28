@@ -1,5 +1,6 @@
 // 回放核心内部接口（核心各文件之间用；前端只认 nvn_mtl.h / nvn_obj.h 里的 nvn_be_*）。
 #pragma once
+#include "rp_guest_snapshot.h"
 #include <stdint.h>
 #include "nvn_obj.h"
 #include "nvn_backend.h"
@@ -26,6 +27,7 @@ nvn_gpu_buf rp_buf_for_null_storage(void);
 // 取 [addr, addr+len) 在后端的缓冲与偏移；自上次同步后写过的页在 c 这一段的 GPU 顺序里重传。0 = 地址不在任何池里（已记账）。线程：[提交]。
 int rp_buf_resolve(nvn_gpu_cmd c, uint64_t addr, uint64_t len, nvn_gpu_buf *buf, uint64_t *off);
 int rp_buf_resolve_multi(int n, const uint64_t *addr, const uint64_t *len, nvn_gpu_buf *buf, uint64_t *off, unsigned char *ok);   // 一次抢锁解析多段
+int rp_buf_disjoint_attachment(uint64_t addr, uint64_t len, nvn_gpu_buf buf, uint64_t off, const tex_t *attachment);
 // 回放窗口 = 一次提交的回放（nvn_be_sub_begin → nvn_be_sub_commit，开窗口的线程是回放线程）。窗口开着时别的线程销毁池（MapVirtual 改 run、MemoryPoolFinalize），
 // 镜像缓冲不当场放（回放线程手里可能已有 rp_buf_resolve 取到、后端还没 cmd_ref 的句柄），推迟到窗口收尾；窗口外或同线程销毁照旧当场放。
 void rp_buf_hold_begin(void);
@@ -38,6 +40,22 @@ void rp_buf_stats(uint64_t *bytes, uint64_t *runs);   // 累计同步字节数 /
 int rp_buf_mirrors(void);                             // 现有镜像个数
 // 缓冲类命令（rec = 命令记录地址，只进未接日志）
 void rp_op_update_ub(const void *a, const void *rec);
+
+// Primitive seen by the shader resolver after the draw path's topology conversion.
+static inline uint32_t rp_draw_shader_prim(uint32_t prim, int gs, int restart, int indirect) {
+    switch (prim) {
+    case NVN_DRAW_PRIMITIVE_LINE_LOOP: return NVN_DRAW_PRIMITIVE_LINES;
+    case NVN_DRAW_PRIMITIVE_QUADS: return NVN_DRAW_PRIMITIVE_TRIANGLES;
+    case NVN_DRAW_PRIMITIVE_QUAD_STRIP:
+        return gs || restart ? NVN_DRAW_PRIMITIVE_TRIANGLES : NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP;
+    case NVN_DRAW_PRIMITIVE_TRIANGLE_STRIP:
+        return gs && !indirect ? NVN_DRAW_PRIMITIVE_TRIANGLES : prim;
+    case NVN_DRAW_PRIMITIVE_POLYGON:
+    case NVN_DRAW_PRIMITIVE_TRIANGLE_FAN:
+        return gs && !indirect ? NVN_DRAW_PRIMITIVE_TRIANGLES : NVN_DRAW_PRIMITIVE_TRIANGLE_FAN;
+    default: return prim;
+    }
+}
 void rp_op_copy_b2b(const void *a, const void *rec);
 void rp_op_clear_buf(const p_clear_buf *cb, const void *rec);
 void rp_op_copy_b2t(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec);
@@ -59,6 +77,14 @@ void rp_pass_clear_ds(nvn_gpu_cmd c, const p_clear_ds *cd, const void *rec);
 void rp_pass_barrier(uint32_t bits);   // 游戏的屏障：记下位，下一个通道前交给后端；带「顺序」位、且开着的通道里已有着色器写的，下一笔绘制前结束该通道（见 rp_pass.c）
 uint32_t rp_pass_take_barrier(void);   // 通道外的计算派发前调：取走待发的游戏屏障位（取完清零），由调用方交给后端
 void rp_pass_prepare_draw(nvn_gpu_cmd c, uint32_t color_write_mask);   // 有效颜色写掩码（含片元输出映射）与像素区域；附件集合变了或区域超出时重开
+// Optional binding proof returns the counter for the first rejection, or zero.
+typedef int (*rp_discard_check)(const tex_t *attachment, const void *bindings);
+void rp_pass_plan_discard(const void *rec, rp_discard_check check, const void *bindings);
+int rp_discard_submit_reject(nvn_gpu_cmd cmd);
+void rp_pass_discard_hint(int slot, const void *rec);  // -1 denotes depth/stencil
+void rp_pass_plan_ds(const void *rec);   // Current direct draw has only host-staged inputs.
+int rp_pass_ds_omitted(void);            // Pipeline shape for the open physical pass.
+void rp_pass_end_xfer(nvn_gpu_cmd c);   // End before transfer and identify the same-target restart.
 // 各绘制路径和开遍用同一个半开矩形；先加宽，客体宽高或起点异常时也不会回绕。
 static inline int rp_clip_scissor(const p_scissor *in, uint32_t w, uint32_t h, p_scissor *out) {
     int64_t x0 = in->x > 0 ? in->x : 0, y0 = in->y > 0 ? in->y : 0;
@@ -146,6 +172,18 @@ enum { RP_PERF_SUBMIT_NS, RP_PERF_COMMIT_NS, RP_PERF_SUBS, RP_PERF_WAIT_NS, RP_P
        RP_PERF_WAIT_EFX_TS, RP_PERF_WAIT_EFX_FX, RP_PERF_WAIT_EFX_GW, RP_PERF_WAIT_EFX_LATER,   // 本可放行、因待落地回写改成真等的 SyncWait：所等区间里带时间戳 / 带事件·别的计数器·遮挡 / 带显卡写缓冲的次数（一次可记多类）；所等区间里没有、只有之后的提交带回写的次数
        RP_PERF_MIRROR_HOIST, RP_PERF_MIRROR_OVERLAP, RP_PERF_MIRROR_FALLBACK,   // 原本会关遍的镜像同步：前移、确认重叠、不具备前移条件
        RP_PERF_TEX_BYTE_EQUAL, RP_PERF_TEX_BYTE_CHANGED, RP_PERF_TEX_BYTE_SKIPPED,
+       RP_PERF_MIRROR_FB_GW, RP_PERF_MIRROR_FB_LAND, RP_PERF_MIRROR_FB_OVERFLOW, RP_PERF_MIRROR_FB_UNKNOWN, RP_PERF_MIRROR_FB_OTHER,
+       RP_PERF_MIRROR_SPAN_GW, RP_PERF_MIRROR_SPAN_LAND,
+       RP_PERF_DC_HINT_COLOR, RP_PERF_DC_HINT_DS,
+       RP_PERF_DC_SCOPE, RP_PERF_DC_NEXT, RP_PERF_DC_RANGE, RP_PERF_DC_TARGET, RP_PERF_DC_MODE,
+       RP_PERF_DC_COLOR, RP_PERF_DC_DEPTH, RP_PERF_DC_STENCIL,
+       RP_PERF_DC_FULL_COLOR, RP_PERF_DC_FULL_DEPTH, RP_PERF_DC_FULL_STENCIL,
+       RP_PERF_DC_PARTIAL, RP_PERF_DC_SPLIT_CLEAR, RP_PERF_DC_LOAD_CLEAR,
+       RP_PERF_DC_VTX_STREAM, RP_PERF_DC_GUEST_BIND, RP_PERF_DC_LAYER_OUT, RP_PERF_DC_COND_QUERY,
+       RP_PERF_DC_NON_PRIMARY, RP_PERF_DC_TARGET_STATE, RP_PERF_DC_PARK, RP_PERF_DC_FIRST_ENCODE,
+       RP_PERF_DC_FIRST_COLD, RP_PERF_DC_FIRST_INDIRECT, RP_PERF_DC_FIRST_STREAM,
+       RP_PERF_DC_FIRST_TOPOLOGY, RP_PERF_DC_FIRST_INDEXED, RP_PERF_DC_FIRST_INDEX_FORMAT,
+       RP_PERF_DC_FIRST_INDEX_SPAN, RP_PERF_DC_FIRST_RECORD,
        RP_PERF_N };   // P_CONT：同目标续接命中的 SET_RT 次数；P_CLEARONLY：一笔绘制都没有的通道数；P_PARK：记进挂起表的待折清除条数；BIND_FAST：整组绑定直接沿用没重建；TEX_EPOCH：贴图内容检查按纪元跳过的次数；PC_HIT/MISS：后端开通道缓存命中 / 新建   /* FX_*：做完时要写回游戏内存的提交数，和各类回写的个数（事件 / 计数器报告 / 遮挡事件 / 显卡写缓冲） */   // TEX_UP_*：贴图整张上传的次数与千字节；BUF_SYNC_KB：池镜像同步的千字节   // P_*：通道的构成（见 rp_pass.c rp_pass_end）   // D_*：一笔绘制里各步（见 rp_draw.c）
 void rp_perf_add(int i, uint64_t v);
 // 分时读数抽样（#1103）：一笔绘制取 10 次时钟 + 9 次原子加、一次贴图解析取 3 次、一个通道取 5 次，世界稳态每帧合计约 2.2 万次取时钟，占回放线程约 3%。
@@ -201,14 +239,36 @@ void rp_occl_pass_opened(int declared); void rp_occl_pass_closed(void);
 void rp_occl_pause(nvn_gpu_cmd c);      // 通道里按矩形清之前
 void rp_occl_draw(nvn_gpu_cmd c);       // 每笔绘制之前
 void rp_dispatch(nvn_gpu_cmd c, const p_dispatch *dp, const void *rec);   // 计算派发（rp_draw.c）
+// Stage is 0 for transfers and 1..6 for VS/FS/GS/TCS/TES/CS.
+enum rp_land_origin {
+    RP_LAND_UNKNOWN, RP_LAND_SSBO, RP_LAND_UBOP, RP_LAND_IMAGE_BUFFER, RP_LAND_T2B,
+    RP_LAND_UPDATE, RP_LAND_COPY, RP_LAND_CLEAR, RP_LAND_MIXED, RP_LAND_ORIGINS
+};
+enum { RP_LAND_STAGES = 7 };
+int rp_post_gpu_write_tagged(uint64_t addr, uint64_t bytes, uint64_t copy_bytes,
+                             uint64_t row, uint64_t image, uint32_t rows, uint32_t images,
+                             enum rp_land_origin origin, unsigned stage);
+uint64_t rp_buf_gpu_write_note_tagged(uint64_t addr, uint64_t len, uint64_t copy_len,
+                                    uint64_t *key, int *merged, enum rp_land_origin origin, unsigned stage);
+void rp_buf_land_diag_log(double frames);
+int rp_buf_land_guard_active(void);
 int rp_post_gpu_write(uint64_t addr, uint64_t len);                       // 登记单段；1 = 登记成功，段完成后回写
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t row_bytes, uint64_t row_stride, uint64_t image_stride, uint32_t rows, uint32_t images);
 // [addr, addr + len) 有没有还没落地的 GPU 写（登记中或正在锁外拷回）：1 有、0 没有、-1 地址不在登记过的池里。线程：[提交]。
 int rp_buf_gpu_write_pending(uint64_t addr, uint64_t len);
+// CPU 快照来源：0 可读地址待调用方验证，1 有在途 GPU 写，-1 越界或别名不能证明连续。
+int rp_buf_cpu_read_source(uint64_t addr, uint64_t len, const uint8_t **source);
 uint64_t rp_buf_gpu_write_note(uint64_t addr, uint64_t len, uint64_t *pool_key); void rp_buf_gpu_write_land(uint64_t pool_key, uint64_t id, int ok);
 struct rp_gpu_write_ref { uint64_t pool_key, id; uint32_t index; };
+int rp_buf_read_pointer(nvn_gpu_buf b, uint64_t off, uint64_t addr, uint64_t *value);
+enum { RP_GPU_WRITE_COPY_MAX = 4 };
+// Each reference owns RP_GPU_WRITE_COPY_MAX slots starting at index * RP_GPU_WRITE_COPY_MAX.
+// The caller initializes unused slots to zero. Snapshot and completion share the same span order.
+void rp_buf_land_seal(const struct rp_gpu_write_ref *refs, uint32_t count, uint64_t fence);
 void rp_buf_gpu_write_snapshot(const struct rp_gpu_write_ref *refs, uint32_t count, nvn_gpu_readback_span *spans);
-void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, int ok, const uint8_t *staged);
+// With staging present, each offset is biased by one. Zero selects the original mirror.
+void rp_buf_gpu_write_land_from(uint64_t pool_key, uint64_t id, uint32_t status,
+                              const uint8_t *staged, const uint64_t *readback_plus_one);
 // 同段合并版登记（merged 非空才合并，开关 nvk_land_merge）：本次提交里相交 / 首尾相接的已有登记并成一条，*merged = 1、返回已有那条的登记号（不要再记新落地项）。
 // len owns the full mirror interval; copy_len only limits staging and guest materialization.
 uint64_t rp_buf_gpu_write_note_prefix(uint64_t addr, uint64_t len, uint64_t copy_len, uint64_t *pool_key, int *merged);

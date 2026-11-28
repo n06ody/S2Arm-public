@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer OutInd {
+    uint words[];
+};
+
+layout(push_constant) uniform PC {
+    uint word_off;
+    uint count_val;
+    uint first_val;
+} pc;
+
+void main() {
+    words[pc.word_off + 0u] = pc.count_val;
+    words[pc.word_off + 1u] = pc.first_val;
+}

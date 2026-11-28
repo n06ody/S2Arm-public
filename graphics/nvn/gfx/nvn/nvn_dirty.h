@@ -26,6 +26,58 @@ int nvn_dirty_log_open(const void *span, uint64_t *ident, uint64_t *cursor);
 int nvn_dirty_log_read(const void *span, uint64_t ident, uint64_t *cursor, void (*fn)(void *user, uintptr_t a, uintptr_t b), void *user);
 // addr 所在页此刻只读（之后的写必然缺页、必然进日志）：1 = 是。加保护被并发的解保护挡住时为 0，调用方不能当已同步。
 int nvn_dirty_page_armed(const void *span, const void *addr);
+// Default-off first-access observation. Install the redirect in normal context
+// with no active observation. Arm only stable, exclusive RW mappings after
+// eager writeback. The caller must own mapping lifetime and cover every host
+// access which bypasses userspace faults, including exported pointers.
+typedef int (*nvn_dirty_read_probe_redirect_fn)(void *, void (*)(void *), void *);
+void nvn_dirty_read_probe_set_redirect(nvn_dirty_read_probe_redirect_fn redirect);
+void nvn_dirty_read_probe_set_guest_pc(int (*is_guest_pc)(void *context));
+size_t nvn_dirty_read_probe_arm(const void *addr, size_t len);
+struct nvn_dirty_read_probe_stats {
+    uint64_t armed, read, write, host_read, host_write, censored, failed, mp_calls, mp_ns;
+    uint64_t host_fault_read, host_fault_write, export_calls, export_refused_pages;
+    uint64_t defer_published, defer_materialized, defer_replaced;
+    int export_table_full;
+};
+void nvn_dirty_read_probe_stats(struct nvn_dirty_read_probe_stats *out);
+// Pin the syscall's exact guest range against fresh read-probe protection.
+// Call end after the kernel stops using it. The scope does not pin the underlying
+// mapping, validate permissions or take the place of ordinary write preparation.
+// The caller must keep its mapping valid through end.
+struct nvn_dirty_probe_access {
+    struct nvn_dirty_probe_access *next;
+    uintptr_t lo, hi;
+};
+void nvn_dirty_read_probe_access_begin(struct nvn_dirty_probe_access *access, const void *addr,
+                                       size_t len, int is_write);
+void nvn_dirty_read_probe_access_end(struct nvn_dirty_probe_access *access);
+// Before returning a pointer without a release contract, restore its real
+// permissions and exclude all its pages from future observation. NVN pool
+// removal alone is not proof that a previously returned pointer is gone.
+void nvn_dirty_read_probe_pin_export(const void *addr, size_t len, int is_write);
+// The VM owner must begin before parking other threads and end after
+// changing backing or permissions. A nonzero token requires a matching end.
+int nvn_dirty_read_probe_vm_begin(void);
+void nvn_dirty_read_probe_vm_end(void);
+// A completed immutable source for whole pages. The producer owns the slot
+// and a private RW alias of destination until remaining reaches zero. The
+// alias is never exported to ordinary readers. No Vulkan call is made here.
+struct nvn_dirty_deferred_source {
+    const void *destination;
+    void *alias;
+    const void *completed_bytes;
+    size_t length;
+    uint64_t version;
+    size_t remaining;
+    int replace_verified;   // proof of complete overwrite, separate from successful completion
+};
+// Completion proves host visibility. A replacement separately requires
+// complete overwrite, a newer version and ownership of every covered page.
+size_t nvn_dirty_land_defer_install(struct nvn_dirty_deferred_source *source, int completed);
+size_t nvn_dirty_land_defer_remaining(const struct nvn_dirty_deferred_source *source);
+// Normal context before the caller reuses or releases any producer storage.
+int nvn_dirty_land_defer_flush(struct nvn_dirty_deferred_source *source);
 void nvn_dirty_set_chunk_pages(uint32_t pages);
 uint32_t nvn_dirty_chunk_pages(void);
 // 跟踪不可靠：任一 mprotect 失败后置位；为 1 时所有查询走保守路径（视为脏 / 代际 -1）。

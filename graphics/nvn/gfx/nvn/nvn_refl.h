@@ -11,7 +11,8 @@
 // SPILL：计算核共享内存超过设备上限时挪出来的线程组数组（安卓直连编译器 DirectSharedSpill，同 iOS SpillFix 的 spill_slot）：每个线程组一片，回放按派发组数从暂存区分配
 
 enum { NVN_RB_CBUF = 1, NVN_RB_SAMP, NVN_RB_TEX, NVN_RB_IMG, NVN_RB_TBUF,
-       NVN_RB_SBUFP, NVN_RB_SUPPORT, NVN_RB_C1, NVN_RB_DRV0, NVN_RB_DRV2, NVN_RB_SAMPT, NVN_RB_UBOP, NVN_RB_TEXU, NVN_RB_SAMPU, NVN_RB_SAMPI, NVN_RB_SBUFU, NVN_RB_TEXD, NVN_RB_SAMPD, NVN_RB_IMGA, NVN_RB_TEXA, NVN_RB_SAMPA, NVN_RB_GEOMETRY, NVN_RB_UVX, NVN_RB_LB, NVN_RB_UBOLEN, NVN_RB_SBSZ, NVN_RB_PUSH, NVN_RB_TBUFU, NVN_RB_IMGU, NVN_RB_GMEM, NVN_RB_GMEML, NVN_RB_TEXP, NVN_RB_SAMPP, NVN_RB_UBOA, NVN_RB_TBLEAD, NVN_RB_SBUFQ, NVN_RB_SPILL };
+       NVN_RB_SBUFP, NVN_RB_SUPPORT, NVN_RB_C1, NVN_RB_DRV0, NVN_RB_DRV2, NVN_RB_SAMPT, NVN_RB_UBOP, NVN_RB_TEXU, NVN_RB_SAMPU, NVN_RB_SAMPI, NVN_RB_SBUFU, NVN_RB_TEXD, NVN_RB_SAMPD, NVN_RB_IMGA, NVN_RB_TEXA, NVN_RB_SAMPA, NVN_RB_GEOMETRY, NVN_RB_UVX, NVN_RB_LB, NVN_RB_UBOLEN, NVN_RB_SBSZ, NVN_RB_PUSH, NVN_RB_TBUFU, NVN_RB_IMGU, NVN_RB_GMEM, NVN_RB_GMEML, NVN_RB_TEXP, NVN_RB_SAMPP, NVN_RB_UBOA, NVN_RB_TBLEAD, NVN_RB_SBUFQ, NVN_RB_SPILL,
+       NVN_RB_MESH_EMU, NVN_RB_MESH_VBO, NVN_RB_MESH_FIRST };
 enum { NVN_REFL_PUSH_SLOTS = 8, NVN_REFL_PUSH_BYTES = 256 };   // SBUFQ bounds: NVN2 push-constant slots and their bytes (= nvn2_cmd.h NVN2_PUSH_SLOTS / NVN2_PUSH_BYTES, asserted in nvn_mtl.m)   // UBOA: 计算存储缓冲来自「用户 UBO 内 8 字节 guest 裸指针」（map 3，UBO 槽 src_reg + 字节偏移 src_off）   // UVX: S2Arm widen 16:9 sampling remap table (dmsh_build.py fs_uvx; widen_glue.inc uvx_fill); LB: #800 sampler LOD bias table (dmsh_red.py fs_lb; nvn_mtl.m lb_fill)
 // TEXA / SAMPA: an array of n handles in the driver table c2 that the shader indexes at run time (dmsh_build.py c2_array): element k = the texture / sampler of the slot whose c2 word lies
 // at byte off + 8k (combined, else separate); words outside both tables give the dummy. Luigi's Mansion 3's shadow cascades

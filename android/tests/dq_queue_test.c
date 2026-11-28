@@ -41,6 +41,7 @@
 #include <unistd.h>
 #include <vulkan/vulkan.h>
 #include "nvn_plat.h"
+#include "../native/direct/vk_device.h"
 
 #ifndef TEST_TIMEOUT_S
 #define TEST_TIMEOUT_S 240

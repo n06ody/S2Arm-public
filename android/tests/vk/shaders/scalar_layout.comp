@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+// 标量紧密排布：v0 偏移 0（12B），v1 偏移 12（跨 16 字节对齐边界），arr[2] 偏移 24 且 ArrayStride=12，总计 48B（12 个 float）。
+// Vulkan 1.1 核心（含 relaxed_block_layout）仍禁止跨 16B 边界的 vec3 与 ArrayStride=12，必须启用 VK_EXT_scalar_block_layout。
+layout(set = 0, binding = 0, scalar) readonly buffer In {
+    vec3 v0;
+    vec3 v1;
+    vec3 arr[2];
+} src;
+layout(set = 0, binding = 1, std430) writeonly buffer Out {
+    float vals[];
+} dst;
+void main() {
+    dst.vals[0]  = src.v0.x;     dst.vals[1]  = src.v0.y;     dst.vals[2]  = src.v0.z;
+    dst.vals[3]  = src.v1.x;     dst.vals[4]  = src.v1.y;     dst.vals[5]  = src.v1.z;
+    dst.vals[6]  = src.arr[0].x; dst.vals[7]  = src.arr[0].y; dst.vals[8]  = src.arr[0].z;
+    dst.vals[9]  = src.arr[1].x; dst.vals[10] = src.arr[1].y; dst.vals[11] = src.arr[1].z;
+}

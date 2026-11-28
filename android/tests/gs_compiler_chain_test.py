@@ -67,6 +67,7 @@ subprocess.run([sys.executable,str(root/'android/tests/nvk_shader_pool_test.py')
 req = json.loads((out/'request.json').read_text())
 assert req['schema'] == 's2a-direct-compile-v2' and [s and s['stage'] for s in req['program']['stages']] == ['vs','fs','gs',None,None]
 dotnet_chain.run(cli, ['compile', '--request', out/'request.json', '--output', out/'compiled'], out)
+dotnet_chain.run(fixtures, ['--emit-live-result', out/'request.json', out/'compiled/program.live'], out)
 cc = ['cc','-std=c11','-Wall','-Wextra','-Werror','-I'+str(root/'android/native'),'-I'+str(root/'android/native/direct'),'-I'+str(root/'android/native/nvn')]
 subprocess.run(cc + [str(root/'android/tests/gs_result_extract.c'),str(root/'android/native/nvn/nvn_vk_program_result.c'),str(root/'android/native/direct/jv.c'),str(root/'android/native/direct/json.c'),'-o',str(out/'parse')], check=True)
 subprocess.run([str(out/'parse'),str(out/'compiled/program.json'),str(out)], check=True)

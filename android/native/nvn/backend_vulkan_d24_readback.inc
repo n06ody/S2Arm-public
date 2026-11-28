@@ -103,7 +103,7 @@ static void d24_readback_copy(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, 
     VkBufferCopy *copies = calloc(row == used_row ? 1 : max_rows, sizeof *copies);
     if (!copies) { set_sticky(c, NVN_GPU_E_OOM, "D24 回读行表分配失败"); return; }
     vkUpdateDescriptorSets(g.d, 2, wr, 0, NULL);
-    image_barrier(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    image_barrier_xfer(c, t, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT_KHR);
     for (uint32_t z = 0; z < ext.depth; z++) for (uint32_t y = 0; y < ext.height;) {
         uint32_t rows = ext.height - y;
         if (rows > max_rows) rows = max_rows;
@@ -120,15 +120,25 @@ static void d24_readback_copy(struct nvn_gpu_cmd_s *c, struct nvn_gpu_tex_s *t, 
         }
         full_barrier(c);   // 重用同一组暂存前，前一组计算与传输均须完成。
         vkCmdCopyImageToBuffer(c->cb, t->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, input.buf->buffer, 1 + stencil, faces);
-        mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        if (g.sync2_on) {
+            mem_barrier2(c, VK_PIPELINE_STAGE_2_COPY_BIT_KHR, VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
+        } else {
+            mem_barrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+        }
         const uint32_t params[] = {ext.width, rows, stencil};
         vkCmdBindPipeline(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_d24_readback.pipe);
         vkCmdBindDescriptorSets(c->cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_d24_readback.layout, 0, 1, &set, 0, NULL);
         vkCmdPushConstants(c->cb, g_d24_readback.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof params, params);
         vkCmdDispatch(c->cb, groups_x, rows, 1);
-        mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        if (g.sync2_on) {
+            mem_barrier2(c, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                         VK_PIPELINE_STAGE_2_COPY_BIT_KHR, VK_ACCESS_2_TRANSFER_READ_BIT_KHR);
+        } else {
+            mem_barrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        }
         const uint64_t base = dst_off + z * plane + y * row;
         const uint32_t count = row == used_row ? 1 : rows;
         for (uint32_t i = 0; i < count; i++)

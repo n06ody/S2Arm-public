@@ -35,10 +35,13 @@ build_test() {
 build_test
 export VK_DRIVER_FILES="$S2A_LAVAPIPE_ICD" VK_LAYER_PATH="$S2A_VK_LAYER_DIR" VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
 export VK_LAYER_ENABLES=VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT
-for arm in default dynamic atomic indirect linear translated reopen; do
+for arm in default dynamic atomic indirect linear translated reopen accounting versioned; do
     timeout 120 "$out/test" "$out/shaders" "$arm" 2>&1 | tee "$out/$arm.log"
     if grep -qE 'Validation Error|VUID-|SYNC-HAZARD-' "$out/$arm.log"; then exit 1; fi
 done
+
+grep -F 'origin=ssbo stage=cs registered=1 window_bytes=3840 prefix_bytes=2544' "$out/accounting.log"
+grep -F 'mirror_bytes=2544' "$out/accounting.log"
 
 # Both mutations must fail on the intended assertion after completing a real dispatch.
 original=${src[1]}

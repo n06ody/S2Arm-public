@@ -17,6 +17,7 @@ void rp_res_reset(void);
 void rp_buf_pool_gone(const void *mem);   // rp_buf.c
 void rp_buf_reset(void);
 void rp_shader_reset(void);            // 着色器来源（核心外）
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <sys/mman.h>   // mincore：池尾之后那段在不在映射里（nvn_be_pool_cover）
@@ -34,9 +35,10 @@ void mtl_init(void) {}
 
 // ---------- 内存池登记：按地址判断「这段在不在某个池里」----------
 enum { RP_NPOOL = 4096 };
-static struct { const uint8_t *mem; uint64_t size; } g_pool[RP_NPOOL];
+static struct { const uint8_t *mem; uint64_t size, storage_size; unsigned flags; } g_pool[RP_NPOOL];
 static uint64_t g_pool_maxend[RP_NPOOL];   // prefix max of pool end addresses (ranges may nest; prunes the walk-back)
 static int g_npool;
+static unsigned g_pool_retiring;
 // 池表按起点升序（插入时挪位）。查找走二分 + 「上次命中的池」快路：
 // 原来三条查找都是「抢全局锁 + 线性扫 4096 项」，而每笔绘制的顶点流解析要调两次；真机（重叠档）读到
 // 「找池取镜像」每帧 20.6–23.0 毫秒 / 5619 次调用（≈4 微秒一次），就是这把锁与这张线性表。
@@ -148,7 +150,7 @@ static int pool_find_fast(pool_tls *const t, uint64_t addr, uint64_t len, const 
     t->fast_hits++;
     return 1;
 }
-void nvn_be_pool_add(const void *mem, uint64_t size) {
+void nvn_be_pool_add_flags(const void *mem, uint64_t size, unsigned flags) {
     if (!mem || !size) return;
     pthread_mutex_lock(&g_mu);
     if (g_npool < RP_NPOOL) {
@@ -156,7 +158,7 @@ void nvn_be_pool_add(const void *mem, uint64_t size) {
         int at = g_npool;
         for (int i = 0; i < g_npool; i++) if ((uint64_t)(uintptr_t)g_pool[i].mem > b) { at = i; break; }
         if (at != g_npool) memmove(&g_pool[at + 1], &g_pool[at], (size_t)(g_npool - at) * sizeof g_pool[0]);
-        g_pool[at] = (__typeof__(g_pool[0])){mem, size};
+        g_pool[at] = (__typeof__(g_pool[0])){mem, size, size, flags};
         g_npool++;
         pool_maxend_recompute();
         __atomic_add_fetch(&g_pool_epoch, 1, __ATOMIC_RELEASE);
@@ -164,6 +166,7 @@ void nvn_be_pool_add(const void *mem, uint64_t size) {
     else { pthread_mutex_unlock(&g_mu); nvn_unimpl("limit", "pool_table_full_4096", mem); return; }
     pthread_mutex_unlock(&g_mu);
 }
+void nvn_be_pool_add(const void *mem, uint64_t size) { nvn_be_pool_add_flags(mem, size, 0); }
 // 池上伸出池尾的缓冲对象（D-6VG6，同 nvn_mtl.m nvn_be_pool_cover）：把这个池在本后端的登记扩到 [mem, mem + need)，越过池尾的访问落在池存储之后同一处内存（真机语义）。
 //   本表注销只删第一个同起点的条目，所以原地加长那一条，不另登记。池尾之后那段须整段映射着（mincore 每页都认），否则不扩、记一笔（读写会 SIGSEGV）
 void nvn_be_pool_cover(const void *mem, uint64_t size, uint64_t need) {
@@ -178,6 +181,7 @@ void nvn_be_pool_cover(const void *mem, uint64_t size, uint64_t need) {
 }
 void nvn_be_pool_del(const void *mem) {
     pthread_mutex_lock(&g_mu);
+    __atomic_add_fetch(&g_pool_retiring, 1, __ATOMIC_RELEASE);
     for (int i = 0; i < g_npool; i++) if (g_pool[i].mem == mem) {
         memmove(&g_pool[i], &g_pool[i + 1], (size_t)(g_npool - i - 1) * sizeof g_pool[0]);
         g_npool--;
@@ -186,6 +190,7 @@ void nvn_be_pool_del(const void *mem) {
         break; }
     pthread_mutex_unlock(&g_mu);
     rp_buf_pool_gone(mem);
+    __atomic_sub_fetch(&g_pool_retiring, 1, __ATOMIC_RELEASE);
 }
 int nvn_be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     const uint8_t *mem = NULL; uint64_t size = 0;
@@ -207,6 +212,56 @@ int rp_pool_find(uint64_t addr, uint64_t len, const uint8_t **mem, uint64_t *siz
     pthread_mutex_unlock(&g_mu);
     return hit;
 }
+static int pool_first_overlap_locked(uint64_t addr) {
+    int lo = 0, hi = g_npool;
+    while (lo < hi) {
+        const int mid = lo + (hi - lo) / 2;
+        if (g_pool_maxend[mid] <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+static int pool_unique_coverage_locked(int i, uint64_t addr, uint64_t end) {
+    if (i == g_npool) return 0;
+    const uint64_t start = (uintptr_t)g_pool[i].mem;
+    return start <= addr && end - start <= g_pool[i].size &&
+           (i + 1 == g_npool || (uintptr_t)g_pool[i + 1].mem >= end);
+}
+// Use the actual guest copy destination. Synthetic runs, ambiguous backing,
+// and bytes outside the storage passed to Initialize carry no pool flag proof.
+unsigned rp_pool_land_flags(const uint8_t *mem, uint64_t off, uint64_t len) {
+    const uint64_t base = (uintptr_t)mem;
+    if (off > UINT64_MAX - base || len > UINT64_MAX - base - off ||
+        pthread_mutex_trylock(&g_mu)) return 0;
+    const uint64_t addr = base + off, end = addr + len;
+    const int i = pool_first_overlap_locked(addr);
+    unsigned flags = 0;
+    if (!__atomic_load_n(&g_pool_retiring, __ATOMIC_ACQUIRE) &&
+        pool_unique_coverage_locked(i, addr, end) && g_pool[i].mem == mem &&
+        end - base <= g_pool[i].storage_size)
+        flags = g_pool[i].flags;
+    pthread_mutex_unlock(&g_mu);
+    return flags;
+}
+// Caller holds the buffer ledger. Pool retirement releases the pool lock before
+// taking the ledger, and remains visible until all lock-free landing copies exit.
+int rp_pool_snapshot_key(uint64_t addr, size_t len, uint64_t *key, uint64_t *epoch) {
+    if (pthread_mutex_trylock(&g_mu)) return EAGAIN;
+    int result = EAGAIN;
+    if (!__atomic_load_n(&g_pool_retiring, __ATOMIC_ACQUIRE)) {
+        const int lo = pool_first_overlap_locked(addr);
+        *epoch = __atomic_load_n(&g_pool_epoch, __ATOMIC_RELAXED);
+        const uint64_t end = addr + len;
+        if (lo == g_npool || (uintptr_t)g_pool[lo].mem >= end) result = ENOSYS;
+        else if (pool_unique_coverage_locked(lo, addr, end)) {
+            *key = (uintptr_t)g_pool[lo].mem;
+            result = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_mu);
+    return result;
+}
+
 // NULL 取池表代际；非空要求整份镜像的后备恰由一个池登记覆盖，含嵌套、同起点池在内的别名都不作证明。
 uint64_t rp_pool_mirror_epoch(const uint8_t *mem, uint64_t size) {
     if (!mem) return __atomic_load_n(&g_pool_epoch, __ATOMIC_ACQUIRE);
@@ -252,14 +307,25 @@ int rp_tex_live_n(void) { pthread_mutex_lock(&g_mu); int n = g_tex_live_inited ?
 void nvn_be_tex_counters(uint64_t *init, uint64_t *rel) { if (init) *init = atomic_load(&g_tex_init_n); if (rel) *rel = atomic_load(&g_tex_rel_n); }
 void nvn_be_tex_tick(uint64_t frame) { (void)frame; }
 int nvn_be_tex_from_gl(void *t, uint32_t gl_name) { (void)t; (void)gl_name; UN("tex_from_gl"); return 0; }
-void nvn_be_xv_window_tex(uint64_t serial) { (void)serial; }   // 跨提交有效性账本随通道规划接
+void nvn_be_xv_window_tex(uint64_t serial) {
+    pthread_mutex_lock(&g_mu);
+    if (g_tex_live_inited && nvn_hm_get(&g_tex_live, &serial))
+        nvn_hm_put(&g_tex_live, &serial, (void *)2);
+    pthread_mutex_unlock(&g_mu);
+}
+int rp_tex_is_window(uint64_t serial) {
+    pthread_mutex_lock(&g_mu);
+    const int window = g_tex_live_inited && nvn_hm_get(&g_tex_live, &serial) == (void *)2;
+    pthread_mutex_unlock(&g_mu);
+    return window;
+}
 
 // ---------- 同步读贴图（ReadTexels） ----------
 // 对齐 iOS（nvn_mtl.m 的 nvn_be_read_texels）：
 // ① 游戏内存里就是内容（随包 / WriteTexels 或刷新写过 / 脏页追踪发现被 CPU 写过）：就地反交织，按调用方给的区域 / 行距 / 片距逐行拷进 dst；
 //    不碰 GPU、不建宿主贴图，任何线程都能调。
 // ② 内容归 GPU（渲染 / 拷贝 / 计算写过）：rt_gpu 从宿主贴图读回（一维 / 二维及其数组 / 立方体 / 三维，NVN_GPU_FMT_READBACK 的格式）。
-// 别的（线性 / 稀疏 / 多重采样 / 缓冲贴图、没人写过的、读回不了的格式）照旧具名记账、不动 dst，不返回假结果。
+// 稀疏虚拟池里的 CPU 采样源按页表读本层本级。线性、多重采样、缓冲或无法归属的内容具名拒绝。
 int nvn_ft_written(const tex_t *t) __attribute__((weak));   // hle_nvn.c：脏页追踪（档案开关在它里面判），命中时它自己记 nvn_be_tex_cpu_written；没有它的构建当「没写过」
 static int tex_content_in_guest_memory(const tex_t *t) {
     if (!t->mem) return 0;
@@ -274,8 +340,8 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     if (!t || !r || !dst) { nvn_unimpl("be", "read_texels_bad_args", __builtin_return_address(0)); return; }
     int bw = 1, bh = 1, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) { nvn_unimpl("fmt", "read_texels_unknown_format", t); return; }
-    // 存储不是块线性的（线性 / 稀疏 / 多重采样 / 缓冲贴图）：反交织管不了，等读回路径
-    if ((t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE)) || t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) { UN("read_texels"); return; }
+    if ((t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) ||
+        t->d.samples > 1 || t->d.target == NVN_TEXTURE_TARGET_BUFFER) { UN("read_texels"); return; }
     // 区域按块折算（x / y 按块宽高除，宽高向上取整到块）。级、层、片、区域、行距、片距任一不成立都拒绝：不读存储之外的字节，
     // 也不写互相覆盖的输出（iOS 不查）。这些检查都是纯的，排在可能改归属的 nvn_ft_written 之前
     uint32_t levels = t->d.levels ? t->d.levels : 1, layers = t->L.layers ? t->L.layers : 1;
@@ -294,20 +360,32 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     size_t ext = 0, ext_all = 0;   // 一片 / 全部输出占的字节范围：行距 / 片距得容得下一行 / 一片，且这个范围本身不回绕
     if (row < wb || __builtin_mul_overflow(hb - 1, row, &ext) || __builtin_add_overflow(ext, wb, &ext) ||
         (nz > 1 && (img < ext || __builtin_mul_overflow((size_t)(nz - 1), img, &ext_all) || __builtin_add_overflow(ext_all, ext, &ext_all)))) { nvn_unimpl("be", "read_texels_bad_stride", t); return; }
-    if (!tex_content_in_guest_memory(t)) {
-        if (nvn_be_tex_gpu_owned(t->serial)) rt_gpu(t, level, is3d ? (uint32_t)zoff : (uint32_t)(layer0 + zoff), (uint32_t)nz, r, wb, hb, bw, bh, lw, lh, dst, row, img);
+    const int virtual_pool = t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL);
+    const int gpu_owned = nvn_be_tex_gpu_owned(t->serial);
+    const int paged = virtual_pool && !gpu_owned && rp_tex_sparse_cpu(t);
+    if (!paged && (virtual_pool || !tex_content_in_guest_memory(t))) {
+        if (gpu_owned) rt_gpu(t, level, is3d ? (uint32_t)zoff : (uint32_t)(layer0 + zoff), (uint32_t)nz, r, wb, hb, bw, bh, lw, lh, dst, row, img);
         else UN("read_texels");   // 游戏内存里没有内容、GPU 也没写过：内容未定义，不猜
         return;
     }
     uint64_t need = 0;   // 一级（三维：整个体积）线性化后的字节数
     if (__builtin_mul_overflow((uint64_t)lp, (uint64_t)lr, &need) || (is3d && __builtin_mul_overflow(need, (uint64_t)ld, &need)) || need > SIZE_MAX) need = 0;
+    if (paged && (!need || need > (256u << 20))) { nvn_unimpl("oom", "read_texels_sparse_level", t); return; }
     uint8_t *lin = need ? malloc((size_t)need) : NULL;
     if (!lin) { nvn_unimpl("limit", "read_texels_alloc", t); return; }
-    uint8_t *part = NULL; const uint8_t *store = rp_tex_src(t, &part);   // 存储伸出内存池时池外按 0，不越界读（rp_res.c）
-    if (!store) { nvn_unimpl("limit", "read_texels_alloc", t); free(lin); return; }
+    uint8_t *part = NULL;
+    const uint8_t *store = paged ? NULL : rp_tex_src(t, &part);
+    if (!paged && !store) { nvn_unimpl("limit", "read_texels_alloc", t); free(lin); return; }
     for (uint64_t z = 0; z < nz; z++) {
         if (!is3d || z == 0) {   // 二维 / 数组：一层一解；三维：一次解整级体积，各片都从这块里取
-            if (nvn_deswizzle(&t->d, level, is3d ? 0 : (unsigned)(layer0 + zoff + z), store, lin, (size_t)lp)) { nvn_unimpl("tex", "deswizzle_failed", t); free(lin); free(part); return; }
+            const unsigned layer = is3d ? 0 : (unsigned)(layer0 + zoff + z);
+            const int bad = paged ? rp_tex_deswizzle_sparse_level(t, level, layer, lin, (size_t)lp)
+                                  : nvn_deswizzle(&t->d, level, layer, store, lin, (size_t)lp);
+            if (bad) {
+                if (bad == NVN_GPU_E_OOM) nvn_unimpl("oom", "read_texels_sparse_level", t);
+                else nvn_unimpl("tex", "deswizzle_failed", t);
+                free(lin); free(part); return;
+            }
         }
         const uint8_t *src = lin + (is3d ? (size_t)((zoff + z) * lp * lr) : 0);
         for (uint64_t y = 0; y < hb; y++) memcpy(dst + (size_t)z * img + (size_t)y * row, src + (y0 + y) * lp + x0, (size_t)wb);
@@ -319,8 +397,8 @@ void nvn_be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
 void nvn_be_prog_release(prog_t *p) { (void)p; }               // 还没有按程序的管线缓存：没有东西要释放
 void nvn_be_shader_prefetch(const uint8_t key[8]) { (void)key; }   // 预取是提速手段，不影响正确性；着色器链接上后再接
 void nvn_be_pair_prefetch(const uint8_t (*keys)[8], int n) { (void)keys; (void)n; }   // 同上：提速手段
-// 1 = 超过 1,024 条的间接计数多绘整段录一条 OP_MULTI_DRAW（rp_multi_draw 一次交后端）；设备没开 drawIndirectCount 时仍逐条录（rp_draw 报名跳过）
-int nvn_be_multi_draw_range(void) { nvn_gpu_caps caps; nvn_gpu_caps_get(&caps); return (caps.caps & NVN_GPU_CAP_INDIRECT_COUNT) != 0; }
+// 前端始终保留大组；回放时再按设备和参数选择原生计数或准备间接参数。
+int nvn_be_multi_draw_range(void) { return 1; }
 int nvn_be_buf_extent_consumer(void) { return 0; }             // 新回放按绑定范围和池镜像解析，未查询前端的活缓冲表
 
 // ---------- 全局状态 ----------

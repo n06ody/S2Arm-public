@@ -3,6 +3,7 @@
 // 「GPU 完成后才可见」的 CPU 副作用（事件值、计数器）挂在本段的完成回调里做。
 #include "rp_exec.h"
 #include "rp_state.h"
+#include "rp_shader.h"
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_plat.h"
@@ -17,6 +18,8 @@
 
 void nvn_hle_queue_enter(void *q);   // hle_nvn.c
 void nvn_hle_piece_begun(void);
+// 弱链接[replay]：rp_pass_discard_hint
+#pragma weak rp_pass_discard_hint
 int s2a_guest_tick_from_host_ns(uint64_t host_ns, uint64_t *out);
 uint64_t s2a_guest_tick(void);       // 运行时：游戏的系统计数器（与游戏自己读到的同一个钟）
 
@@ -31,19 +34,24 @@ static const char *const k_op_name[OP_NVN2_END_] = {
     OPN(OP_RESET_COUNTER), OPN(OP_CLEAR_TEX), OPN(OP_CLEAR_BUF), OPN(OP_DEPTH_CLAMP), OPN(OP_RENDER_COND), OPN(OP_FENCE_SYNC),
     OPN(OP_TF_BIND), OPN(OP_TF_STATE), OPN(OP_RAST_DISCARD), OPN(OP_VP_SWIZZLE), OPN(OP_BIND_TEX1), OPN(OP_PRIM_RESTART), OPN(OP_SET_PATCH_SIZE),
     OPN(OP_DRAW_TEX), OPN(OP_WAIT_SYNC), OPN(OP_ALPHA_REF),
-    OPN(OP_PUSH_CONST), OPN(OP_DLSS), OPN(OP_PUSH_CONST_PTR), OPN(OP_MULTI_DRAW),
+    OPN(OP_PUSH_CONST), OPN(OP_DLSS), OPN(OP_PUSH_CONST_PTR), OPN(OP_MULTI_DRAW), OPN(OP_SET_PROVOKING_VERTEX), OPN(OP_SAMPLE_MASK), OPN(OP_DISCARD_COLOR), OPN(OP_DISCARD_DS),
 };
 #undef OPN
 // 加了新命令这里就红：名字表、接线表（docs/直连_Vulkan回放接线表.tsv）、nvn_be_exec 三处同批补。
-_Static_assert(OP_COUNT_ == 52 && OP_NVN2_END_ == 56, "录制命令个数变了：补 k_op_name、接线表和 nvn_be_exec");
+_Static_assert(OP_COUNT_ == 52 && OP_NVN2_END_ == 60, "录制命令个数变了：补 k_op_name、接线表和 nvn_be_exec");
 const char *rp_op_name(uint32_t op) { return op < OP_NVN2_END_ && k_op_name[op] ? k_op_name[op] : "OP_?"; }
+
+static uint64_t g_lookahead_stops[RP_LOOKAHEAD_STOP_COUNT][OP_NVN2_END_ + 1];
 
 // ---------- 提交 ----------
 // 固定地址的段属结果：mid 回调不能碰仍会 realloc 的 post 表。最后一段回调后统一回收。
 struct ts_segment { struct ts_segment *next; uint32_t count; nvn_gpu_timestamp_result values[NVN_GPU_TIMESTAMP_SLOTS]; };
 struct post { volatile uint32_t *val; uint32_t mode, v; uint64_t report; uint32_t type; struct ts_segment *ts; uint32_t slot; };   // 完成后写事件值（mode 0 写 / 1 加）；report 非 0 = 计数器报告的写回地址
 struct occ_ev { uint32_t pos; uint32_t report; uint64_t addr; };   // 遮挡计数的事件：发生时本段已经开过 pos 个槽；report 0 = 复位、1 = 报告（写回 addr）
-struct gw_ev { uint64_t pool_key, id, readback_plus_one; };   // 本段里 GPU 写进池的一段（rp_buf_gpu_write_note 的登记）
+struct gw_ev {
+    uint64_t pool_key, id;
+    uint64_t readback_plus_one[RP_GPU_WRITE_COPY_MAX];   // 0 = 这一片从镜像回写
+};
 struct sub { struct ts_segment *ts_head, *ts_current; uint32_t refs; /* 录制者/末段回调持一引用，每个 mid 回调另持一引用。 */
              struct post *p; int n, cap, nfx; /* nfx：p 里时间戳报告以外的条数 */ uint64_t t_commit; struct occ_ev *oe; int noe, oecap; uint64_t fence; struct gw_ev *gw; int ngw, gwcap; uint64_t readback_bytes;
     uint64_t *oc; uint32_t noc, occ_base; };   // oc：中途交过段的提交，各段的遮挡槽结果按整次提交的槽号攒在这里（没拆过为 NULL）；occ_base：最后一段的第一个槽号
@@ -58,7 +66,14 @@ static uint64_t now_ns(void) { return s2a_rp_test_clock_ns(); }
 static uint64_t now_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
 #endif
 static uint64_t g_pf[RP_PERF_N];
-void rp_perf_take(uint64_t out[RP_PERF_N]) { for (int i = 0; i < RP_PERF_N; i++) out[i] = __atomic_exchange_n(&g_pf[i], 0, __ATOMIC_ACQ_REL); }
+void rp_perf_take(uint64_t out[RP_PERF_N]) {
+    for (int i = 0; i < RP_PERF_N; i++) out[i] = __atomic_exchange_n(&g_pf[i], 0, __ATOMIC_ACQ_REL);
+    // 在窗口边界加回分因，保留原有回退总数，每次同步只记一个计数。
+    out[RP_PERF_MIRROR_FALLBACK] += out[RP_PERF_MIRROR_FB_GW] + out[RP_PERF_MIRROR_FB_LAND] +
+        out[RP_PERF_MIRROR_FB_OVERFLOW] + out[RP_PERF_MIRROR_FB_UNKNOWN] + out[RP_PERF_MIRROR_FB_OTHER];
+    for (int i = RP_PERF_DC_FIRST_COLD; i <= RP_PERF_DC_FIRST_RECORD; i++) out[RP_PERF_DC_FIRST_ENCODE] += out[i];
+    for (int i = RP_PERF_DC_VTX_STREAM; i <= RP_PERF_DC_FIRST_ENCODE; i++) out[RP_PERF_DC_SCOPE] += out[i];
+}
 static void pf_add(int i, uint64_t v) { __atomic_fetch_add(&g_pf[i], v, __ATOMIC_RELAXED); }
 
 // ---------- 逐帧分项账（长帧归因，开关 nvk_hitch_log） ----------
@@ -149,7 +164,17 @@ int nvn_cmd_call_resolve(uint64_t h, uint64_t *to);   // hle_nvn.c：CALL 目标
 static void red(const char *fmt, const char *why) { char b[512]; snprintf(b, sizeof b, fmt, why); nvn_plat_log(NVN_PLAT_LOG_RED, "replay", b); }
 // 弱链接[replay]：rp_res_byte_upload_failed
 #pragma weak rp_res_byte_upload_failed
+// 弱链接[replay]：rp_tex_upload_diag_enabled
+// 弱链接[replay]：rp_tex_upload_diag_submit
+// 弱链接[replay]：rp_tex_upload_diag_done
+#pragma weak rp_tex_upload_diag_enabled
+#pragma weak rp_tex_upload_diag_submit
+#pragma weak rp_tex_upload_diag_done
+static inline int tex_upload_diag_enabled(void) {
+    return &rp_tex_upload_diag_enabled && __atomic_load_n(&rp_tex_upload_diag_enabled, __ATOMIC_RELAXED);
+}
 static void pre_done(void *user, const nvn_gpu_done *d) {
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_done) rp_tex_upload_diag_done(d);
     struct pre_note *p = user;
     if (d->status == NVN_GPU_DONE_FAILED) {
         if (rp_res_byte_upload_failed) rp_res_byte_upload_failed();
@@ -163,12 +188,19 @@ static void pre_done(void *user, const nvn_gpu_done *d) {
 // 前提是「同步的内容对本次提交里每个使用点都成立」：回放发生在游戏提交之后，游戏对池内存的写在提交前已经做完，这个前提成立；
 // 例外是同一资源在本次提交里已经同步过又变了（命令流里按序的写、别的线程正在写下一帧）：那一次必须排在已录的绘制之后，
 // 于是结束当前通道、录进主段（通道在下一笔绘制时重开）。last_sub：该资源上次同步所在的提交序号，由调用方持有。
+// 弱链接[replay]：rp_pass_end_xfer
+#pragma weak rp_pass_end_xfer
 nvn_gpu_cmd rp_xfer_cmd(uint64_t *last_sub) {
     if (!g_cmd) return NULL;
-    if (*last_sub == g_sub_serial) { if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1); rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; }
+    if (*last_sub == g_sub_serial) {
+        if (rp_pass_is_open()) pf_add(RP_PERF_P_CUT_XFER, 1);
+        if (rp_pass_end_xfer) rp_pass_end_xfer(g_cmd); else rp_pass_end(g_cmd);
+        rp_gpu_wr_gen++;
+        return g_cmd;
+    }
     *last_sub = g_sub_serial;
     if (!g_pre) { nvn_gpu_err err = {0}; nvn_gpu_cmd_desc d = {0, "nvn submit pre"};
-        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; } }
+        if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_pre, &err))) { g_pre = NULL; if (rp_pass_end_xfer) rp_pass_end_xfer(g_cmd); else rp_pass_end(g_cmd); rp_gpu_wr_gen++; return g_cmd; } }
     return g_pre;
 }
 
@@ -188,32 +220,61 @@ int nvn_gpu_readback_enabled(void) __attribute__((weak));
 int nvn_gpu_readback_cmd_enabled(nvn_gpu_cmd c) __attribute__((weak));
 // 弱链接[replay]：nvn_gpu_readback_record
 uint64_t nvn_gpu_readback_record(nvn_gpu_cmd c, nvn_gpu_readback_span *spans, uint32_t count) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_visibility_enabled
+int nvn_gpu_mirror_visibility_enabled(void) __attribute__((weak));
+// 弱链接[replay]：nvn_gpu_mirror_visibility_record
+void nvn_gpu_mirror_visibility_record(nvn_gpu_cmd c, const nvn_gpu_readback_span *spans, uint32_t count) __attribute__((weak));
 
 static int compare_write_ref(const void *a, const void *b) {
     const struct rp_gpu_write_ref *x = a, *y = b;
     if (x->pool_key != y->pool_key) return x->pool_key < y->pool_key ? -1 : 1;
     return (x->id > y->id) - (x->id < y->id);
 }
+// 弱链接[replay]：rp_buf_land_guard_active
+// 弱链接[replay]：rp_buf_land_seal
+// 弱链接[replay]：rp_buf_gpu_write_note_tagged
+int rp_buf_land_guard_active(void) __attribute__((weak));
+void rp_buf_land_seal(const struct rp_gpu_write_ref *, uint32_t, uint64_t) __attribute__((weak));
+uint64_t rp_buf_gpu_write_note_tagged(uint64_t, uint64_t, uint64_t, uint64_t *, int *,
+                                     enum rp_land_origin, unsigned) __attribute__((weak));
+
 static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
-    if (!s || !s->ngw || !nvn_gpu_readback_record) return;
-    if (nvn_gpu_readback_cmd_enabled ? !nvn_gpu_readback_cmd_enabled(c) :
-        (!nvn_gpu_readback_enabled || !nvn_gpu_readback_enabled())) return;
+    if (!s || !s->ngw) return;
+    const int visibility = nvn_gpu_mirror_visibility_record && nvn_gpu_mirror_visibility_enabled &&
+                           nvn_gpu_mirror_visibility_enabled();
+    const int staging = nvn_gpu_readback_record && (nvn_gpu_readback_cmd_enabled ?
+                        nvn_gpu_readback_cmd_enabled(c) : nvn_gpu_readback_enabled && nvn_gpu_readback_enabled());
+    const int guard = rp_buf_land_guard_active && rp_buf_land_seal && rp_buf_land_guard_active();
+    if (!visibility && !staging && !guard) return;
     const uint32_t count = (uint32_t)s->ngw;
+    if (count > UINT32_MAX / RP_GPU_WRITE_COPY_MAX) {
+        if (visibility) nvn_gpu_mirror_visibility_record(c, NULL, count);
+        return;
+    }
+    const uint32_t slots = count * RP_GPU_WRITE_COPY_MAX;
     struct rp_gpu_write_ref local_refs[16];
-    nvn_gpu_readback_span local_spans[16] = {0};
+    nvn_gpu_readback_span local_spans[16 * RP_GPU_WRITE_COPY_MAX] = {0};
     struct rp_gpu_write_ref *refs = count <= 16 ? local_refs : calloc(count, sizeof *refs);
-    nvn_gpu_readback_span *spans = count <= 16 ? local_spans : calloc(count, sizeof *spans);
-    if (!refs || !spans) red("%s", "回写暂存：复制表分配失败，使用镜像回写");
+    nvn_gpu_readback_span *spans = !visibility && !staging ? NULL : count <= 16 ? local_spans : calloc(slots, sizeof *spans);
+    if (!refs || ((visibility || staging) && !spans)) {
+        if (visibility) nvn_gpu_mirror_visibility_record(c, NULL, count);
+        else red("%s", "回写暂存：复制表分配失败，使用镜像回写");
+    }
     else {
         for (uint32_t i = 0; i < count; i++)
             refs[i] = (struct rp_gpu_write_ref){s->gw[i].pool_key, s->gw[i].id, i};
         qsort(refs, count, sizeof *refs, compare_write_ref);
-        rp_buf_gpu_write_snapshot(refs, count, spans);
-        s->readback_bytes = nvn_gpu_readback_record(c, spans, count);
+        if (guard) rp_buf_land_seal(refs, count, s->fence);
+        if (spans) rp_buf_gpu_write_snapshot(refs, count, spans);
+        if (visibility) nvn_gpu_mirror_visibility_record(c, spans, slots);
+        if (staging) s->readback_bytes = nvn_gpu_readback_record(c, spans, slots);
         if (s->readback_bytes)
-            for (uint32_t i = 0; i < count; i++)
-                if (spans[i].src && spans[i].readback_offset != UINT64_MAX)
-                    s->gw[i].readback_plus_one = spans[i].readback_offset + 1;
+            for (uint32_t i = 0; i < count; i++) {
+                const nvn_gpu_readback_span *group = spans + i * RP_GPU_WRITE_COPY_MAX;
+                for (unsigned j = 0; j < RP_GPU_WRITE_COPY_MAX && group[j].src; j++)
+                    if (group[j].readback_offset != UINT64_MAX)
+                        s->gw[i].readback_plus_one[j] = group[j].readback_offset + 1;
+            }
     }
     if (spans != local_spans) free(spans);
     if (refs != local_refs) free(refs);
@@ -221,6 +282,7 @@ static void sub_record_readback(struct sub *s, nvn_gpu_cmd c) {
 
 static void sub_release(struct sub *s);
 static void sub_done(void *user, const nvn_gpu_done *d) {
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_done) rp_tex_upload_diag_done(d);
     if (d->status == NVN_GPU_DONE_FAILED && rp_res_byte_upload_failed) rp_res_byte_upload_failed();
     struct sub *s = user;
     if (!s) return;
@@ -240,11 +302,9 @@ static void sub_done(void *user, const nvn_gpu_done *d) {
     if (s->t_commit) { pf_add(RP_PERF_DONE_NS, t_done - s->t_commit); pf_add(RP_PERF_DONE_N, 1); }
     if (d->status != NVN_GPU_DONE_FAILED) busy_done(s->t_commit, t_done);   // 失败段没执行：不算显卡忙
     // 先落 GPU 写，再发布事件和完成序号：等待事件的 CPU 不能先看见旧内存。
-    const int executed = d->status != NVN_GPU_DONE_FAILED;
     for (int i = 0; i < s->ngw; i++) {
         const struct gw_ev *w = &s->gw[i];
-        const uint8_t *staged = executed && w->readback_plus_one ? d->readback + (w->readback_plus_one - 1) : NULL;
-        rp_buf_gpu_write_land_from(w->pool_key, w->id, executed, staged);
+        rp_buf_gpu_write_land_from(w->pool_key, w->id, d->status, d->readback, w->readback_plus_one);
     }
     if (d->status != NVN_GPU_DONE_FAILED)   // 没执行的段不做任何成功回写
         for (int i = 0; i < s->n; i++) {
@@ -392,10 +452,17 @@ int rp_cold_submit_scope(nvn_gpu_cmd cmd, nvn_gpu_cmd *pre) {
     return 1;
 }
 
+int rp_discard_submit_reject(nvn_gpu_cmd cmd) {
+    if (!g_sub || !cmd || cmd != g_cmd) return RP_PERF_DC_NON_PRIMARY;
+    if (g_rc_active || g_occ_counting || g_occ_seg) return RP_PERF_DC_COND_QUERY;
+    return 0;
+}
+
 void rp_exec_reset(void) {   // 会话收尾：遮挡计数与条件渲染的账清掉
     __atomic_store_n(&g_bad_readback_fence, 0, __ATOMIC_RELEASE);
     g_occ_used = g_occ_counting = g_occ_seg = g_occ_pass = 0; g_occ_cur = -1; g_occ_next = 0; g_occ_acc = 0;
     g_rc_skip = g_rc_active = 0; g_rc_npend = g_rc_nsub = 0; if (g_rc_occ) memset(g_rc_occ, 0, (size_t)g_rc_ocap * 8); g_rc_on = 0;
+    memset(g_lookahead_stops, 0, sizeof g_lookahead_stops);
 }
 
 void nvn_be_sub_begin(void) {
@@ -412,6 +479,7 @@ void nvn_be_sub_begin(void) {
 
 struct mid { struct ts_segment *ts; struct sub *s; uint32_t base; uint8_t counted; uint64_t t_commit; };   // counted：这次中途段持 s 的引用（完成回调里释放）；t_commit：提交时刻（算 GPU 忙）
 static void mid_done(void *user, const nvn_gpu_done *d) {   // 中途交的段完成：遮挡槽的结果先攒进所属提交（它的最后一段还没完成：段按提交顺序完成）
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_done) rp_tex_upload_diag_done(d);
     struct mid *m = user;
     if (m) ts_capture(m->ts, d);
     if (d->status == NVN_GPU_DONE_FAILED) {
@@ -466,7 +534,9 @@ static void submit_pre(nvn_gpu_err *err) {
     if (!g_pre) return;
     nvn_gpu_cmd pc = g_pre;
     g_pre = NULL;
-    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, g_fence + ++g_mid, pre_done, pre_note_make(), err))) {
+    const uint64_t f = g_fence + ++g_mid;
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_submit) rp_tex_upload_diag_submit(pc, f);
+    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(pc, f, pre_done, pre_note_make(), err))) {
         rp_res_xfer_aborted(g_sub_serial);
         red("前置段提交失败：%s", err->why);
     }
@@ -484,13 +554,27 @@ static void seg_cut(int next_occ) {
     if (g_occ_seg && !g_sub->oc) g_sub->oc = calloc(2048, sizeof *g_sub->oc);
     __atomic_add_fetch(&g_sub->refs, 1, __ATOMIC_ACQ_REL); m->counted = 1;
     g_sub->ts_current = NULL;
-    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, g_fence + ++g_mid, mid_done, m, &err))) red("中途交段失败：%s", err.why);
+    const uint64_t f = g_fence + ++g_mid;
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_submit) rp_tex_upload_diag_submit(c, f);
+    if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, mid_done, m, &err))) red("中途交段失败：%s", err.why);
     pf_add(RP_PERF_SUBS, 1);
     g_occ_base = g_occ_next; g_occ_cur = -1; g_seg_serial++;
     g_occ_seg = next_occ;
     nvn_gpu_cmd_desc d = {g_occ_seg ? OCC_SLOTS : 0, "nvn submit"};
     if (!nvn_gpu_ok(nvn_gpu_cmd_begin(&d, &g_cmd, &err))) { g_cmd = NULL; red("中途交段后开新段失败：%s", err.why); }
     rp_dirty_all();
+}
+
+// 慢路径先把读回拷贝录在当前段，通过回放器自己的段和栅栏提交。返回新段，不再用旧命令。
+int rp_mdi_checkpoint(nvn_gpu_cmd *cmd) {
+    if (!cmd || !g_cmd || *cmd != g_cmd || !g_sub || rp_pass_is_open() ||
+        g_mid + 1 + (g_pre != NULL) >= SUB_STEP) return 0;
+    const uint64_t before = g_seg_serial;
+    seg_cut(g_occ_seg);
+    *cmd = g_cmd;
+    nvn_gpu_err err = {0};
+    return g_seg_serial != before && g_cmd &&
+        nvn_gpu_ok(nvn_gpu_fence_wait(g_fence + g_mid, 5000000000ull, &err));
 }
 
 static uint64_t sub_commit_body(void);
@@ -505,6 +589,7 @@ static uint64_t sub_commit_body(void) {
     if (!g_cmd) {   // 没有段（开段失败，或中途交段之后开新段失败）：副作用无处挂，按失败丢弃（不写假成功）
         if (s) sub_orphan(s);
         if (g_pre) {
+            if (tex_upload_diag_enabled() && rp_tex_upload_diag_submit) rp_tex_upload_diag_submit(g_pre, 0);
             nvn_gpu_cmd_abort(g_pre);
             g_pre = NULL;
             rp_res_xfer_aborted(g_sub_serial);
@@ -534,6 +619,7 @@ static uint64_t sub_commit_body(void) {
     if (s && (s->n || s->noe || s->ngw)) { pf_add(RP_PERF_FX_SUBS, 1); pf_add(RP_PERF_FX_OCC, (uint64_t)s->noe); pf_add(RP_PERF_FX_GW, (uint64_t)s->ngw); }   // 这次提交做完时有东西要写回游戏内存（事件、计数器报告、遮挡结果、GPU 写的缓冲）
     rc_commit(f);
     sub_record_readback(s, c);
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_submit) rp_tex_upload_diag_submit(c, f);
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, sub_done, s, &err))) red("提交失败：%s", err.why);
     pf_add(RP_PERF_COMMIT_NS, now_ns() - t0); pf_add(RP_PERF_SUBS, 1);
     g_fence = f;
@@ -554,6 +640,7 @@ uint64_t nvn_be_last_fence(void) { return g_fence; }
 static _Thread_local int g_in_submit;   // 本线程正在 nvn_be_submit 里（持着提交锁）
 int rp_in_submit(void) { return g_in_submit; }
 static void side_done(void *user, const nvn_gpu_done *d) {
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_done) rp_tex_upload_diag_done(d);
     const uint64_t f = (uint64_t)(uintptr_t)user;
     if (d->status == NVN_GPU_DONE_FAILED) { red("旁路段失败：%s", d->why ? d->why : "?"); return; }
     uint64_t done = __atomic_load_n(&g_done_fence, __ATOMIC_RELAXED); if (f > done) __atomic_store_n(&g_done_fence, f, __ATOMIC_RELEASE);
@@ -569,6 +656,7 @@ uint64_t rp_side_commit(nvn_gpu_cmd c) {
     const uint64_t f = g_fence + SUB_STEP;
     nvn_gpu_err err = {0};
     g_fence = f;   // 先推进：提交失败时后端也已按这个值记了失败段，下一次提交必须取更大的值
+    if (tex_upload_diag_enabled() && rp_tex_upload_diag_submit) rp_tex_upload_diag_submit(c, f);
     if (!nvn_gpu_ok(nvn_gpu_cmd_commit(c, f, side_done, (void *)(uintptr_t)f, &err))) { red("旁路段提交失败：%s", err.why); return 0; }
     return f;
 }
@@ -664,7 +752,8 @@ static void post_event(volatile uint32_t *val, uint32_t mode, uint32_t v) {
 // 仅登记真正写到的行，不把行间 / 片间填充覆盖回游戏内存。
 // 数据相关重叠（nvk_sync_lag=4）：这一栅栏之后是否有「显卡会写游戏缓冲」的活。有 → 真等（游戏接下来要读它）；
 // 没有（只画不写）→ 放行，让 CPU 回放与显卡执行重叠。计算派发写存储缓冲 / 存储图像时走 rp_post_gpu_write* 登记，这里就是信号源。
-static int post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t copy_bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
+int rp_post_gpu_write_tagged(uint64_t addr, uint64_t bytes, uint64_t copy_bytes, uint64_t row, uint64_t image,
+                             uint32_t rows, uint32_t images, enum rp_land_origin origin, unsigned stage) {
     __atomic_store_n(&g_wrote_since_wait, 1, __ATOMIC_RELEASE);
     struct sub *s = g_sub; uint64_t count = (uint64_t)rows * images;
     if (!s || !bytes || !count || count > (uint64_t)(INT_MAX - s->ngw)) return 0;
@@ -681,7 +770,12 @@ static int post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t copy_byte
     // 只有单笔（存储缓冲写）才允许并进本次提交里已有的登记：多行的失败回滚只能撤掉「这一次新记的」，已有那条被扩大后缩不回去
     // （扩出去的字节从没被显卡写过，落地会拿镜像里可能偏旧的内容盖掉游戏内存）。
     for (uint32_t z = 0; z < images; z++) for (uint32_t y = 0; y < rows; y++) {
-        int merged = 0; uint64_t key = 0, id = rp_buf_gpu_write_note_prefix(addr + (uint64_t)z * image + (uint64_t)y * row, bytes, copy_bytes, &key, count == 1 ? &merged : NULL);
+        int merged = 0;
+        uint64_t key = 0, start_addr = addr + (uint64_t)z * image + (uint64_t)y * row;
+        int *may_merge = count == 1 ? &merged : NULL;
+        uint64_t id = rp_buf_gpu_write_note_tagged ?
+            rp_buf_gpu_write_note_tagged(start_addr, bytes, copy_bytes, &key, may_merge, origin, stage) :
+            rp_buf_gpu_write_note_prefix(start_addr, bytes, copy_bytes, &key, may_merge);
         if (!id) {
             while (s->ngw > start) { struct gw_ev v = s->gw[--s->ngw]; rp_buf_gpu_write_land(v.pool_key, v.id, 0); }
             return 0;
@@ -692,10 +786,10 @@ static int post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t copy_byte
     return 1;
 }
 int rp_post_gpu_write_rows(uint64_t addr, uint64_t bytes, uint64_t row, uint64_t image, uint32_t rows, uint32_t images) {
-    return post_gpu_write_rows(addr, bytes, bytes, row, image, rows, images);
+    return rp_post_gpu_write_tagged(addr, bytes, bytes, row, image, rows, images, RP_LAND_UNKNOWN, 0);
 }
 int rp_post_gpu_write_prefix(uint64_t addr, uint64_t len, uint64_t copy_len) {
-    return post_gpu_write_rows(addr, len, copy_len, len, len, 1, 1);
+    return rp_post_gpu_write_tagged(addr, len, copy_len, len, len, 1, 1, RP_LAND_UNKNOWN, 0);
 }
 int rp_post_gpu_write(uint64_t addr, uint64_t len) { return rp_post_gpu_write_rows(addr, len, len, len, 1, 1); }
 
@@ -727,11 +821,245 @@ static void post_report(uint64_t addr, uint32_t type) {
     s->p[s->n++] = p; if (type != NVN_COUNTER_TYPE_TIMESTAMP && type != NVN_COUNTER_TYPE_TIMESTAMP_TOP) s->nfx++; pf_add(RP_PERF_FX_REPORT, 1); __atomic_fetch_or(&g_fx_types, 1ull << (type & 63), __ATOMIC_RELAXED);
 }
 
-void nvn_be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }     // 存储前瞻索引：通道规划接上时再建
 void nvn_be_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // ---------- 主循环 ----------
 static int rec_bad(op_hdr h) { return h.size < 8 || (h.size & 7) || h.op >= OP_NVN2_END_ || h.op == OP_BEGIN; }
+
+// 弱链接[replay]：rp_shader_lookahead_budget
+#pragma weak rp_shader_lookahead_budget
+// 弱链接[replay]：rp_shader_lookahead
+#pragma weak rp_shader_lookahead
+// 弱链接[replay]：rp_shader_lookahead_end
+#pragma weak rp_shader_lookahead_end
+
+static void lookahead_note(enum rp_lookahead_stop reason, uint32_t op, int terminal) {
+    static const char *const names[RP_LOOKAHEAD_STOP_COUNT] = {
+        [RP_LOOKAHEAD_COMMAND] = "command", [RP_LOOKAHEAD_RECORD] = "record",
+        [RP_LOOKAHEAD_SCAN_LIMIT] = "scan_limit", [RP_LOOKAHEAD_SUBMIT_STATE] = "submit_state",
+        [RP_LOOKAHEAD_JUMP_CYCLE] = "jump_cycle",
+        [RP_LOOKAHEAD_DEFERRED_BINDING] = "deferred_binding",
+        [RP_LOOKAHEAD_TARGET] = "target", [RP_LOOKAHEAD_DRAW] = "draw",
+        [RP_LOOKAHEAD_TEX_POOL] = "tex_pool", [RP_LOOKAHEAD_PROGRAM] = "program",
+        [RP_LOOKAHEAD_DYNAMIC_UBO] = "dynamic_ubo", [RP_LOOKAHEAD_RESOURCE] = "resource",
+        [RP_LOOKAHEAD_CONTEXT] = "context", [RP_LOOKAHEAD_IDENTITY] = "identity",
+        [RP_LOOKAHEAD_DESCRIPTOR_CHANGED] = "descriptor_changed", [RP_LOOKAHEAD_SNAPSHOT] = "snapshot",
+        [RP_LOOKAHEAD_REQUEST] = "request", [RP_LOOKAHEAD_QUEUE] = "queue",
+    };
+    const uint32_t bucket = op < OP_NVN2_END_ ? op : OP_NVN2_END_;
+    const uint64_t count = ++g_lookahead_stops[reason][bucket];
+    // 每笔提交只记首个略过候选与首退；同类首笔立刻可见，重复时在 2 的幂次打印累计值。
+    if (count & (count - 1)) return;
+    char line[160];
+    snprintf(line, sizeof line, "前瞻%s reason=%s opcode=%s op=%u count=%llu",
+             terminal ? "首退" : "候选略过", names[reason],
+             op == UINT32_MAX ? "none" : rp_op_name(op), (unsigned)op, (unsigned long long)count);
+    nvn_plat_log(NVN_PLAT_LOG_INFO, "shader", line);
+}
+
+// Decode only the draw fields that reach shader selection. Indirect counts and
+// index/vertex data belong to real execution, including the multi-draw count.
+static int lookahead_draw_prim(const struct rp_state *state, uint32_t op, const void *payload,
+                               uint32_t size, uint32_t *shader_prim) {
+    const size_t bytes = size - sizeof(op_hdr);
+    uint32_t prim;
+    int indexed, itype = -1, indirect;
+    if (op == OP_DRAW) {
+        p_draw tmp;
+        if (bytes != offsetof(p_draw, ind) && bytes != sizeof(p_draw)) return -1;
+        const p_draw *d = draw_rec(payload, size, &tmp);
+        if (d->tfc || (!d->ind && d->count <= 0)) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = 0;
+        indirect = d->ind != 0;
+    } else if (op == OP_DRAW_IDX) {
+        p_draw_idx tmp;
+        if (bytes != sizeof(p_draw_idx_single) && bytes != offsetof(p_draw_idx, ind) &&
+            bytes != sizeof(p_draw_idx)) return -1;
+        const p_draw_idx *d = draw_idx_rec(payload, size, &tmp);
+        if (!d->ind && d->count <= 0) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = 1;
+        itype = d->itype;
+        indirect = d->ind != 0;
+    } else {
+        if (bytes < sizeof(p_multi_draw)) return -1;
+        const p_multi_draw *d = payload;
+        if (!d->ind || d->max <= 0 || d->stride <= 0) return 0;
+        prim = (uint32_t)d->prim;
+        indexed = d->itype >= 0;
+        itype = d->itype;
+        indirect = 1;
+    }
+    const int gs = state->bser[2] != 0;
+    if (state->tf_on || prim > NVN_DRAW_PRIMITIVE_PATCHES ||
+        (indexed && (itype < 0 || itype > 2))) return 0;
+    *shader_prim = rp_draw_shader_prim(prim, gs, indexed && state->restart.on, indirect);
+    return 1;
+}
+
+void nvn_be_sub_index(const uint64_t *handles, int n) {
+    if (!rp_shader_lookahead_budget || !rp_shader_lookahead) return;
+    unsigned left = rp_shader_lookahead_budget();
+    if (!left) return;
+    enum rp_lookahead_stop stopped = RP_LOOKAHEAD_SUBMIT_STATE;
+    uint32_t op = UINT32_MAX;
+    if (!g_cmd) goto stop;
+    struct rp_state state = rp_S;
+    struct rp_lookahead_unknown unknown = {0};
+    const p_set_rt *targets = rp_pass_target();
+    p_set_rt captured;
+    if (targets) { captured = *targets; targets = &captured; }
+    enum { LOOKAHEAD_RECORDS = 512, LOOKAHEAD_CALLS = 64 };
+    unsigned records = LOOKAHEAD_RECORDS;
+    int skip_draw = 0, noted_candidate = 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)handles[i];
+        op = UINT32_MAX;
+        if (!p || (uintptr_t)p % 8) goto bad_record;
+        const uint8_t *visited[LOOKAHEAD_RECORDS];
+        struct { const uint8_t *next; unsigned visited; } calls[LOOKAHEAD_CALLS];
+        unsigned nvisited = 0, depth = 0;
+        for (;;) {
+            if (!left) return;
+            if (!records--) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; op = UINT32_MAX; goto stop; }
+            visited[nvisited++] = p;
+            op_hdr h;
+            memcpy(&h, p, sizeof h);
+            op = h.op;
+            if (rec_bad(h) || (uintptr_t)p > UINTPTR_MAX - h.size) goto bad_record;
+            const void *payload = p + sizeof h;
+            p += h.size;
+            const size_t bytes = h.size - sizeof h;
+            const p_dispatch *dispatch;
+            struct rp_shader_req q = {0};
+            int accepted;
+            switch (h.op) {
+            case OP_END:
+                if (bytes) goto bad_record;
+                if (!depth) goto next_handle;
+                depth--;
+                p = calls[depth].next;
+                nvisited = calls[depth].visited;
+                continue;
+            case OP_JUMP: case OP_CALL: {
+                uint64_t dest;
+                if (bytes != sizeof dest) goto bad_record;
+                memcpy(&dest, payload, sizeof dest);
+                if (op == OP_CALL) {
+                    if (depth == LOOKAHEAD_CALLS) { stopped = RP_LOOKAHEAD_SCAN_LIMIT; goto stop; }
+                    if (nvn_cmd_call_resolve(dest, &dest) < 0) goto bad_record;
+                }
+                if (!dest || dest % 8) goto bad_record;
+                const uint8_t *target = (const uint8_t *)(uintptr_t)dest;
+                for (unsigned j = 0; j < nvisited; j++)
+                    if (visited[j] == target) { stopped = RP_LOOKAHEAD_JUMP_CYCLE; goto stop; }
+                if (op == OP_CALL) {
+                    calls[depth].next = p;
+                    calls[depth].visited = nvisited;
+                    depth++;
+                }
+                p = target;
+                continue;
+            }
+            case OP_REPORT_COUNTER:
+                if (bytes < 2 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_RESET_COUNTER: case OP_FENCE_SYNC: case OP_WAIT_SYNC:
+                if (bytes < sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_SIGNAL_EVENT:
+                if (bytes < sizeof(uint64_t) + 2 * sizeof(uint32_t)) goto bad_record;
+                continue;
+            case OP_RENDER_COND: {
+                if (bytes < sizeof(p_render_cond)) goto bad_record;
+                const int mode = ((const p_render_cond *)payload)->mode;
+                if (mode < 0 || mode > 3) goto bad_record;
+                skip_draw = mode == 3;   // 动态条件可以绘制，前瞻不读计数器
+                continue;
+            }
+            case OP_SET_RT: {
+                const p_set_rt_c *head = payload;
+                if (bytes < sizeof *head || head->n > 8 || bytes < set_rt_payload(head)) goto bad_record;
+                targets = set_rt_rec(payload, h.size, &captured);
+                continue;
+            }
+            case OP_DISCARD_COLOR:
+                if (bytes != sizeof(p_discard_color)) goto bad_record;
+                continue;
+            case OP_DISCARD_DS:
+                if (bytes != 0) goto bad_record;
+                continue;
+            case OP_COPY_B2B:
+                if (bytes < 3 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            case OP_UPDATE_UB: {
+                uint64_t count;
+                if (bytes < 2 * sizeof(uint64_t)) goto bad_record;
+                memcpy(&count, (const uint8_t *)payload + sizeof(uint64_t), sizeof count);
+                if (count > bytes - 2 * sizeof(uint64_t)) goto bad_record;
+                continue;
+            }
+            case OP_COPY_T2B: case OP_COPY_B2T:
+                if (bytes < sizeof(p_copy_b2t)) goto bad_record;
+                continue;
+            case OP_COPY_T2T:   // 含 Downsample/Resolve，仍是同一载荷
+                if (bytes < sizeof(p_copy_t2t)) goto bad_record;
+                continue;
+            case OP_CLEAR_TEX:
+                if (bytes < sizeof(p_clear_tex)) goto bad_record;
+                continue;
+            case OP_CLEAR_BUF:
+                if (bytes < sizeof(p_clear_buf)) goto bad_record;
+                continue;
+            case OP_DLSS:
+                if (bytes < sizeof(p_dlss)) goto bad_record;
+                continue;
+            case OP_DRAW_TEX:   // 后端固定着色器
+                if (bytes < sizeof(p_draw_tex)) goto bad_record;
+                continue;
+            case OP_DISPATCH:   // 直接与间接共用一条记录，组数不参与请求
+                if (bytes < sizeof(p_dispatch)) goto bad_record;
+                dispatch = payload;
+                if (!dispatch->ind && (dispatch->x <= 0 || dispatch->y <= 0 || dispatch->z <= 0)) continue;
+                accepted = rp_state_lookahead_dynamic(&state, &unknown, 1) ? -RP_LOOKAHEAD_DEFERRED_BINDING :
+                    rp_shader_lookahead(&state, NULL, NULL);
+                break;
+            case OP_DRAW: case OP_DRAW_IDX: case OP_MULTI_DRAW: {
+                const int wanted = lookahead_draw_prim(&state, op, payload, h.size, &q.prim);
+                if (wanted < 0) goto bad_record;
+                if (!wanted || skip_draw) continue;
+                if (!targets || targets->n < 0 || targets->n > 8) {
+                    accepted = -RP_LOOKAHEAD_TARGET;
+                    break;
+                }
+                q.rt_count = targets->n;
+                for (int j = 0; j < targets->n; j++) {
+                    if (targets->color[j])
+                        q.rt_format[j] = (uint32_t)(targets->has_cview[j] && targets->cview[j].set_format
+                                                  ? targets->cview[j].format : targets->color[j]->d.format);
+                }
+                accepted = rp_state_lookahead_dynamic(&state, &unknown, 0) ? -RP_LOOKAHEAD_DEFERRED_BINDING :
+                    rp_shader_lookahead(&state, &q, targets);
+                break;
+            }
+            default:
+                if (!rp_state_lookahead(&state, &unknown, h.op, payload, h.size)) goto bad_record;
+                continue;
+            }
+            if (accepted < 0) {
+                if (!noted_candidate) lookahead_note(-accepted, op, 0);
+                noted_candidate = 1;
+            } else left -= (unsigned)accepted;
+        }
+next_handle:;
+    }
+    return;
+bad_record:
+    stopped = RP_LOOKAHEAD_RECORD;
+stop:
+    lookahead_note(stopped, op, 1);
+}
 
 // 逐命令类型的耗时（开关 nvk_exec_tm 打开时才记）：窗口末尾由 rp_exec_dump_ops 取前几名，看「其余」那部分到底是哪些命令占的。
 static uint64_t g_op_ns[64];
@@ -804,9 +1132,8 @@ static void count_feed(struct rp_count_group *g, const p_draw *dr, const p_draw_
     int same = g->n && g->n < 1024 && ix == g->indexed && cnt == oldcnt && seq == (int32_t)g->n;
     if (same) same = ix ? di->prim == g->di.prim && di->itype == g->di.itype && di->ibuf == g->di.ibuf : dr->prim == g->dr.prim && dr->tfc == g->dr.tfc;
     uint64_t stride = g->stride;
-    if (same && g->n == 1) { if (ind <= first) same = 0; else stride = ind - first; }
-    if (same && (stride < (ix ? 20u : 16u) || (stride & 3) || stride > UINT32_MAX)) same = 0;
-    if (same && ((uint64_t)g->n > (UINT64_MAX - first) / stride || ind != first + g->n * stride)) same = 0;
+    if (same && g->n == 1) { if (ind < first) same = 0; else stride = ind - first; }
+    if (same && ((stride && (uint64_t)g->n > (UINT64_MAX - first) / stride) || ind != first + g->n * stride)) same = 0;
     if (same) { g->n++; g->stride = stride; if (g->n == 1024) count_flush(g, 0); return; }
     count_flush(g, 0);   // 调用处 t_cmd 已覆盖本次绘制，避免重复计时。
     if (!cnt || seq != 0) { rp_draw(g_cmd, dr, di, rec); return; }
@@ -875,6 +1202,18 @@ static uint64_t exec_list(const uint8_t *p) {
             case OP_SET_RT: { p_set_rt t; rp_pass_set_rt(g_cmd, set_rt_rec(a, h.size, &t)); sub_split(); break; }
             case OP_CLEAR_COLOR: if (!g_rc_skip) rp_pass_clear_color(g_cmd, a, p); break;
             case OP_CLEAR_DS: if (!g_rc_skip) rp_pass_clear_ds(g_cmd, a, p); break;
+            case OP_DISCARD_COLOR: {
+                p_discard_color dc;
+                if (h.size != sizeof h + sizeof dc) { nvn_unimpl("rec", "discard_color_size", p); break; }
+                memcpy(&dc, a, sizeof dc);
+                if ((unsigned)dc.slot >= 8) { nvn_unimpl("pass", "discard_color_slot", p); break; }
+                if (!g_rc_skip && rp_pass_discard_hint) rp_pass_discard_hint(dc.slot, p);
+                break;
+            }
+            case OP_DISCARD_DS:
+                if (h.size != sizeof h) { nvn_unimpl("rec", "discard_ds_size", p); break; }
+                if (!g_rc_skip && rp_pass_discard_hint) rp_pass_discard_hint(-1, p);
+                break;
             case OP_BARRIER: { int32_t bits; memcpy(&bits, a, 4); rp_pass_barrier((uint32_t)bits); break; }
             case OP_COPY_T2B: rp_pass_flush(g_cmd); rp_op_copy_t2b(g_cmd, a, p); break;
             case OP_CLEAR_TEX: rp_pass_flush(g_cmd); rp_op_clear_tex(g_cmd, a, p); break;
@@ -945,6 +1284,7 @@ void nvn_be_submit(void *q, const uint64_t *h, int n) {
     nvn_be_sub_index(h, n);
     for (int i = 0; i < n; i++) { nvn_be_exec_rest(h + i + 1, n - i - 1); nvn_be_exec((const uint8_t *)(uintptr_t)h[i]); }
     nvn_be_exec_rest(NULL, 0);
+    if (rp_shader_lookahead_end) rp_shader_lookahead_end();
     uint64_t t2 = now_ns();
     nvn_be_sub_commit();
     uint64_t t3 = now_ns();

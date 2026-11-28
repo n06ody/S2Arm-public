@@ -193,7 +193,7 @@ namespace S2A.DirectCompiler
                 if (requestVersion == 2 && stageJson.ValueKind == JsonValueKind.Null) continue;
                 JsonStrict.OnlyKeys(stageJson, sw, "stage", "code", "control", "c1", "constantBufferUse");
                 string stage = JsonStrict.String(stageJson, "stage", sw, 3);
-                if (stage != "vs" && stage != "fs" && stage != "cs" && !(requestVersion == 2 && stage == "gs"))
+                if (stage != "vs" && stage != "fs" && stage != "cs" && !(requestVersion == 2 && stage is "gs" or "tcs" or "tes"))
                     throw new DirectCompileException("UNSUPPORTED_PROGRAM", sw + ".stage " + stage + " is not implemented");
                 if (requestVersion == 2 && stage != new[] { "vs", "fs", "gs", "tcs", "tes" }[stageSlot])
                     throw new DirectCompileException("INVALID_JSON", sw + ".stage does not match its NVN slot");
@@ -208,7 +208,7 @@ namespace S2A.DirectCompiler
                     throw new DirectCompileException("INVALID_JSON", sw + ".code has no 0x50-byte Maxwell header");
                 if (requestVersion == 2)
                 {
-                    int expectedStage = stage switch { "vs" => 1, "fs" => 5, "gs" => 4, _ => -1 };
+                    int expectedStage = stage switch { "vs" => 1, "tcs" => 2, "tes" => 3, "gs" => 4, "fs" => 5, _ => -1 };
                     if (((BitConverter.ToUInt32(code, 0) >> 10) & 15) != expectedStage)
                         throw new DirectCompileException("INVALID_JSON", sw + ".code header does not match stage");
                 }
@@ -231,13 +231,15 @@ namespace S2A.DirectCompiler
             }
             else
             {
-                // v1 接 VS+FS 或只有 VS；v2 额外接 VS+GS+FS，其余阶段与组合继续报未实现。
+                // v1 接 VS+FS 或只有 VS。v2 也接几何，以及 VS 与成对细分阶段。
                 bool vsFs = stages.Count == 2 && stages.Any(s => s.IsVertex) && stages.Any(s => s.IsFragment);
                 bool vsOnly = stages.Count == 1 && stages[0].IsVertex;
                 bool vsGsFs = requestVersion == 2 && stages.Count == 3 && stages.Any(s => s.IsVertex) &&
                               stages.Any(s => s.IsFragment) && stages.Any(s => s.Stage == "gs");
-                if (!vsFs && !vsOnly && !vsGsFs)
-                    throw new DirectCompileException("UNSUPPORTED_PROGRAM", where + ": graphics contract is vs, vs+fs, or v2 vs+gs+fs");
+                bool tess = requestVersion == 2 && stages.Any(s => s.IsVertex) &&
+                            stages.Any(s => s.Stage == "tcs") && stages.Any(s => s.Stage == "tes");
+                if (!vsFs && !vsOnly && !vsGsFs && !tess)
+                    throw new DirectCompileException("UNSUPPORTED_PROGRAM", where + ": graphics requires VS and paired TCS/TES when tessellating");
                 if (requestVersion == 1) stages = stages.OrderBy(s => s.IsVertex ? 0 : 1).ToList();
             }
             bool tf = JsonStrict.Bool(e, "transformFeedbackEnabled", where);

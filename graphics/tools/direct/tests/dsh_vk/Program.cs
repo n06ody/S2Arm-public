@@ -20,7 +20,9 @@
 // libdsx（--dsx，必给）：Finish 对片元调 NxgalSpvCross.ColorRound，Compile 对所有阶段交 SPIRV-Cross 前先调 NxgalSpvCross.Harden（main de14970a6，#1204 T1），
 //   两者都 DllImport("dsx")。t_dsh_vk.sh 在 Mac 给 build/dsx/libdsx.dylib，在 Linux 给 build/dsx/linux/libdsx.so（#783），
 //   三个键都走 CompileWithSpv。SPIRV-Cross 两边都用命令行版（CliSpvCross），--dsx 只改上面两个 DllImport 的去处。
-// 用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx>
+//   ⑭ 存储缓冲窗口读回夹具料（可选 --emit <目录>）：同一份 VS（读 [基址+0x20]、写 [基址+0x40] 与 [基址+0]，基址取自 c0+0x110，写入值取自 c3[0]）
+//      走 CompileWithSpv 出 _b.json / _b.spv 放进给定目录，android/tests/vk/standalone/libpack-ssbo-window.sh 在 lavapipe 上用它读回字节。
+// 用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx> [--emit <目录>]
 using S2A.Dsh;
 using System;
 using System.Collections.Generic;
@@ -37,7 +39,11 @@ static class Program
     static ulong Mov32i(int rd, uint v) => 0x0100000000000000UL | ((ulong)v << 20) | (7UL << 16) | (15UL << 12) | (ulong)rd;
     static ulong Ldc(int rd, int slot, int off, int size) => 0xef90000000000000UL | ((ulong)size << 48) | ((ulong)slot << 36) | ((ulong)off << 20) | (7UL << 16) | (255UL << 8) | (ulong)rd;   // size 4 = B32、5 = B64
     static ulong Ldg32(int rd, int ra, int off) => 0xeed4200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
+    static ulong Ldg128(int rd, int ra, int off) => 0xeed6200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;   // LDG.E.128：Rd..Rd+3
+    static ulong Stg128(int rs, int ra, int off) => 0xeede200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rs;   // STG.E.128：Rs..Rs+3
     static ulong Stg32(int rs, int ra, int off) => 0xeedc200000000000UL | ((ulong)off << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rs;
+    static ulong AtomAdd32(int rd, int ra, int rb, int off) =>
+        0xed01000000000000UL | ((ulong)off << 28) | ((ulong)rb << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
     // TEXS.2D Rd(仅 R 分量), Ra = x, Rb = y；TidB = 驱动常量段 c2 里的句柄字偏移（8 → 0x20 = 纹理槽 0）
     static ulong Texs2D(int rd, int ra, int rb, int tid) => 0xd800000000000000UL | (1UL << 53) | ((ulong)tid << 36) | (255UL << 28) | ((ulong)rb << 20) | (7UL << 16) | ((ulong)ra << 8) | (ulong)rd;
 
@@ -73,7 +79,7 @@ static class Program
     static ulong Out(int type) => (0b1111101111100UL << 51) | ((ulong)type << 39) | (255UL << 20) | (7UL << 16) | (255UL << 8) | 255UL;
     static (byte[] Code, byte[] Ctl) GeometryFixture(bool passthrough)
     {
-        var h = Sph(1u | (3u << 5) | (4u << 10) | (passthrough ? 1u << 24 : 0u), -1);
+        var h = Sph(1u | (3u << 5) | (4u << 10) | (1u << 16) | (1u << 26) | (passthrough ? 1u << 24 : 0u), -1);
         BitConverter.TryWriteBytes(h.AsSpan(0x30 + 8), 1u << 24);   // 字 2：每输入图元 1 个调用
         BitConverter.TryWriteBytes(h.AsSpan(0x30 + 12), 7u << 24);  // 字 3：输出拓扑 7 = 三角带
         BitConverter.TryWriteBytes(h.AsSpan(0x30 + 16), 3u);        // 字 4：最多输出 3 个顶点
@@ -82,8 +88,64 @@ static class Program
             Mov32i(6, 0x3f000000), Mov32i(7, 0x3f000000), Texs2D(5, 6, 7, 8), // R5 = 纹理槽 0 采样
             Ldc(4, 3, 0, 4),                                                // R4 = c3[0]
             Ast(0, 0x70, 3), Ast(4, 0x80, 0), Ast(5, 0x84, 0),              // 位置 + 通用输出 0 的 x / y
+            Ldc(8, 0, 0x410, 5), Stg32(4, 8, 0x40),                            // c0 的 GS 存储槽 0
             Out(1), Out(2), EXIT });
         var ctl = new byte[0x880]; ctl[0x10] = 4;
+        return (code, ctl);
+    }
+
+    // ⑭ 窗口读回夹具的 VS：R0:R1 = c0+0x110 的存储缓冲 0 基址（游戏原始地址），R2 = c3[0]；R4 = [基址+0x20]；[基址+0x40] = R4；[基址+0] = R2
+    static (byte[] Code, byte[] Ctl) WindowFixture()
+    {
+        const uint store = (1u << 16) | (1u << 26);   // SPH DoesGlobalStore / DoesLoadOrStore
+        var code = Bundles(Sph(1 | (3 << 5) | (1 << 10) | store, -1), new[] {
+            Ldc(0, 0, 0x110, 5), Ldc(2, 3, 0, 4), Ldg32(4, 0, 0x20), Stg32(4, 0, 0x40), Stg32(2, 0, 0), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 21;
+        return (code, ctl);
+    }
+
+    // ⑭ 片元阶段（8E 新库里 8240 个 PS 带窗口掩码、只有 440 个 VS）：存储缓冲 0 = c0+0x510、1 = c0+0x520，用户常量缓冲 0 首字 = c3[0]
+    //   [B0+0x40] = [B0+0x20]（32 位）；[B0+0x80..0x8f] = [B0+0x30..0x3f]（128 位）；[B0+0] = c3[0]；[B1+0x20] = [B1+0x10]（第二个存储缓冲）；最后写出常量颜色
+    static (byte[] Code, byte[] Ctl) WindowFixturePs()
+    {
+        const uint store = (1u << 16) | (1u << 26);
+        var code = Bundles(Sph(2 | (3 << 5) | (5 << 10) | store, 15), new[] {
+            Ldc(0, 0, 0x510, 5), Ldc(14, 0, 0x520, 5), Ldc(2, 3, 0, 4),
+            Ldg32(4, 0, 0x20), Stg32(4, 0, 0x40),
+            Ldg128(8, 0, 0x30), Stg128(8, 0, 0x80),
+            Stg32(2, 0, 0),
+            Ldg32(5, 14, 0x10), Stg32(5, 14, 0x20),
+            Mov32i(0, 0x3f800000), Mov32i(1, 0x3f000000), Mov32i(2, 0), Mov32i(3, 0x3f800000), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 22;
+        return (code, ctl);
+    }
+
+    // ⑭ 计算阶段：存储缓冲 0 = c0+0x310。[B+0x40] = [B+0x20]；[B+0x80..0x8f] = [B+0x30..0x3f]（128 位）；[B+0x90] 原子加 7，旧值存 [B+0xa0]；[B+0] = c3[0]
+    static (byte[] Code, byte[] Ctl) WindowFixtureCs()
+    {
+        var head = new byte[0x100]; BitConverter.TryWriteBytes(head.AsSpan(0), 0x12345679u);
+        var code = Bundles(head, new[] {
+            Ldc(0, 0, 0x310, 5), Ldc(3, 3, 0, 4),
+            Ldg32(2, 0, 0x20), Stg32(2, 0, 0x40),
+            Ldg128(8, 0, 0x30), Stg128(8, 0, 0x80),
+            Mov32i(5, 7), AtomAdd32(6, 0, 5, 0x90), Stg32(6, 0, 0xa0),
+            Stg32(3, 0, 0), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 31;
+        return (code, ctl);
+    }
+
+    // 一个几何调用只写存储缓冲，故意不发顶点，读回不依赖光栅覆盖。
+    static (byte[] Code, byte[] Ctl) WindowFixtureGs()
+    {
+        const uint store = (1u << 16) | (1u << 26);
+        var h = Sph(1u | (3u << 5) | (4u << 10) | store, -1);
+        BitConverter.TryWriteBytes(h.AsSpan(0x38), 1u << 24);
+        BitConverter.TryWriteBytes(h.AsSpan(0x3c), 7u << 24);
+        BitConverter.TryWriteBytes(h.AsSpan(0x40), 3u);
+        var code = Bundles(h, new[] {
+            Ldc(0, 0, 0x410, 5), Ldc(2, 3, 0, 4), Ldg32(4, 0, 0x20),
+            Stg32(4, 0, 0x40), Ldg128(8, 0, 0x30), Stg128(8, 0, 0x80), Stg32(2, 0, 0), EXIT });
+        var ctl = new byte[0x880]; ctl[0x10] = 23;
         return (code, ctl);
     }
 
@@ -123,6 +185,28 @@ static class Program
         }
         return vars.Where(v => v.Value is 0 or 2 or 12 && bind.ContainsKey(v.Key))
                    .ToDictionary(v => names.GetValueOrDefault(v.Key, "%" + v.Key), v => (set.GetValueOrDefault(v.Key, uint.MaxValue), bind[v.Key], touched.Contains(v.Key)));
+    }
+
+    static bool UsesStorageWindowMask(byte[] spv, uint id)
+    {
+        var words = MemoryMarshal.Cast<byte, uint>(spv.AsSpan());
+        bool defaultMask = false;
+        bool maskedAddress = false;
+        var maskIds = new HashSet<uint> { id };
+        for (int i = 5; i < words.Length;)
+        {
+            int count = (int)(words[i] >> 16);
+            if (count == 0 || i + count > words.Length) throw new InvalidDataException("bad SPIR-V word count");
+            int op = (int)(words[i] & 0xffff);
+            if (op == 50 && count == 4 && words[i + 2] == id) // OpSpecConstant
+                defaultMask = words[i + 3] == uint.MaxValue;
+            if (op == 124 && count == 4 && maskIds.Contains(words[i + 3])) // OpBitcast
+                maskIds.Add(words[i + 2]);
+            if (op == 199 && count == 5 && (maskIds.Contains(words[i + 3]) || maskIds.Contains(words[i + 4]))) // OpBitwiseAnd
+                maskedAddress = true;
+            i += count;
+        }
+        return defaultMask && maskedAddress;
     }
 
     // 全部 OpTypeImage 的（dim, Sampled, Image Format 操作数）：OpTypeImage %id %采样类型 %dim %depth %arrayed %ms %sampled %format
@@ -207,21 +291,84 @@ static class Program
         if (!ok) bad = 1;
     }
 
+    static string ColorTypeAtZero(byte[] spirv)
+    {
+        var words = new uint[spirv.Length / 4];
+        Buffer.BlockCopy(spirv, 0, words, 0, spirv.Length);
+        var types = new Dictionary<uint, string>();
+        var pointers = new Dictionary<uint, uint>();
+        var variables = new Dictionary<uint, uint>();
+        var locationZero = new HashSet<uint>();
+        for (int i = 5; i < words.Length; i += (int)(words[i] >> 16))
+        {
+            switch (words[i] & 0xffff)
+            {
+                case 21: types[words[i + 1]] = words[i + 3] == 0 ? "Uint" : "Sint"; break;
+                case 22: types[words[i + 1]] = "Float"; break;
+                case 23 when types.TryGetValue(words[i + 2], out string type):
+                    types[words[i + 1]] = type;
+                    break;
+                case 32 when words[i + 2] == 3: pointers[words[i + 1]] = words[i + 3]; break;
+                case 59 when words[i + 3] == 3: variables[words[i + 2]] = words[i + 1]; break;
+                case 71 when (words[i] >> 16) == 4 && words[i + 2] == 30 && words[i + 3] == 0:
+                    locationZero.Add(words[i + 1]);
+                    break;
+            }
+        }
+        return types[pointers[variables[locationZero.Single(variables.ContainsKey)]]];
+    }
+
+    static void VerifyFragmentOutputVariants(string outDir, string key, string val)
+    {
+        string path = Path.Combine(outDir, key + "_vf.bin");
+        Check("片元键按出库请求同时提供 Uint / Sint 颜色输出变体", File.Exists(path));
+        if (!File.Exists(path)) return;
+
+        using var input = new BinaryReader(File.OpenRead(path));
+        Check("颜色输出变体表头和条数", input.ReadBytes(8).AsSpan().SequenceEqual("S2AVFO1\0"u8) &&
+            input.ReadUInt32() == 2);
+        string floatPath = Path.Combine(outDir, key + "_b.spv");
+        Check("默认片元的 location 0 仍是 Float", ColorTypeAtZero(File.ReadAllBytes(floatPath)) == "Float");
+        foreach (var (unsigned, signed, expected) in new[] { (1, 0, "Uint"), (0, 1, "Sint") })
+        {
+            int u = input.ReadByte(), s = input.ReadByte(), reserved = input.ReadUInt16();
+            int jsonSize = input.ReadInt32(), spvSize = input.ReadInt32();
+            var json = JsonNode.Parse(input.ReadBytes(jsonSize));
+            byte[] spv = input.ReadBytes(spvSize);
+            Check($"{expected} 输出掩码与 location 0 声明一致",
+                u == unsigned && s == signed && reserved == 0 && ColorTypeAtZero(spv) == expected);
+            Check($"{expected} 绑定与该变体的反射配对",
+                (string)json["dm_ctl"] == key && (string)json["stage"] == "ps" &&
+                Mismatch(Resources(spv), json["bindings"].AsArray(), StageNoOf["ps"]).Count == 0);
+            string candidate = Path.Combine(outDir, expected + ".spv");
+            File.WriteAllBytes(candidate, spv);
+            using var process = Process.Start(new ProcessStartInfo(val) { ArgumentList = { "--target-env", "vulkan1.1", candidate } });
+            process.WaitForExit();
+            Check($"{expected} spirv-val --target-env vulkan1.1", process.ExitCode == 0);
+        }
+        Check("颜色输出变体没有未消费字节", input.BaseStream.Position == input.BaseStream.Length);
+    }
+
     static int Main(string[] args)
     {
-        if (!(args.Length == 5 && args[3] == "--dsx")) { Console.Error.WriteLine("用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx>"); return 2; }
+        if (!((args.Length == 5 || (args.Length == 7 && args[5] == "--emit")) && args[3] == "--dsx")) { Console.Error.WriteLine("用法：dsh_vk_test <spirv-cross> <spirv-val> <工作目录> --dsx <libdsx> [--emit <目录>]"); return 2; }
         string val = args[1], root = args[2], tables = Path.Combine(root, "tables"), outDir = Path.Combine(root, "out"), dsx = args[4];
         NativeLibrary.SetDllImportResolver(typeof(NxgalSpvCross).Assembly, (name, asm, path) => name == "dsx" ? NativeLibrary.Load(dsx) : IntPtr.Zero);
         Directory.CreateDirectory(tables); Directory.CreateDirectory(outDir);
         File.WriteAllText(Path.Combine(tables, "shader_facts.tsv"), ""); File.WriteAllText(Path.Combine(tables, "shader_pairs.tsv"), "");
         var xc = new CliSpvCross(args[0], root);
+        var fixtures = Fixtures();
+        string fragmentKey = Convert.ToHexStringLower(SHA256.HashData(fixtures.Single(f => f.Stage == "ps").Ctl))[..16];
+        File.WriteAllText(Path.Combine(tables, "fout_want.tsv"),
+            $"{fragmentKey}\t1\t0\n{fragmentKey}\t0\t1\n{fragmentKey}\t3\t0\n{fragmentKey}\t0\t101\n");
         var keys = new List<(string Key, string Stage, byte[] Code, byte[] Ctl)>();
-        foreach (var (stage, code, ctl) in Fixtures())
+        foreach (var (stage, code, ctl) in fixtures)
         {
             string key = Convert.ToHexStringLower(SHA256.HashData(ctl.AsSpan(0, 0x880)))[..16];
             Console.WriteLine($"{stage} {key}: {string.Join(" ", DshVk.CompileWithSpv(key, stage, code, ctl, outDir, xc, tables, true, root))}");
             keys.Add((key, stage, code, ctl));
         }
+        VerifyFragmentOutputVariants(outDir, fragmentKey, val);
 
         // ① 键集合
         var jsonKeys = Directory.GetFiles(outDir, "*_b.json").Select(p => Path.GetFileName(p)[..^7]).OrderBy(k => k).ToList();
@@ -232,7 +379,8 @@ static class Program
         var perStage = new Dictionary<string, (Dictionary<string, (uint Set, uint Binding, bool Used)> Res, JsonArray Bindings)>();
         foreach (var (key, stage, code, ctl) in keys)
         {
-            var bindings = JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, key + "_b.json")))["bindings"].AsArray();
+            var metadata = JsonNode.Parse(File.ReadAllText(Path.Combine(outDir, key + "_b.json")));
+            var bindings = metadata["bindings"].AsArray();
             string spvPath = Path.Combine(outDir, key + "_b.spv");
             byte[] spv = File.ReadAllBytes(spvPath);
             var res = Resources(spv);
@@ -251,8 +399,27 @@ static class Program
             string err = p.StandardError.ReadToEnd() + p.StandardOutput.ReadToEnd(); p.WaitForExit();
             Check($"③ {stage} spirv-val --target-env vulkan1.1", p.ExitCode == 0, err.Trim());
 
-            var raw = DshCompiler.TranslateForVulkan(stage, code, ctl, root).Spv;   // 同空表：与 _b.spv 同一遍翻译、未改写
+            var raw = DshCompiler.TranslateForVulkan(stage, code, ctl, root).Spv;   // 空表，现编路径，未改写绑定
             rawDiff += Mismatch(Resources(raw), bindings, StageNoOf[stage]).Count;
+
+            if (stage == "vs")
+            {
+                uint mask = (uint?)metadata["ssbo_window_mask"] ?? 0;
+                Check("顶点出包将驱动地址与可替换 SSBO 窗口掩码相与",
+                    (int?)metadata["ssbo_window_abi"] == 1 && mask != 0 && UsesStorageWindowMask(spv, mask));
+                Check("顶点的驱动常量段 c0 在绑定表中且入口取用",
+                    bindings.OfType<JsonObject>().Any(o => (string)o["kind"] == "drvcb" && (int?)o["bank"] == 0 &&
+                        res.TryGetValue((string)o["msl_name"], out var driver) && driver.Used));
+            }
+            if (stage == "ps")
+                Check("不访问 SSBO 的片元仍声明窗口协议，无掩码", (int?)metadata["ssbo_window_abi"] == 1 &&
+                    metadata["ssbo_window_mask"] == null);
+            if (stage == "cs")
+                Check("计算出包携带窗口合同：协议 1、掩码参与按位与、c0 绑定在表里且入口取用",
+                    (int?)metadata["ssbo_window_abi"] == 1 && (uint?)metadata["ssbo_window_mask"] is uint cmask && cmask != 0 &&
+                    UsesStorageWindowMask(spv, cmask) &&
+                    bindings.OfType<JsonObject>().Any(o => (string)o["kind"] == "drvcb" && (int?)o["bank"] == 0 &&
+                        res.TryGetValue((string)o["msl_name"], out var driver) && driver.Used));
 
             if (stage == "ps")
             {
@@ -358,6 +525,9 @@ static class Program
             var gj = JsonNode.Parse(gfiles[$"{gkey}_vg{t}.json"]).AsObject();
             var gb = gj["bindings"].AsArray();
             byte[] gspv = gfiles[$"{gkey}_vg{t}.spv"];
+            uint gmask = (uint?)gj["ssbo_window_mask"] ?? 0;
+            Check($"⑫ _vg{t} 的几何阶段有窗口合同且使用掩码",
+                (int?)gj["ssbo_window_abi"] == 1 && gmask != 0 && UsesStorageWindowMask(gspv, gmask));
             var w = new uint[gspv.Length / 4]; Buffer.BlockCopy(gspv, 0, w, 0, w.Length * 4);
             uint model = uint.MaxValue; var modes = new List<uint>();
             for (int i = 5; i < w.Length;)
@@ -388,6 +558,46 @@ static class Program
         try { DshVk.CompileGeometry("pt" + gkey[2..], pcode2, pctl2, xc, tables, true, root); } catch (DshError e) { pwhy = e.Detail; }
         Check("⑫ 直通型几何头：GeometrySkip 给原因、CompileGeometry 报 DshError（离线不出，设备现编）",
             DshVk.GeometrySkip(pcode2, pctl2) is string sk && sk.Contains("passthrough") && pwhy != null && pwhy.Contains("passthrough") && DshVk.GeometrySkip(gcode, gctl) == null, pwhy ?? "没有报错");
+        // ⑭ 窗口读回夹具料：给了 --emit 才出（android/tests/vk/standalone/libpack-ssbo-window.sh 在 lavapipe 上读回字节）
+        if (args.Length == 7)
+        {
+            var (wcode, wctl) = WindowFixture();
+            string wkey = Convert.ToHexStringLower(SHA256.HashData(wctl.AsSpan(0, 0x880)))[..16], emit = args[6];
+            Directory.CreateDirectory(emit);
+            DshVk.CompileWithSpv(wkey, "vs", wcode, wctl, emit, xc, tables, true, root);
+            var wj = JsonNode.Parse(File.ReadAllText(Path.Combine(emit, wkey + "_b.json")));
+            byte[] wspv = File.ReadAllBytes(Path.Combine(emit, wkey + "_b.spv"));
+            uint wmask = (uint?)wj["ssbo_window_mask"] ?? 0;
+            Check("⑭ 读回夹具 VS：窗口协议 1、有掩码且参与按位与",
+                (int?)wj["ssbo_window_abi"] == 1 && wmask != 0 && UsesStorageWindowMask(wspv, wmask));
+            File.WriteAllText(Path.Combine(emit, "window_vs.key"), wkey);
+            var (wpcode, wpctl) = WindowFixturePs();
+            string wpkey = Convert.ToHexStringLower(SHA256.HashData(wpctl.AsSpan(0, 0x880)))[..16];
+            DshVk.CompileWithSpv(wpkey, "ps", wpcode, wpctl, emit, xc, tables, true, root);
+            var wpj = JsonNode.Parse(File.ReadAllText(Path.Combine(emit, wpkey + "_b.json")));
+            uint wpmask = (uint?)wpj["ssbo_window_mask"] ?? 0;
+            Check("⑭ 读回夹具 PS：窗口协议 1、有掩码且参与按位与、两个存储缓冲槽",
+                (int?)wpj["ssbo_window_abi"] == 1 && wpmask != 0 && UsesStorageWindowMask(File.ReadAllBytes(Path.Combine(emit, wpkey + "_b.spv")), wpmask) &&
+                wpj["bindings"].AsArray().OfType<JsonObject>().Count(o => (string)o["kind"] == "sbuf") == 2);
+            File.WriteAllText(Path.Combine(emit, "window_ps.key"), wpkey);
+            var (ccode, cctl) = WindowFixtureCs();
+            string ckey = Convert.ToHexStringLower(SHA256.HashData(cctl.AsSpan(0, 0x880)))[..16];
+            DshVk.CompileWithSpv(ckey, "cs", ccode, cctl, emit, xc, tables, true, root);
+            File.WriteAllText(Path.Combine(emit, "window_cs.key"), ckey);
+            var (wgcode, wgctl) = WindowFixtureGs();
+            string wgkey = Convert.ToHexStringLower(SHA256.HashData(wgctl.AsSpan(0, 0x880)))[..16];
+            foreach (var (name, bytes) in DshVk.CompileGeometry(wgkey, wgcode, wgctl, xc, tables, true, root))
+                File.WriteAllBytes(Path.Combine(emit, name), bytes);
+            File.WriteAllText(Path.Combine(emit, "window_gs.key"), wgkey);
+            // 同一出库翻译器产生 VS 的内建输出块，与 GS 的内建输入块逐成员匹配。
+            var gvs = Bundles(Sph(1 | (3 << 5) | (1 << 10), -1), new[] {
+                Mov32i(0, 0), Mov32i(1, 0), Mov32i(2, 0), Mov32i(3, 0x3f800000),
+                Ast(0, 0x70, 3), EXIT });
+            var gvctl = new byte[0x880]; gvctl[0x10] = 24;
+            string gvkey = Convert.ToHexStringLower(SHA256.HashData(gvctl))[..16];
+            DshVk.CompileWithSpv(gvkey, "vs", gvs, gvctl, emit, xc, tables, true, root);
+            File.WriteAllText(Path.Combine(emit, "window_gs_vs.key"), gvkey);
+        }
         Console.WriteLine(bad == 0 ? "dsh_vk: 全过" : "dsh_vk: 有不通");
         return bad;
     }

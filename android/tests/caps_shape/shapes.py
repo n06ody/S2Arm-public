@@ -40,16 +40,52 @@ EXT_FEATURES = (('shaderDrawParameters', 'shaderDrawParameters'), ('timelineSema
                 ('vertexAttributeInstanceRateDivisor', 'vertexAttributeInstanceRateDivisor'),
                 ('vertexAttributeInstanceRateZeroDivisor', 'vertexAttributeInstanceRateZeroDivisor'),
                 ('formatA4B4G4R4', 'formatA4B4G4R4'), ('formatA4R4G4B4', 'formatA4R4G4B4'),
-                ('depthClipControl', 'depthClipControl'), ('swapchainMaintenance1', 'swapchainMaintenance1'),
+                ('depthClipControl', 'depthClipControl'), ('scalarBlockLayout', 'scalarBlockLayout'),
+                ('uniformBufferStandardLayout', 'uniformBufferStandardLayout'), ('maintenance4', 'maintenance4'),
+                ('shaderFloat16', 'shaderFloat16'), ('shaderInt8', 'shaderInt8'), ('swapchainMaintenance1', 'swapchainMaintenance1'),
+                ('pipelineCreationCacheControl', 'pipelineCreationCacheControl'),
+                ('hostQueryReset', 'hostQueryReset'),
+                ('primitiveTopologyListRestart', 'primitiveTopologyListRestart'),
+                ('image2DViewOf3D', 'image2DViewOf3D'), ('sampler2DViewOf3D', 'sampler2DViewOf3D'),
+                ('texelBufferAlignment', 'texelBufferAlignment'),
+                ('robustImageAccess', 'robustImageAccess'),
+                ('shaderZeroInitializeWorkgroupMemory', 'shaderZeroInitializeWorkgroupMemory'),
+                ('rectangularLines', 'rectangularLines'), ('bresenhamLines', 'bresenhamLines'), ('smoothLines', 'smoothLines'),
+                ('stippledRectangularLines', 'stippledRectangularLines'), ('stippledBresenhamLines', 'stippledBresenhamLines'),
+                ('stippledSmoothLines', 'stippledSmoothLines'),
+                ('storageBuffer8BitAccess', 'storageBuffer8BitAccess'),
+                ('uniformAndStorageBuffer8BitAccess', 'uniformAndStorageBuffer8BitAccess'),
+                ('storagePushConstant8', 'storagePushConstant8'),
+                ('storageBuffer16BitAccess', 'storageBuffer16BitAccess'),
+                ('uniformAndStorageBuffer16BitAccess', 'uniformAndStorageBuffer16BitAccess'),
+                ('storagePushConstant16', 'storagePushConstant16'),
+                ('storageInputOutput16', 'storageInputOutput16'),
+                ('variablePointersStorageBuffer', 'variablePointersStorageBuffer'),
+                ('variablePointers', 'variablePointers'),
+                ('multiview', 'multiview'),
+                ('multiviewGeometryShader', 'multiviewGeometryShader'),
+                ('multiviewTessellationShader', 'multiviewTessellationShader'),
                 ('runtimeDescriptorArray', 'diRuntimeArray'), ('descriptorBindingPartiallyBound', 'diPartiallyBound'),
                 ('shaderSampledImageArrayNonUniformIndexing', 'diSampledNonUniform'),
                 ('shaderStorageImageArrayNonUniformIndexing', 'diStorageNonUniform'),
                 ('descriptorBindingVariableDescriptorCount', 'diVariableCount'),
                 ('descriptorBindingSampledImageUpdateAfterBind', 'diSampledUpdateAfterBind'))
+DYNAMIC_FEATURES = {
+    'VK_EXT_extended_dynamic_state': ('extendedDynamicState',),
+    'VK_EXT_extended_dynamic_state2': ('extendedDynamicState2', 'extendedDynamicState2LogicOp',
+                                      'extendedDynamicState2PatchControlPoints'),
+    'VK_EXT_vertex_input_dynamic_state': ('vertexInputDynamicState',),
+}
+EXT_FEATURES += tuple((field, field) for fields in DYNAMIC_FEATURES.values() for field in fields)
 EXT_PROPERTIES = (('subgroupQuadOperationsInAllStages', 'subgroup_quad_all'),
                   ('maxCustomBorderColorSamplers', 'border_max'), ('maxVertexAttribDivisor', 'divisor_max'),
                   ('filterMinmaxSingleComponentFormats', 'minmax_single'), ('filterMinmaxImageComponentMapping', 'minmax_mapping'),
-                  ('minImportedHostPointerAlignment', 'host_align'))
+                  ('minImportedHostPointerAlignment', 'host_align'), ('lineSubPixelPrecisionBits', 'line_subpixel_bits'), ('maxBufferSize', 'max_buffer_size'),
+                  ('shaderDenormPreserveFloat32', 'fctrl_denorm_preserve_f32'),
+                  ('shaderDenormFlushToZeroFloat32', 'fctrl_denorm_ftz_f32'),
+                  ('shaderSignedZeroInfNanPreserveFloat32', 'fctrl_sz_inf_nan_f32'),
+                  ('shaderRoundingModeRTEFloat32', 'fctrl_rte_f32'),
+                  ('shaderRoundingModeRTZFloat32', 'fctrl_rtz_f32'))
 
 
 def names():
@@ -160,12 +196,19 @@ def oracle(name, got_path):
     want = json.load(open(os.path.join(DEVICES, stem + '.json')))
     got = json.load(open(got_path))
     # 档案里写 null（来源没读数）的格式，假驱动按「能力未知 = 按不支持」回答；device_caps.c 里由这些格式决定的格式族因此不比，点名列出
-    null_fmts = {k for k, v in load(name)['vulkan']['formats'].items() if v is None}
+    prof_v = load(name)['vulkan']
+    null_fmts = {k for k, v in prof_v['formats'].items() if v is None}
     unknown = {('formats', group) for group, fmts in caps_format_groups().items() if fmts & null_fmts}
     bad = []
     for sect in ('limits', 'features', 'formats', 'memory'):
         for k, v in want[sect].items():
             if sect == 'features' and k in ('geometryShader', 'geometryShaderOcclusionQuery'): continue   # capprobe 判定，不是能力形态
+            if sect == 'features' and k == 'tessellationShader':
+                # devices/{8e,9000}.json 采于 vk_device.c 启用 tessellationShader 之前；按物理档核对本构建启用值，不篡改历史真机采样档
+                want_tess = bool(prof_v['features'].get('tessellationShader')) and int(prof_v['properties']['limits'].get('maxTessellationPatchSize') or 0) > 0
+                g = got.get(sect, {}).get(k)
+                if g != want_tess: bad.append('%s.%s：物理档期望 %r / 本构建 %r' % (sect, k, want_tess, g))
+                continue
             if (sect, k) in unknown: continue
             g = got.get(sect, {}).get(k)
             if (abs(g - v) > 1e-6 if isinstance(v, float) else g != v): bad.append('%s.%s：真机 %r / 本构建 %r' % (sect, k, v, g))
@@ -197,6 +240,12 @@ def compare(name, got_path):
     bad = ['生成的档案不合格：' + b for b in lint.check(got)]
     if (got.get('provenance'), got.get('completeness')) != ('probed', 'complete'):
         bad.append('生成的档案元数据应为 probed + complete，实为 %r + %r' % (got.get('provenance'), got.get('completeness')))
+    if api_num(want['api']['version']) >= api_num('1.1.0'):
+        vk = want['vulkan']
+        for ext, fields in DYNAMIC_FEATURES.items():
+            if ext in vk['extensions']:
+                for field in fields:
+                    vk['features'].setdefault(field, 0)
     w = dict(leaves({k: want[k] for k in ('api', 'identity', 'vulkan')}))
     g = dict(leaves({k: got.get(k) for k in ('api', 'identity', 'vulkan')}))
     skipped = 0
@@ -204,7 +253,42 @@ def compare(name, got_path):
         if k not in g: bad.append('%s：档案 %r / 生成的没有这项' % (k, v)); continue   # null 也算：值不知道，但这项该现查到
         if v is None: skipped += 1; continue
         if g[k] != v: bad.append('%s：档案 %r / 生成 %r' % (k, v, g[k]))
-    extra = sorted(k for k in g if k not in w)
+    # 新采集的特性字段允许旧签名档缺项，已有字段仍逐值比较。
+    added_features = {'.vulkan.features.pipelineCreationCacheControl', '.vulkan.features.hostQueryReset',
+                      '.vulkan.features.primitiveTopologyListRestart', '.vulkan.features.image2DViewOf3D',
+                      '.vulkan.features.sampler2DViewOf3D', '.vulkan.features.texelBufferAlignment'}
+    if 'VK_EXT_image_robustness' in want['vulkan']['extensions']:
+        added_features.add('.vulkan.features.robustImageAccess')
+    if 'VK_KHR_zero_initialize_workgroup_memory' in want['vulkan']['extensions']:
+        added_features.add('.vulkan.features.shaderZeroInitializeWorkgroupMemory')
+    if 'VK_EXT_scalar_block_layout' in want['vulkan']['extensions']:
+        added_features.add('.vulkan.features.scalarBlockLayout')
+    if 'VK_KHR_uniform_buffer_standard_layout' in want['vulkan']['extensions']:
+        added_features.add('.vulkan.features.uniformBufferStandardLayout')
+    has_lr = 'VK_EXT_line_rasterization' in want['vulkan']['extensions'] or 'VK_KHR_line_rasterization' in want['vulkan']['extensions']
+    added_features |= ({'.vulkan.features.rectangularLines', '.vulkan.features.bresenhamLines', '.vulkan.features.smoothLines',
+                    '.vulkan.features.stippledRectangularLines', '.vulkan.features.stippledBresenhamLines',
+                    '.vulkan.features.stippledSmoothLines', '.vulkan.properties.lineSubPixelPrecisionBits'} if has_lr else set())
+    has_m4 = 'VK_KHR_maintenance4' in want['vulkan']['extensions']
+    added_features |= ({'.vulkan.features.maintenance4', '.vulkan.properties.maxBufferSize'} if has_m4 else set())
+    has_f16i8 = 'VK_KHR_shader_float16_int8' in want['vulkan']['extensions']
+    added_features |= ({'.vulkan.features.shaderFloat16', '.vulkan.features.shaderInt8'} if has_f16i8 else set())
+    has_fctrl = 'VK_KHR_shader_float_controls' in want['vulkan']['extensions']
+    added_features |= ({'.vulkan.properties.shaderDenormPreserveFloat32', '.vulkan.properties.shaderDenormFlushToZeroFloat32',
+                    '.vulkan.properties.shaderSignedZeroInfNanPreserveFloat32', '.vulkan.properties.shaderRoundingModeRTEFloat32',
+                    '.vulkan.properties.shaderRoundingModeRTZFloat32'} if has_fctrl else set())
+    if 'VK_KHR_8bit_storage' in want['vulkan']['extensions']:
+        added_features |= {'.vulkan.features.storageBuffer8BitAccess',
+                          '.vulkan.features.uniformAndStorageBuffer8BitAccess',
+                          '.vulkan.features.storagePushConstant8'}
+    added_features |= {'.vulkan.features.storageBuffer16BitAccess',
+                     '.vulkan.features.uniformAndStorageBuffer16BitAccess',
+                     '.vulkan.features.storagePushConstant16',
+                     '.vulkan.features.storageInputOutput16'}
+    added_features |= {'.vulkan.features.variablePointersStorageBuffer', '.vulkan.features.variablePointers'}
+    added_features |= {'.vulkan.features.multiview', '.vulkan.features.multiviewGeometryShader',
+                       '.vulkan.features.multiviewTessellationShader'}
+    extra = sorted(k for k in g if k not in w and k not in added_features)
     bad += ['%s：生成的多出这项（%r），档案里没有' % (k, g[k]) for k in extra]
     if bad:
         print('FAIL: [%s] 生成的设备档案和 devprofiles/%s.json 不一致（%d 处）：\n  %s' % (name, name, len(bad), '\n  '.join(bad[:40])))
@@ -215,11 +299,21 @@ def compare(name, got_path):
 
 
 # 版本门槛变体（dev_facts.c：timeline / 描述符索引「列了扩展或 ≥ 1.2」、有效版本 = min(应用申请的 1.1, 设备)：不列扩展时 1.2 / 1.3 转正的都不用、4444 特性位只在列了扩展时记、低于 1.1 整条扩展查询链不挂）：
-#   由 adreno 档派生，去掉这三个已转正扩展再改设备版本；期望只由变体自己的版本号决定
-PROMOTED = ('VK_KHR_timeline_semaphore', 'VK_EXT_descriptor_indexing', 'VK_EXT_4444_formats')
-VARIANTS = {'v-api10': '1.0.0', 'v-api11-noext': '1.1.0', 'v-api12-noext': '1.2.0', 'v-api13-noext': '1.3.0', 'v-khr-alias': '1.3.0'}
+#   由 adreno 档派生，去掉这些已转正扩展再改设备版本；期望只由变体自己的版本号决定
+PROMOTED = ('VK_KHR_timeline_semaphore', 'VK_EXT_descriptor_indexing', 'VK_EXT_4444_formats', 'VK_EXT_image_robustness',
+            'VK_KHR_zero_initialize_workgroup_memory', 'VK_EXT_scalar_block_layout',
+            'VK_KHR_uniform_buffer_standard_layout', 'VK_EXT_line_rasterization', 'VK_KHR_line_rasterization', 'VK_KHR_maintenance4', 'VK_KHR_shader_float16_int8', 'VK_KHR_shader_float_controls', 'VK_KHR_8bit_storage')
+VARIANTS = {'v-api10': '1.0.0', 'v-api11-noext': '1.1.0', 'v-api12-noext': '1.2.0', 'v-api13-noext': '1.3.0',
+            'v-khr-alias': '1.3.0', 'v-eds-bits': '1.3.0', 'v-cache-ctl': '1.3.0', 'v-hqr': '1.3.0',
+            'v-list-restart': '1.3.0', 'v-image-2d-of-3d': '1.3.0', 'v-texel-buf-align': '1.3.0', 'v-image-robustness': '1.3.0',
+            'v-zero-init-workgroup': '1.3.0', 'v-scalar-block-layout': '1.3.0', 'v-ubo-std-layout': '1.3.0', 'v-line-raster': '1.3.0', 'v-maintenance4': '1.3.0', 'v-f16i8': '1.3.0', 'v-f16-only': '1.3.0', 'v-float-controls': '1.3.0', 'v-8bit-storage': '1.3.0', 'v-8bit-ssbo-only': '1.3.0', 'v-16bit-storage': '1.3.0',
+            'v-16bit-partial': '1.3.0', 'v-16bit-none': '1.3.0',
+            'v-vp-both': '1.3.0', 'v-vp-sb-only': '1.3.0', 'v-vp-none': '1.3.0', 'v-vp-vuid': '1.3.0',
+            'v-mv-all': '1.3.0', 'v-mv-base': '1.3.0', 'v-mv-none': '1.3.0', 'v-mv-vuid': '1.3.0', 'v-mv-no-gs': '1.3.0'}
 # KHR 别名正控：只列 KHR 版的 index_type_uint8 / swapchain_maintenance1（同一个特性结构），照样挂、照样记，假驱动不判红
 KHR_ALIAS = {'VK_EXT_index_type_uint8': 'VK_KHR_index_type_uint8', 'VK_EXT_swapchain_maintenance1': 'VK_KHR_swapchain_maintenance1'}
+EDS_VARIANT = {'extendedDynamicState': 1, 'extendedDynamicState2': 1, 'extendedDynamicState2LogicOp': 0,
+               'extendedDynamicState2PatchControlPoints': 1, 'vertexInputDynamicState': 1}
 
 
 def variants(out):
@@ -234,6 +328,109 @@ def variants(out):
                 assert e in ex, '基准档没列 ' + e
                 ex[k] = ex.pop(e)
             p['vulkan']['extensions'] = dict(sorted(ex.items()))
+        elif name == 'v-eds-bits':
+            assert all(ext in p['vulkan']['extensions'] for ext in DYNAMIC_FEATURES)
+            p['vulkan']['features'].update(EDS_VARIANT)
+        elif name == 'v-cache-ctl':
+            p['vulkan']['features']['pipelineCreationCacheControl'] = 1
+        elif name == 'v-hqr':
+            p['vulkan']['extensions']['VK_EXT_host_query_reset'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['hostQueryReset'] = 1
+        elif name == 'v-list-restart':
+            p['vulkan']['extensions']['VK_EXT_primitive_topology_list_restart'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['primitiveTopologyListRestart'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-image-2d-of-3d':
+            p['vulkan']['extensions']['VK_EXT_image_2d_view_of_3d'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['image2DViewOf3D'] = 1
+            p['vulkan']['features']['sampler2DViewOf3D'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-texel-buf-align':
+            p['vulkan']['extensions']['VK_EXT_texel_buffer_alignment'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['texelBufferAlignment'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-image-robustness':
+            p['vulkan']['extensions']['VK_EXT_image_robustness'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['robustImageAccess'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-zero-init-workgroup':
+            p['vulkan']['extensions']['VK_KHR_zero_initialize_workgroup_memory'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['shaderZeroInitializeWorkgroupMemory'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-scalar-block-layout':
+            p['vulkan']['extensions']['VK_EXT_scalar_block_layout'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['scalarBlockLayout'] = 1
+        elif name == 'v-ubo-std-layout':
+            p['vulkan']['extensions']['VK_KHR_uniform_buffer_standard_layout'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['uniformBufferStandardLayout'] = 1
+        elif name == 'v-line-raster':
+            p['vulkan']['extensions']['VK_EXT_line_rasterization'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            for k in ('rectangularLines', 'bresenhamLines', 'smoothLines',
+                      'stippledRectangularLines', 'stippledBresenhamLines', 'stippledSmoothLines'):
+                p['vulkan']['features'][k] = 1
+            p['vulkan']['properties']['lineSubPixelPrecisionBits'] = 4
+        elif name == 'v-maintenance4':
+            p['vulkan']['extensions']['VK_KHR_maintenance4'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['maintenance4'] = 1
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+            p['vulkan']['properties']['maxBufferSize'] = 1073741824
+            p['vulkan']['properties'] = dict(sorted(p['vulkan']['properties'].items()))
+        elif name in ('v-f16i8', 'v-f16-only'):
+            p['vulkan']['extensions']['VK_KHR_shader_float16_int8'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['shaderFloat16'] = 1
+            p['vulkan']['features']['shaderInt8'] = 1 if name == 'v-f16i8' else 0
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name == 'v-float-controls':
+            p['vulkan']['extensions']['VK_KHR_shader_float_controls'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            pr = p['vulkan']['properties']
+            pr['shaderDenormPreserveFloat32'] = 1
+            pr['shaderDenormFlushToZeroFloat32'] = 1
+            pr['shaderSignedZeroInfNanPreserveFloat32'] = 1
+            pr['shaderRoundingModeRTEFloat32'] = 1
+            pr['shaderRoundingModeRTZFloat32'] = 0
+            p['vulkan']['properties'] = dict(sorted(pr.items()))
+        elif name in ('v-8bit-storage', 'v-8bit-ssbo-only'):
+            p['vulkan']['extensions']['VK_KHR_8bit_storage'] = 1
+            p['vulkan']['extensions'] = dict(sorted(p['vulkan']['extensions'].items()))
+            p['vulkan']['features']['storageBuffer8BitAccess'] = 1
+            p['vulkan']['features']['uniformAndStorageBuffer8BitAccess'] = 1 if name == 'v-8bit-storage' else 0
+            p['vulkan']['features']['storagePushConstant8'] = 1 if name == 'v-8bit-storage' else 0
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name in ('v-16bit-storage', 'v-16bit-partial', 'v-16bit-none'):
+            # 不依赖 VK_KHR_16bit_storage 扩展名：验证 Vulkan 1.1 核心结构即可独立协商 4 位
+            p['vulkan']['extensions'].pop('VK_KHR_16bit_storage', None)
+            p['vulkan']['features']['storageBuffer16BitAccess'] = 1 if name in ('v-16bit-storage', 'v-16bit-partial') else 0
+            p['vulkan']['features']['uniformAndStorageBuffer16BitAccess'] = 1 if name == 'v-16bit-storage' else 0
+            p['vulkan']['features']['storagePushConstant16'] = 1 if name in ('v-16bit-storage', 'v-16bit-partial') else 0
+            p['vulkan']['features']['storageInputOutput16'] = 1 if name == 'v-16bit-storage' else 0
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name in ('v-vp-both', 'v-vp-sb-only', 'v-vp-none', 'v-vp-vuid'):
+            # 不依赖 VK_KHR_variable_pointers 扩展名：验证 Vulkan 1.1 核心结构即可协商，且 v-vp-vuid 守住 VUID-01431
+            p['vulkan']['extensions'].pop('VK_KHR_variable_pointers', None)
+            p['vulkan']['features']['variablePointersStorageBuffer'] = 1 if name in ('v-vp-both', 'v-vp-sb-only') else 0
+            p['vulkan']['features']['variablePointers'] = 1 if name in ('v-vp-both', 'v-vp-vuid') else 0
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
+        elif name in ('v-mv-all', 'v-mv-base', 'v-mv-none', 'v-mv-vuid', 'v-mv-no-gs'):
+            # 不依赖 VK_KHR_multiview 扩展名：验证 Vulkan 1.1 核心结构即可协商，并守住 VUID-00580/00581
+            p['vulkan']['extensions'].pop('VK_KHR_multiview', None)
+            p['vulkan']['features']['multiview'] = 1 if name in ('v-mv-all', 'v-mv-base', 'v-mv-no-gs') else 0
+            p['vulkan']['features']['multiviewGeometryShader'] = 1 if name in ('v-mv-all', 'v-mv-vuid', 'v-mv-no-gs') else 0
+            p['vulkan']['features']['multiviewTessellationShader'] = 1 if name in ('v-mv-all', 'v-mv-vuid') else 0
+            if name == 'v-mv-no-gs':
+                p['vulkan']['features']['geometryShader'] = 0
+            p['vulkan']['features'] = dict(sorted(p['vulkan']['features'].items()))
         else:
             for e in PROMOTED: p['vulkan']['extensions'].pop(e, None)
         p['factsDigest'] = lint.digest(p)
@@ -244,6 +441,89 @@ def check_variant(name, got_path):
     got = json.load(open(got_path, encoding='utf-8'))
     minor = int(VARIANTS[name].split('.')[1])
     f, fm, pr = got['vulkan']['features'], got['vulkan']['formats'], got['vulkan']['properties']
+    if name == 'v-eds-bits':
+        bad = ['%s：入参 %d，档案 %r' % (k, v, f.get(k)) for k, v in EDS_VARIANT.items() if f.get(k) != v]
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] EDS 能力回读：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] EDS 能力回读 5/5，含真假位' % name); return 0
+    if name == 'v-cache-ctl':
+        bad = []
+        if f.get('pipelineCreationCacheControl') != 1:
+            bad.append('pipelineCreationCacheControl 期望 1，实为 %r' % (f.get('pipelineCreationCacheControl'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] pipeline_creation_cache_control 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_EXT_pipeline_creation_cache_control：特性位查询与建设备启用一致' % name); return 0
+    if name == 'v-image-robustness':
+        bad = []
+        if f.get('robustImageAccess') != 1:
+            bad.append('列了 VK_EXT_image_robustness 且支持 robustImageAccess 时：生成 %r，期望 1' % (f.get('robustImageAccess'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] image_robustness 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] 列了 VK_EXT_image_robustness：照样挂结构、记 robustImageAccess=1，假驱动放行' % name); return 0
+    if name == 'v-zero-init-workgroup':
+        bad = []
+        if f.get('shaderZeroInitializeWorkgroupMemory') != 1:
+            bad.append('列了 VK_KHR_zero_initialize_workgroup_memory 且支持特性时：生成 %r，期望 1' % (f.get('shaderZeroInitializeWorkgroupMemory'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] zero_initialize_workgroup_memory 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] 列了 VK_KHR_zero_initialize_workgroup_memory：照样挂结构、记 shaderZeroInitializeWorkgroupMemory=1，假驱动放行' % name); return 0
+    if name == 'v-scalar-block-layout':
+        bad = []
+        if f.get('scalarBlockLayout') != 1:
+            bad.append('列了 VK_EXT_scalar_block_layout 且支持特性时：生成 %r，期望 1' % (f.get('scalarBlockLayout'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] scalar_block_layout 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] 列了 VK_EXT_scalar_block_layout：照样挂结构、记 scalarBlockLayout=1，假驱动放行' % name); return 0
+    if name == 'v-ubo-std-layout':
+        bad = []
+        if f.get('uniformBufferStandardLayout') != 1:
+            bad.append('列了 VK_KHR_uniform_buffer_standard_layout 且支持特性时：生成 %r，期望 1' % (f.get('uniformBufferStandardLayout'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] ubo_std_layout 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] 列了 VK_KHR_uniform_buffer_standard_layout：照样挂结构、记 uniformBufferStandardLayout=1，假驱动放行' % name); return 0
+    if name == 'v-line-raster':
+        bad = []
+        for k in ('rectangularLines', 'bresenhamLines', 'smoothLines',
+                  'stippledRectangularLines', 'stippledBresenhamLines', 'stippledSmoothLines'):
+            if f.get(k) != 1: bad.append('列了 VK_EXT_line_rasterization 时 %s：生成 %r，期望 1' % (k, f.get(k)))
+        if pr.get('lineSubPixelPrecisionBits') != 4:
+            bad.append('lineSubPixelPrecisionBits：生成 %r，期望 4' % (pr.get('lineSubPixelPrecisionBits'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] line_rasterization 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] 列了 VK_EXT_line_rasterization：照样挂结构、记 6 项特性 + subpixel=4，假驱动放行' % name); return 0
+    if name == 'v-maintenance4':
+        bad = []
+        if f.get('maintenance4') != 1: bad.append('maintenance4：期望 1 / 生成 %r' % (f.get('maintenance4'),))
+        if pr.get('maxBufferSize') != 1073741824: bad.append('maxBufferSize：期望 1073741824 / 生成 %r' % (pr.get('maxBufferSize'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] maintenance4 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_KHR_maintenance4 正控：maintenance4=1、maxBufferSize=1073741824 逐值一致' % name); return 0
+    if name in ('v-f16i8', 'v-f16-only'):
+        want_i8 = 1 if name == 'v-f16i8' else 0
+        bad = []
+        if f.get('shaderFloat16') != 1: bad.append('shaderFloat16：期望 1 / 生成 %r' % (f.get('shaderFloat16'),))
+        if f.get('shaderInt8') != want_i8: bad.append('shaderInt8：期望 %d / 生成 %r' % (want_i8, f.get('shaderInt8')))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] shader_float16_int8 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_KHR_shader_float16_int8 正控：shaderFloat16=1、shaderInt8=%d 逐值一致' % (name, want_i8)); return 0
+    if name == 'v-float-controls':
+        want_pr = {'shaderDenormPreserveFloat32': 1, 'shaderDenormFlushToZeroFloat32': 1,
+                   'shaderSignedZeroInfNanPreserveFloat32': 1, 'shaderRoundingModeRTEFloat32': 1,
+                   'shaderRoundingModeRTZFloat32': 0}
+        bad = ['%s：期望 %r / 生成 %r' % (k, v, pr.get(k)) for k, v in want_pr.items() if pr.get(k) != v]
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] shader_float_controls 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_KHR_shader_float_controls 正控：5 项 Float32 浮点控制属性逐值一致' % name); return 0
     if name == 'v-khr-alias':
         # 逐值对照：生成档里这两项必须等于基准档（adreno）的输入值；只查键在不在的话，回填成 0 也会过（#1879 复审）
         base = load('adreno-8xx-qcom')['vulkan']['features']
@@ -253,21 +533,133 @@ def check_variant(name, got_path):
         if bad:
             print('FAIL: [%s] KHR 别名正控：\n  %s' % (name, '\n  '.join(bad))); return 1
         print('PASS: [%s] 只列 KHR 版 index_type_uint8 / swapchain_maintenance1：照样挂结构、记特性，假驱动放行' % name); return 0
-    # 直连实例只申请 1.1（S2A_VK_APP_API_VERSION）：有效版本 = min(1.1, 设备)。变体都不列这三个已转正扩展，
-    #   1.2 / 1.3 转正的东西（timeline、描述符索引、A4B4G4R4 格式）一概不能用，不论设备版本多高；4444 特性结构没转正，更不能挂
+    if name in ('v-8bit-storage', 'v-8bit-ssbo-only'):
+        want_rest = 1 if name == 'v-8bit-storage' else 0
+        bad = []
+        if f.get('storageBuffer8BitAccess') != 1:
+            bad.append('storageBuffer8BitAccess：期望 1 / 生成 %r' % (f.get('storageBuffer8BitAccess'),))
+        if f.get('uniformAndStorageBuffer8BitAccess') != want_rest:
+            bad.append('uniformAndStorageBuffer8BitAccess：期望 %d / 生成 %r' % (want_rest, f.get('uniformAndStorageBuffer8BitAccess')))
+        if f.get('storagePushConstant8') != want_rest:
+            bad.append('storagePushConstant8：期望 %d / 生成 %r' % (want_rest, f.get('storagePushConstant8')))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] 8bit_storage 正控：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_KHR_8bit_storage 正控：ssbo=1、ubo_ssbo=%d、push=%d 逐值一致' % (name, want_rest, want_rest)); return 0
+    if name in ('v-16bit-storage', 'v-16bit-partial', 'v-16bit-none'):
+        want_bits = {
+            'storageBuffer16BitAccess': 1 if name in ('v-16bit-storage', 'v-16bit-partial') else 0,
+            'uniformAndStorageBuffer16BitAccess': 1 if name == 'v-16bit-storage' else 0,
+            'storagePushConstant16': 1 if name in ('v-16bit-storage', 'v-16bit-partial') else 0,
+            'storageInputOutput16': 1 if name == 'v-16bit-storage' else 0,
+        }
+        bad = ['%s：期望 %d / 生成 %r' % (k, v, f.get(k)) for k, v in want_bits.items() if f.get(k) != v]
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] 16bit_storage 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] Vulkan 1.1 核心 16bit_storage 变体（无扩展名）：ssbo=%d ubo=%d push=%d io=%d 逐值一致' % (
+            name, want_bits['storageBuffer16BitAccess'], want_bits['uniformAndStorageBuffer16BitAccess'],
+            want_bits['storagePushConstant16'], want_bits['storageInputOutput16'])); return 0
+    if name in ('v-vp-both', 'v-vp-sb-only', 'v-vp-none', 'v-vp-vuid'):
+        want_sb = 1 if name in ('v-vp-both', 'v-vp-sb-only') else 0
+        want_vp = 1 if name in ('v-vp-both', 'v-vp-vuid') else 0
+        bad = []
+        if f.get('variablePointersStorageBuffer') != want_sb:
+            bad.append('variablePointersStorageBuffer：期望 %d / 生成 %r' % (want_sb, f.get('variablePointersStorageBuffer')))
+        if f.get('variablePointers') != want_vp:
+            bad.append('variablePointers：期望 %d / 生成 %r' % (want_vp, f.get('variablePointers')))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] variable_pointers 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] Vulkan 1.1 核心 variable_pointers 变体（无扩展名）：sb=%d full=%d 逐值一致' % (name, want_sb, want_vp)); return 0
+    if name in ('v-mv-all', 'v-mv-base', 'v-mv-none', 'v-mv-vuid', 'v-mv-no-gs'):
+        want_mv = 1 if name in ('v-mv-all', 'v-mv-base', 'v-mv-no-gs') else 0
+        want_gs = 1 if name in ('v-mv-all', 'v-mv-vuid', 'v-mv-no-gs') else 0
+        want_ts = 1 if name in ('v-mv-all', 'v-mv-vuid') else 0
+        bad = []
+        if f.get('multiview') != want_mv:
+            bad.append('multiview：期望 %d / 生成 %r' % (want_mv, f.get('multiview')))
+        if f.get('multiviewGeometryShader') != want_gs:
+            bad.append('multiviewGeometryShader：期望 %d / 生成 %r' % (want_gs, f.get('multiviewGeometryShader')))
+        if f.get('multiviewTessellationShader') != want_ts:
+            bad.append('multiviewTessellationShader：期望 %d / 生成 %r' % (want_ts, f.get('multiviewTessellationShader')))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] multiview 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] Vulkan 1.1 核心 multiview 变体（无扩展名）：mv=%d gs=%d ts=%d 逐值一致' % (name, want_mv, want_gs, want_ts)); return 0
+    if name == 'v-hqr':
+        bad = []
+        if f.get('hostQueryReset') != 1:
+            bad.append('hostQueryReset：期望 1 / 生成 %r' % (f.get('hostQueryReset'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] host_query_reset 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_EXT_host_query_reset：特性位查询与建设备启用一致' % name); return 0
+    if name == 'v-list-restart':
+        bad = []
+        if f.get('primitiveTopologyListRestart') != 1:
+            bad.append('primitiveTopologyListRestart：期望 1 / 生成 %r' % (f.get('primitiveTopologyListRestart'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] list_restart 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_EXT_primitive_topology_list_restart：特性位查询与建设备启用一致' % name); return 0
+    if name == 'v-image-2d-of-3d':
+        bad = []
+        for k in ('image2DViewOf3D', 'sampler2DViewOf3D'):
+            if f.get(k) != 1:
+                bad.append('%s：期望 1 / 生成 %r' % (k, f.get(k)))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] image_2d_view_of_3d 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_EXT_image_2d_view_of_3d：image2DViewOf3D/sampler2DViewOf3D 查询与建设备启用一致' % name); return 0
+    if name == 'v-texel-buf-align':
+        bad = []
+        if f.get('texelBufferAlignment') != 1:
+            bad.append('texelBufferAlignment：期望 1 / 生成 %r' % (f.get('texelBufferAlignment'),))
+        bad += ['生成的档案不合格：' + b for b in lint.check(got)]
+        if bad:
+            print('FAIL: [%s] texel_buffer_alignment 变体：\n  %s' % (name, '\n  '.join(bad))); return 1
+        print('PASS: [%s] VK_EXT_texel_buffer_alignment：texelBufferAlignment 查询与建设备启用一致' % name); return 0
+    # 直连实例只申请 1.1（S2A_VK_APP_API_VERSION）：有效版本 = min(1.1, 设备)。变体都不列这些已转正扩展，
+    #   1.2 / 1.3 转正的东西（timeline、描述符索引、A4B4G4R4 格式、robustImageAccess、共享内存零初始化、scalarBlockLayout、uniformBufferStandardLayout、maintenance4、shaderFloat16/Int8、float_controls）及未列出的线光栅扩展一概不能用，不论设备版本多高；4444 特性结构没转正，更不能挂
     want = {'timelineSemaphore 记了': False, 'runtimeDescriptorArray 记了': False,
             'formatA4B4G4R4 记了': False, 'A4B4G4R4 格式查了': False,
+            'robustImageAccess 记了': False,
+            'shaderZeroInitializeWorkgroupMemory 记了': False,
+            'scalarBlockLayout 记了': False,
+            'uniformBufferStandardLayout 记了': False,
+            'rectangularLines 记了': False, 'lineSubPixelPrecisionBits 记了': False,
+            'maintenance4 记了': False, 'maxBufferSize 记了': False,
+            'shaderFloat16 记了': False, 'shaderInt8 记了': False,
+            'shaderSignedZeroInfNanPreserveFloat32 记了': False,
+            'storageBuffer8BitAccess 记了': False, 'storageBuffer16BitAccess 记了': minor >= 1,
+            'multiview 记了': minor >= 1,
+            'variablePointersStorageBuffer 记了': minor >= 1,
             'shaderDrawParameters 记了': minor >= 1, 'maxMemoryAllocationSize 记了': minor >= 1,
-            '扩展特性只在 ≥ 1.1 记（swapchainMaintenance1）': minor >= 1}
+            '扩展特性只在 ≥ 1.1 记（swapchainMaintenance1）': minor >= 1,
+            '动态状态扩展特性只在 ≥ 1.1 记': minor >= 1}
     have = {'timelineSemaphore 记了': 'timelineSemaphore' in f, 'runtimeDescriptorArray 记了': 'runtimeDescriptorArray' in f,
             'formatA4B4G4R4 记了': 'formatA4B4G4R4' in f, 'A4B4G4R4 格式查了': 'VK_FORMAT_A4B4G4R4_UNORM_PACK16' in fm,
+            'robustImageAccess 记了': 'robustImageAccess' in f,
+            'shaderZeroInitializeWorkgroupMemory 记了': 'shaderZeroInitializeWorkgroupMemory' in f,
+            'scalarBlockLayout 记了': 'scalarBlockLayout' in f,
+            'uniformBufferStandardLayout 记了': 'uniformBufferStandardLayout' in f,
+            'rectangularLines 记了': 'rectangularLines' in f, 'lineSubPixelPrecisionBits 记了': 'lineSubPixelPrecisionBits' in pr,
+            'maintenance4 记了': 'maintenance4' in f, 'maxBufferSize 记了': 'maxBufferSize' in pr,
+            'shaderFloat16 记了': 'shaderFloat16' in f, 'shaderInt8 记了': 'shaderInt8' in f,
+            'shaderSignedZeroInfNanPreserveFloat32 记了': 'shaderSignedZeroInfNanPreserveFloat32' in pr,
+            'storageBuffer8BitAccess 记了': 'storageBuffer8BitAccess' in f,
+            'storageBuffer16BitAccess 记了': 'storageBuffer16BitAccess' in f,
+            'multiview 记了': 'multiview' in f,
+            'variablePointersStorageBuffer 记了': 'variablePointersStorageBuffer' in f,
             'shaderDrawParameters 记了': 'shaderDrawParameters' in f, 'maxMemoryAllocationSize 记了': 'maxMemoryAllocationSize' in pr,
-            '扩展特性只在 ≥ 1.1 记（swapchainMaintenance1）': 'swapchainMaintenance1' in f}
+            '扩展特性只在 ≥ 1.1 记（swapchainMaintenance1）': 'swapchainMaintenance1' in f,
+            '动态状态扩展特性只在 ≥ 1.1 记': all(k in f for k in EDS_VARIANT)}
     bad = ['%s：期望 %s / 实为 %s' % (k, want[k], have[k]) for k in want if want[k] != have[k]]
     bad += ['生成的档案不合格：' + b for b in lint.check(got)]
     if bad:
         print('FAIL: [%s] 版本门槛不对：\n  %s' % (name, '\n  '.join(bad))); return 1
-    print('PASS: [%s] 设备 %s、不列三个已转正扩展：%d 项版本门槛都对' % (name, VARIANTS[name], len(want)))
+    print('PASS: [%s] 设备 %s、不列对应已转正扩展：%d 项版本门槛都对' % (name, VARIANTS[name], len(want)))
     return 0
 
 

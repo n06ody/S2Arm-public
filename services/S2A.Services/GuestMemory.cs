@@ -37,6 +37,20 @@ namespace S2A.Services
         // 双线程渲染时回写在渲染线程上执行，再触发会与等这次回写的 GPU 模拟线程死锁
         public static delegate*<ulong, ulong, void> WriteQuietHook;
 
+        // Optional direct owner for guest addresses which escape to host code.
+        // The notification precedes exposure of a naked pointer or span.
+        public static delegate* unmanaged<ulong, ulong, int, void> HostAddressHook;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static void PinHostAddress(ulong address, ulong size, bool write)
+        {
+            var pin = HostAddressHook;
+            if (pin != null && size != 0)
+            {
+                pin(address, size, write ? 1 : 0);
+            }
+        }
+
         // 帧率能耗线挂（NxTrack.GpuModified）：[va, va+size) 涉及的 4 KB 子页里有没有 GPU 改过、还没回写的（Ryujinx 设了 None 保护）
         public static delegate*<ulong, ulong, bool> GpuModifiedHook;
 
@@ -176,6 +190,7 @@ namespace S2A.Services
 
         public static void AudioPoolResident(ulong va, ulong size, bool on)
         {
+            PinHostAddress(va, size, false);
             long* dir = FarDir();
             ulong lo = dir != null ? Native.Far->Lo : 0;
             int err = 0;
@@ -359,6 +374,7 @@ namespace S2A.Services
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public T Read<T>(ulong va) where T : unmanaged
         {
+            PinHostAddress(va, (ulong)sizeof(T), false);
             ReadFlushIfGpuModified(va, (ulong)sizeof(T));
 
             if (Contiguous(va, (ulong)sizeof(T), out ulong h))
@@ -379,6 +395,7 @@ namespace S2A.Services
 
         public void Read(ulong va, Span<byte> data)
         {
+            PinHostAddress(va, (ulong)data.Length, false);
             ReadFlushIfGpuModified(va, (ulong)data.Length);
             CopyOut(va, data);
         }
@@ -387,6 +404,7 @@ namespace S2A.Services
         {
             if (length > 0)
             {
+                PinHostAddress(va, (ulong)length, true);
                 ReadFlushIfGpuModified(va, (ulong)length);
             }
 
@@ -403,6 +421,7 @@ namespace S2A.Services
 
         public void Write<T>(ulong va, T value) where T : unmanaged
         {
+            PinHostAddress(va, (ulong)sizeof(T), true);
             SignalManagedWrite(va, (ulong)sizeof(T));
             WriteSignalled(va, new ReadOnlySpan<byte>(&value, sizeof(T)));
         }
@@ -414,6 +433,7 @@ namespace S2A.Services
                 return;
             }
 
+            PinHostAddress(va, (ulong)data.Length, true);
             SignalManagedWrite(va, (ulong)data.Length);
             WriteSignalled(va, data);
         }
@@ -461,6 +481,7 @@ namespace S2A.Services
 
         private static void WriteUntrackedStatic(ulong va, ReadOnlySpan<byte> data)
         {
+            PinHostAddress(va, (ulong)data.Length, true);
             bool flush = !(t_preciseLen != 0 && va == t_preciseVa && data.Length == t_preciseLen);
             t_preciseLen = 0;
 
@@ -494,6 +515,7 @@ namespace S2A.Services
 
             if (GpuModifiedHook == null || !GpuModifiedHook(va, (ulong)data.Length))
             {
+                PinHostAddress(va, (ulong)data.Length, true);
                 if (GuestEquals(va, data))
                 {
                     return false;
@@ -514,6 +536,7 @@ namespace S2A.Services
 
         public ReadOnlySequence<byte> GetReadOnlySequence(ulong va, int size, bool tracked = false)
         {
+            PinHostAddress(va, (ulong)size, false);
             if (tracked)
             {
                 SignalMemoryTracking(va, (ulong)size, false);
@@ -533,6 +556,7 @@ namespace S2A.Services
 
         public ReadOnlySpan<byte> GetSpan(ulong va, int size, bool tracked = false)
         {
+            PinHostAddress(va, (ulong)size, false);
             if (tracked)
             {
                 SignalMemoryTracking(va, (ulong)size, false);
@@ -548,6 +572,7 @@ namespace S2A.Services
 
         public WritableRegion GetWritableRegion(ulong va, int size, bool tracked = false)
         {
+            PinHostAddress(va, (ulong)size, true);
             if (tracked)
             {
                 SignalMemoryTracking(va, (ulong)size, true);
@@ -687,6 +712,7 @@ namespace S2A.Services
                 throw new InvalidMemoryRegionException($"S2Arm：GetRef<{typeof(T).Name}> 0x{va:X} 跨远端 2 MiB 块且两块影子不相邻，给不出引用");
             }
 
+            PinHostAddress(va, (ulong)sizeof(T), true);
             SignalMemoryTracking(va, (ulong)sizeof(T), true);
             BeforeWrite(va, (ulong)sizeof(T));
             return ref Unsafe.AsRef<T>((void*)h);
@@ -695,6 +721,7 @@ namespace S2A.Services
         // 渲染器零拷贝的依据，必须是真实宿主地址：远端按块切段，宿主上首尾相接的段并成一段（一次映射请求的影子按游戏地址升序连续，far.c s2a_far_map）
         public IEnumerable<HostMemoryRange> GetHostRegions(ulong va, ulong size)
         {
+            PinHostAddress(va, size, true);
             long* dir = FarDir();
 
             if (dir == null)
@@ -730,7 +757,11 @@ namespace S2A.Services
             return list;
         }
 
-        public IEnumerable<MemoryRange> GetPhysicalRegions(ulong va, ulong size) => [new MemoryRange(va, size)];
+        public IEnumerable<MemoryRange> GetPhysicalRegions(ulong va, ulong size)
+        {
+            PinHostAddress(va, size, true);
+            return [new MemoryRange(va, size)];
+        }
 
         public bool IsMapped(ulong va) => IsRangeMapped(va, 1);
 

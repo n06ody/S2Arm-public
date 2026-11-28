@@ -181,10 +181,11 @@ check_tier() {
             [ "$rc" -eq 0 ] || red no_calibrated_timestamps "run.sh rc=$rc"
             has "$log" "calibrated_timestamps=0" || red no_calibrated_timestamps "层没去掉校准时间戳扩展（期望走完成点兜底）" ;;
         no_vertex_divisor)
-            run_tier no_vertex_divisor "$log" VK_KHRONOS_PROFILES_EXCLUDE_DEVICE_EXTENSIONS=VK_EXT_vertex_attribute_divisor || rc=$?
+            run_tier no_vertex_divisor "$log" \
+                VK_KHRONOS_PROFILES_EXCLUDE_DEVICE_EXTENSIONS=VK_EXT_vertex_attribute_divisor,VK_KHR_vertex_attribute_divisor || rc=$?
             [ "$rc" -eq 0 ] || red no_vertex_divisor "run.sh rc=$rc"
-            has "$log" "vk vertex divisor: enabled=0" || red no_vertex_divisor "层没去掉 VK_EXT_vertex_attribute_divisor"
-            has "$log" "C977b 实例除数：本设备没有 VK_EXT_vertex_attribute_divisor，除数 2 具名 UNSUPPORTED" || red no_vertex_divisor "C977b 没在缺除数扩展的设备上具名报 UNSUPPORTED（不能静默退回每实例一次）" ;;
+            has "$log" "vk vertex divisor: enabled=0" || red no_vertex_divisor "层没去掉 EXT/KHR 除数扩展"
+            has "$log" "C977b 实例除数：设备无可用 EXT/KHR 除数，除数 2 具名 UNSUPPORTED" || red no_vertex_divisor "C977b 缺除数能力时没具名报 UNSUPPORTED" ;;
         no_mirror_clamp)
             run_tier no_mirror_clamp "$log" VK_KHRONOS_PROFILES_EXCLUDE_DEVICE_EXTENSIONS=VK_KHR_sampler_mirror_clamp_to_edge || rc=$?
             [ "$rc" -eq 0 ] || red no_mirror_clamp "run.sh rc=${rc}，期望契约绿"

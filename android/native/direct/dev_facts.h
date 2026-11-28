@@ -34,20 +34,40 @@ struct s2a_dev_facts {
     uint32_t n_ext;
     char ext[S2A_DEV_FACTS_MAX_EXT][VK_MAX_EXTENSION_NAME_SIZE];
     // 扩展特性（只在对应扩展列出 / 核心版本够时才挂查询结构；have_* = 挂了）
-    int have_core11;                           // apiVersion ≥ 1.1：shaderDrawParameters / maintenance3 / subgroup
+    int have_core11;                           // apiVersion ≥ 1.1：shaderDrawParameters / 16bit_storage / variable_pointers / multiview / maintenance3 / subgroup
     VkPhysicalDeviceShaderDrawParametersFeatures draw_parameters;
+    VkPhysicalDevice16BitStorageFeatures storage_16bit;
+    VkPhysicalDeviceVariablePointersFeatures var_ptrs;
+    VkPhysicalDeviceMultiviewFeatures multiview;
     int have_timeline; VkPhysicalDeviceTimelineSemaphoreFeatures timeline;
     int have_index_u8; VkPhysicalDeviceIndexTypeUint8FeaturesEXT index_u8;
     int have_4444; VkPhysicalDevice4444FormatsFeaturesEXT f4444;   // 列了 VK_EXT_4444_formats：特性结构只在这时挂链（1.3 只转正了格式，特性结构没转正）
     int have_4444_fmt;                         // 列了扩展或设备 ≥ 1.3：A4B4G4R4 格式可以查
     int have_dcc; VkPhysicalDeviceDepthClipControlFeaturesEXT dcc;
+    int have_eds1; VkPhysicalDeviceExtendedDynamicStateFeaturesEXT eds1;
+    int have_eds2; VkPhysicalDeviceExtendedDynamicState2FeaturesEXT eds2;
+    int have_vi; VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vi;
+    int have_img_robust; VkPhysicalDeviceImageRobustnessFeaturesEXT img_robust;
+    int have_zero_init_wg; VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR zero_init_wg;
+    int have_scalar_layout; VkPhysicalDeviceScalarBlockLayoutFeaturesEXT scalar_layout;
+    int have_ubo_std; VkPhysicalDeviceUniformBufferStandardLayoutFeaturesKHR ubo_std;
+    int have_line_rast; VkPhysicalDeviceLineRasterizationFeaturesEXT line_rast; uint32_t line_subpixel_bits;
+    int have_maint4; VkPhysicalDeviceMaintenance4FeaturesKHR maint4; VkDeviceSize max_buffer_size;
+    int have_f16i8; VkPhysicalDeviceShaderFloat16Int8FeaturesKHR f16i8;
     int have_placed; VkBool32 placed_map, placed_range, placed_unmap_reserve; VkDeviceSize placed_align;
     int have_border; VkPhysicalDeviceCustomBorderColorFeaturesEXT border; uint32_t border_max;
     int have_di; VkPhysicalDeviceDescriptorIndexingFeaturesEXT di;
     int have_vdiv; VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT vdiv; uint32_t vdiv_max;
     int have_swapchain_m1; VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_m1;
+    int have_pipe_cache_ctl; VkPhysicalDevicePipelineCreationCacheControlFeaturesEXT pipe_cache_ctl;
+    int have_hqr; VkPhysicalDeviceHostQueryResetFeaturesEXT hqr;
+    int have_list_restart; VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart;
+    int have_2d_of_3d; VkPhysicalDeviceImage2DViewOf3DFeaturesEXT view_2d_of_3d;
+    int have_tba; VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT tba;
+    int have_8bit_storage; VkPhysicalDevice8BitStorageFeaturesKHR storage_8bit;
     int have_minmax; VkBool32 minmax_single, minmax_mapping;
     int have_host_import; VkDeviceSize host_align;
+    int have_fctrl; VkBool32 fctrl_denorm_preserve_f32, fctrl_denorm_ftz_f32, fctrl_sz_inf_nan_f32, fctrl_rte_f32, fctrl_rtz_f32;
     VkDeviceSize max_alloc; uint32_t max_per_set;            // maintenance3（have_core11）
     uint32_t subgroup_size; VkShaderStageFlags subgroup_stages; VkSubgroupFeatureFlags subgroup_ops; VkBool32 subgroup_quad_all;
     // 逐格式能力：与 s2a_dev_facts_format_name(i) 同序；fmt_have[i] = 查了（扩展格式只在扩展列出时查）

@@ -2,6 +2,9 @@
 // Copyright 2026 S2Arm contributors
 // 贴图到缓冲的录制回放：GPU 拷到池镜像，段成功后才回写真实写过的行。
 #include "rp_exec.h"
+// 弱链接[replay]：rp_post_gpu_write_tagged
+int rp_post_gpu_write_tagged(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t,
+                             enum rp_land_origin, unsigned) __attribute__((weak));
 #include "rp_res.h"
 #include "nvn_unimpl.h"
 #include "nvn_fmt_info.h"
@@ -72,7 +75,10 @@ void rp_op_copy_t2b(nvn_gpu_cmd c, const p_copy_b2t *o, const void *rec) {
         nvn_unimpl("tex", "t2b_alignment", rec); return;
     }
     if (!nvn_gpu_buf_cpu(buf)) { nvn_unimpl("buf", "t2b_mirror_not_cpu_visible", rec); return; }
-    if (!rp_post_gpu_write_rows(o->src, bytes, row, img, rows, (uint32_t)nz)) { nvn_unimpl("buf", "t2b_write_registration", rec); return; }
+    const int registered = rp_post_gpu_write_tagged ?
+        rp_post_gpu_write_tagged(o->src, bytes, bytes, row, img, rows, (uint32_t)nz, RP_LAND_T2B, 0) :
+        rp_post_gpu_write_rows(o->src, bytes, row, img, rows, (uint32_t)nz);
+    if (!registered) { nvn_unimpl("buf", "t2b_write_registration", rec); return; }
     NVNcopyRegion r = o->r; r.zoffset = 0; r.depth = 1;
     for (int32_t z = 0; z < nz; z++) {
         uint32_t layer = l0 + (uint32_t)o->r.zoffset + (uint32_t)z;

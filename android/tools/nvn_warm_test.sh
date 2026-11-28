@@ -20,6 +20,7 @@ CFLAGS=(-std=gnu11 -O1 -Wall -Wextra -Werror -pthread -D_GNU_SOURCE
 cc_bin="${CC:-cc}"
 "$cc_bin" "${CFLAGS[@]}" -o "$tmp/t" "$android/tests/nvn_warm_test.c" "$android/native/nvn/nvn_warm.c"
 "$tmp/t"                                     # ① ② ③ ④（默认：快落盘）
+NVK_WARM_TEST_REACTIVE=1 "$tmp/t"
 NVK_WARM_OFF=1 "$tmp/t"                      # ⑦ 开关关 + 无预热线程时的快落盘（saver）
 NVK_WARM_SLOW_SAVE_US=3000000 "$tmp/t"        # ⑤ 慢落盘：Stop 必须有界
 NVK_WARM_OFF=1 NVK_WARM_SLOW_SAVE_US=3000000 "$tmp/t"   # ⑥ 没有预热线程 + 慢落盘

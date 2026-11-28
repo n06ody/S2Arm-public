@@ -554,6 +554,7 @@ static int32_t activate_impl(void *context) {
             __android_log_print(ANDROID_LOG_WARN, TAG,
                                 "direct activate: compiler binding not frozen (rc=%d); "
                                 "compile paths will report the missing compiler", (int)freeze);
+        nvk_shader_activate_codec(ctx);
     }
     snprintf(ctx->reason, sizeof ctx->reason, "nvk backend active on %s (window=%d)", ctx->device.driver_name, ctx->has_window);
     __android_log_print(ANDROID_LOG_INFO, TAG, "direct activate: nvk backend ready, window=%d current_hz=%.3f",

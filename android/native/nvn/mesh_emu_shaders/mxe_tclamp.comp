@@ -1,0 +1,21 @@
+#version 450
+// SPDX-License-Identifier: Apache-2.0
+// Indirect task workgroup count clamp (aligned with iOS nvn_geometry.inc mxe_tclamp #1542).
+// Reads NVN2 DrawMeshTasksIndirect {count, first} at ind[ind_word_off..+1], writes clamped
+// VkDispatchIndirectCommand into h[20..22] and copies first to h[29] and h[h[30]].
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Exchange { uint h[]; };
+layout(set = 0, binding = 1) readonly buffer Indirect { uint ind[]; };
+layout(push_constant) uniform PC { uint ind_word_off; } pc;
+
+void main() {
+    uint cap = max(h[3], 1u);
+    uint cnt = ind[pc.ind_word_off];
+    uint first = ind[pc.ind_word_off + 1u];
+    h[20] = min(cnt, cap);
+    h[21] = 1u;
+    h[22] = 1u;
+    h[29] = first;
+    uint fa = h[30];
+    if (fa >= 32u) h[fa] = first;
+}

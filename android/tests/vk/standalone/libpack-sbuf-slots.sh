@@ -52,7 +52,7 @@ elif mode == '--negative-engine':
     before, after, count = '{ un = 1; um[st] |= 1u << i; }', '{ un = 1; um[st] |= 1u << ((i + 1) & 15); }', 1
 else:
     path, name = repo / 'android/native/gfx_plat/nvk_shader.c', 'nvk_shader_mutant.c'
-    before, after, count = 'sbu_stage_slots(stage_key((unsigned)st), (unsigned)st, q->prim, &used)', 'sbu_stage_slots(stage_key((unsigned)st), (unsigned)(st ^ 1), q->prim, &used)', 1
+    before, after, count = 'sbu_stage_slots(key, (unsigned)st, q->prim, &used)', 'sbu_stage_slots(key, (unsigned)(st ^ 1), q->prim, &used)', 1
 s = path.read_text()
 assert s.count(before) == count, 'mutation anchor changed: ' + mode
 (out / name).write_text(s.replace(before, after))

@@ -1,0 +1,12 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 8, local_size_y = 1, local_size_z = 1) in;
+layout(set = 0, binding = 0, std430) buffer Out {
+    uint vals[];
+} out_buf;
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint8_t u = uint8_t(250u + gid * 4u);
+    int8_t s = int8_t(-10) + int8_t(gid * 3u);
+    out_buf.vals[gid] = (uint(u) & 0xffu) | ((uint(int(s) + 128) & 0xffu) << 8);
+}

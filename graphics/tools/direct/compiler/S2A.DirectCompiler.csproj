@@ -21,4 +21,7 @@
   </ItemGroup>
   <!-- 翻译闭包身份（W2.1）：构建期按源码闭包生成并嵌入，CLI/设备/生产者同源读取。 -->
   <Import Project="DirectClosure.targets" />
+  <ItemGroup>
+    <EmbeddedResource Include="DirectResultFields.inc" LogicalName="S2A.DirectCompiler.ResultFields" />
+  </ItemGroup>
 </Project>

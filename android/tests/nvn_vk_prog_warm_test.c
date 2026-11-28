@@ -2,7 +2,7 @@
 // 覆盖：首次无文件 / 记录去重与 uses / 有界淘汰最冷（含缺省上限 8192）/ uses 热点排序 / 落盘→读回逐字段一致（含 c1）/
 //       坏文件整份拒绝（magic·版本·条目大小·条数·长度·FNV·截断）/ 本局有效性整份拒绝（profile·ABI·闭包）/
 //       合法条目容量过滤 / 落盘没变化不重写 / 统计记账 / reset。
-// 期望值不来自被测实现：uses 与淘汰结果按测试自己构造的顺序手算，文件长度按格式手算（60 + Σ(88 + 各有效阶段 c1 补齐到 4) + 8；mkrec 掩码 3 的条目 = 88 + 2×0x100 = 600）。
+// 期望值不来自被测实现：uses 与淘汰结果按测试自己构造的顺序手算，文件长度按格式手算（60 + Σ(112 + 各有效阶段 c1 补齐到 4) + 8；mkrec 掩码 3 的条目 = 112 + 2×0x100 = 624）。
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1   // mkdtemp / st_mtim 在严格 -std=c11 下也要可见
 #endif
@@ -61,7 +61,7 @@ static struct nvk_prog_rec mkrec(int n, uint32_t mask) {
     r.stage_mask = mask;
     for (int i = 0; i < NVK_PROG_REC_STAGES; i++)
         for (int b = 0; b < 8; b++) r.keys[i][b] = (uint8_t)(n * 7 + i * 3 + b);
-    r.c1_ok = (uint8_t)(mask == 1u ? 1u : mask == 3u ? 3u : 7u);
+    r.c1_ok = (uint8_t)(mask == 32u ? 1u : mask);
     static uint8_t c1tab[256][NVK_PROG_REC_STAGES][NVK_PROG_REC_C1_MIN];   // c1 内容只随 (n*3+i) 的低 8 位变：按 n 的低 8 位共用一份
     for (int i = 0; i < NVK_PROG_REC_STAGES; i++) {
         uint8_t *c = c1tab[n & 255][i]; memset(c, (uint8_t)(n * 3 + i), NVK_PROG_REC_C1_MIN);
@@ -140,6 +140,22 @@ int main(void) {
         snprintf(g_dir, sizeof g_dir, "%s", saved);
     }
 
+    // 带 GS 空槽的细分记录：在量产序列化器里写读 TCS、TES 的键和完整 c1。
+    {
+        dir_reset();
+        struct nvk_prog_rec a = mkrec(3, 0x1b);
+        memset(a.keys[2], 0, sizeof a.keys[2]);
+        nvk_prog_warm_note(&a);
+        nvk_prog_warm_save();
+        nvk_prog_warm_reset();
+        struct nvk_prog_rec got = {0};
+        CHECK(load_now() == 1 && nvk_prog_warm_take(&got) == 1, "tessellation record round-trips");
+        CHECK(got.stage_mask == 0x1b && got.c1_ok == 0x1b && !memcmp(got.keys, a.keys, sizeof a.keys),
+              "tessellation record preserves its five NVN slots");
+        CHECK(!got.c1[2] && got.c1[3] && got.c1[4] && got.c1[3][0] == 12 && got.c1[4][255] == 13,
+              "tessellation record keeps TCS/TES c1 and the GS hole");
+    }
+
     // 2) 记录去重 + uses：同一身份 note 两次 uses=2，不产生两条。
     {
         dir_reset();
@@ -172,14 +188,16 @@ int main(void) {
         struct nvk_prog_rec g1, g2;
         CHECK(nvk_prog_warm_take(&g1) == 1 && nvk_prog_warm_take(&g2) == 1, "both lp_ok records are taken");
         struct nvk_prog_rec *ga = rec_is(&g1, 1) ? &g1 : &g2, *gb = rec_is(&g1, 1) ? &g2 : &g1;
-        CHECK(rec_is(ga, 1) && ga->lp_ok == 1 && rec_is(gb, 2) && gb->lp_ok == 0, "lp_ok round-trips per record (%u, %u)", (unsigned)ga->lp_ok, (unsigned)gb->lp_ok);
-        b.lp_ok = 1; nvk_prog_warm_note(&b);           // 旧清单读来的 0：真实 resolve 再记时刷新
+        CHECK(rec_is(ga, 1) && ga->lp_ok == 1 && !ga->lp_ssbo_window && rec_is(gb, 2) && gb->lp_ok == 0 && !gb->lp_ssbo_window, "lp_ok round-trips per record (%u, %u)", (unsigned)ga->lp_ok, (unsigned)gb->lp_ok);
+        b.lp_ok = 2;
+        b.lp_ssbo_window = 1;
+        nvk_prog_warm_note(&b);   // 实际命中带补偿的库件后刷新。
         nvk_prog_warm_save();
         nvk_prog_warm_reset();
         CHECK(load_now() == 2, "records survive the lp_ok refresh");
         CHECK(nvk_prog_warm_take(&g1) == 1 && nvk_prog_warm_take(&g2) == 1, "refreshed records are taken");
         gb = rec_is(&g1, 2) ? &g1 : &g2;
-        CHECK(rec_is(gb, 2) && gb->lp_ok == 1, "a later note refreshes lp_ok (got %u)", (unsigned)gb->lp_ok);
+        CHECK(rec_is(gb, 2) && gb->lp_ok == 2 && gb->lp_ssbo_window == 1, "a later note round-trips the required SSBO window");
     }
 
 
@@ -307,7 +325,7 @@ int main(void) {
         nvk_prog_warm_save();
         struct stat st1;
         CHECK(stat(file, &st1) == 0, "manifest file exists after save");
-        CHECK((uint64_t)st1.st_size == 60ull + 2ull * 600ull + 8ull, "file size = 60 + n*600 + 8, got %lld", (long long)st1.st_size);
+        CHECK((uint64_t)st1.st_size == 60ull + 2ull * 624ull + 8ull, "file size = 60 + n*624 + 8, got %lld", (long long)st1.st_size);
         struct timespec nap = {0, 30 * 1000000}; nanosleep(&nap, NULL);
         nvk_prog_warm_save();   // 没有变化：直接返回，不动文件
         struct stat st2;
@@ -318,18 +336,18 @@ int main(void) {
         nvk_prog_warm_note(&r);
         nvk_prog_warm_save();
         struct stat st3;
-        CHECK(stat(file, &st3) == 0 && (uint64_t)st3.st_size == 60ull + 3ull * 600ull + 8ull,
+        CHECK(stat(file, &st3) == 0 && (uint64_t)st3.st_size == 60ull + 3ull * 624ull + 8ull,
               "save after a note rewrites the manifest");
     }
 
     // 5) 坏文件整份拒绝：magic / 版本 / 条目大小 / 条数 / 长度 / FNV / 截断。
     {
         uint8_t *good = NULL; size_t glen = 0;
-        CHECK(read_file(file, &good, &glen) == 0 && glen == 60 + 3 * 600 + 8, "good manifest is readable");
-        if (!good || glen != 60 + 3 * 600 + 8) { printf("nvn_vk_prog_warm: cannot continue without a good manifest (%d checks, %d failed)\n", checks, failures); free(good); return 1; }
+        CHECK(read_file(file, &good, &glen) == 0 && glen == 60 + 3 * 624 + 8, "good manifest is readable");
+        if (!good || glen != 60 + 3 * 624 + 8) { printf("nvn_vk_prog_warm: cannot continue without a good manifest (%d checks, %d failed)\n", checks, failures); free(good); return 1; }
         struct { const char *name; size_t len; size_t at; uint8_t v; } cases[] = {
             { "magic", glen, 0, 'X' },
-            { "version", glen, 4, 9 },
+            { "version", glen, 4, 2 },
             { "entry size", glen, 8, 0x41 },
             { "count", glen, 12, 4 },
             { "fnv", glen, 0, 0 },   // 特殊：改最后一个字节（下面单独处理）
@@ -354,16 +372,16 @@ int main(void) {
             CHECK(write_file(file, bad, glen - 1) == 0, "truncated manifest written");
             nvk_prog_warm_reset();
             CHECK(load_now() == 0, "truncated manifest is rejected");
-            uint8_t *longer = (uint8_t *)calloc(glen + 600, 1);
+            uint8_t *longer = (uint8_t *)calloc(glen + 624, 1);
             memcpy(longer, good, glen);
-            CHECK(write_file(file, longer, glen + 600) == 0, "oversized manifest written");
+            CHECK(write_file(file, longer, glen + 624) == 0, "oversized manifest written");
             nvk_prog_warm_reset();
             CHECK(load_now() == 0, "manifest longer than its entry count claims is rejected");
             free(longer);
             free(bad);
         }
-        // 旧格式（版本 1：每阶段 c1 定长 0x100、条目 844 字节）：整份按「版本不符」拒收，不按版本 2 的变长条目误读；
-        //   本局照常记，落盘写成版本 2（文件头第 4 字节起 = 2），下一局按版本 2 读回。
+        // 旧格式（版本 1：每阶段 c1 定长 0x100、条目 844 字节）：整份按「版本不符」拒收，不按版本 3 的变长条目误读；
+        //   本局照常记，落盘写成版本 3（文件头第 4 字节起 = 3），下一局按版本 3 读回。
         //   期望值手算：版本 1 文件 = 60 + 2×844 + 8 = 1756 字节，头 magic/版本 1/条目 844/条数 2，FNV 按宿主同一公式算对（只有版本不同）。
         {
             size_t olen = 60 + 2 * 844 + 8; uint8_t *old = (uint8_t *)calloc(olen, 1);
@@ -376,17 +394,17 @@ int main(void) {
             CHECK(write_file(file, old, olen) == 0, "version-1 manifest written");
             free(old);
             nvk_prog_warm_reset(); g_last_red[0] = 0;
-            CHECK(load_now() == 0, "version-1 manifest is rejected as a whole (not misread as version 2)");
+            CHECK(load_now() == 0, "version-1 manifest is rejected as a whole (not misread as version 3)");
             struct nvk_prog_warm_stats s; stats_now(&s);
             CHECK(s.loaded == 0 && strstr(g_last_red, "版本不符"), "version-1 manifest: loaded=%llu red=%s", (unsigned long long)s.loaded, g_last_red);
             struct nvk_prog_rec r = mkrec(9, 3); nvk_prog_warm_note(&r); nvk_prog_warm_save();
             uint8_t *nb = NULL; size_t nl = 0;
-            CHECK(read_file(file, &nb, &nl) == 0 && nl == 60 + 600 + 8 && nb[4] == 2 && nb[8] == 88, "after a version-1 file, save rewrites it as version 2 (len=%zu ver=%u)", nl, nb ? nb[4] : 0);
+            CHECK(read_file(file, &nb, &nl) == 0 && nl == 60 + 624 + 8 && nb[4] == 3 && nb[8] == 112, "after a version-1 file, save rewrites it as version 3 (len=%zu ver=%u)", nl, nb ? nb[4] : 0);
             free(nb);
             nvk_prog_warm_reset();
-            CHECK(load_now() == 1, "the rewritten version-2 manifest loads back");
+            CHECK(load_now() == 1, "the rewritten version-3 manifest loads back");
         }
-        // c1 整段往返（八方旅人调色 LUT 的片元 c1 是 2304 字节）：期望 片元段长 2304、首尾字节原样，文件 = 60 + (88 + 0x100 + 2304) + 8。
+        // c1 整段往返（八方旅人调色 LUT 的片元 c1 是 2304 字节）：期望 片元段长 2304、首尾字节原样，文件 = 60 + (112 + 0x100 + 2304) + 8。
         {
             static uint8_t big[2304]; for (int k = 0; k < 2304; k++) big[k] = (uint8_t)(k * 13 + 1);
             nvk_prog_warm_reset(); dir_reset();
@@ -394,7 +412,7 @@ int main(void) {
             nvk_prog_warm_note(&r);
             big[0] ^= 0xff;   // note 必须拷了自己的副本：调用方改自己的缓冲不影响清单
             nvk_prog_warm_save();
-            struct stat stb; CHECK(stat(file, &stb) == 0 && (uint64_t)stb.st_size == 60ull + 88ull + 0x100ull + 2304ull + 8ull, "long c1 file size (got %lld)", (long long)stb.st_size);
+            struct stat stb; CHECK(stat(file, &stb) == 0 && (uint64_t)stb.st_size == 60ull + 112ull + 0x100ull + 2304ull + 8ull, "long c1 file size (got %lld)", (long long)stb.st_size);
             nvk_prog_warm_reset();
             CHECK(load_now() == 1, "long c1 manifest loads back");
             struct nvk_prog_rec got;

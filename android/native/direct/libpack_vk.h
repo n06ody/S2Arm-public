@@ -69,11 +69,22 @@ struct s2a_frag_outputs {
 };
 int s2a_libpack_spv_frag_interface(const uint8_t *spv, size_t n, struct s2a_frag_outputs *out);
 int s2a_libpack_spv_frag_outputs(const uint8_t *spv, size_t n, uint32_t *map);
-// 几何程序（stages 0x7 = vs|fs|gs）要的两样绘制事实；vs+fs 程序不读，可传 NULL（传 NULL 时几何程序 miss）。
+struct s2a_libpack_color_outputs {
+    uint32_t write_components;   // 四位一槽，仅包括实绑附件和打开的颜色通道
+    uint8_t uint_locations, sint_locations, unknown_locations;
+};
+// LibPack 合成所需的本局事实。旧对齐库可省略设备事实，几何库还需要拓扑和 profile。
 //   topology：绘制图元名，与现编请求 graphicsState.topology 同源（nvk_input_topology：Points / Lines / Triangles / …Adjacency）；
 //   profile_json：本局 effective profile（s2a_direct_compile_context.profile_json），取 capabilities.supportsGeometryShader，
 //   与现编 profile.Caps.SupportsGeometryShader 同一判据：没开 = miss。
-struct s2a_libpack_gfx { const char *topology; const char *profile_json; size_t profile_bytes; };
+struct s2a_libpack_gfx {
+    const char *topology;
+    const char *profile_json;
+    size_t profile_bytes;
+    uint32_t storage_alignment;   // 后端实际的 minStorageBufferOffsetAlignment
+    int require_ssbo_window;      // 本次绑定需要经验证的窗口合同
+    const struct s2a_libpack_color_outputs *color_outputs; // NULL：预热等尚无实绑附件事实的调用方
+};
 int s2a_libpack_profile_geometry_shader(const char *profile_json, size_t profile_bytes);
 /* 能力核（见 .c）：删掉模块用不上的 Float64 / Int64 能力声明（本后端设备从不启用 shaderFloat64 / shaderInt64），
  * 真用到 64 位浮点 / 整型或声明 Int64Atomics 就拒。0 = 可用（*n 可能变小）；-1 = 拒，why 以具名原因开头
@@ -100,14 +111,14 @@ int s2a_libpack_stage_sbuf_slots(const struct s2a_libpack *lp, const uint8_t key
 // 计算程序命中：单个 cs 键（rp_S.skey[5]）→ kind "compute" 的 s2a-direct-program-v1/v2（malloc，调用方 free），
 //   按 nvn_vk_program_parse_compute 的合同合成：绑定号 = arg_id×6+5、每条 count 1、storage 带 cbSlot/cbOffset
 //   出处与 rw、c0 驱动常量段挂 slot 0；c0Reads / supportReads 写 null（_b.json 给不出，解析器认可的「未知」），
-//   hasUnalignedStorageBuffer 写 false（批翻链按缺省 false 翻）。返回码与计数口径同 program_v1。
+//   hasUnalignedStorageBuffer 由模块固化结果决定；无掩码的模块写 false。设备与窗口要求通过 gfx 传入。
 //   shared_limit = 本设备 maxComputeSharedMemorySize：_b.json 带 spill 标记（批翻链 MSL 侧 32K 阈值溢出事实）
 //   时核 _b.spv 的 Workgroup 字节数，超出的程序出库即拒（其 .spv 未做溢出改写，建不出计算管线）。
 //   reason（可空）：没取到 / 拒收的原因码（enum s2a_libpack_why）。诊断只按码分类，why 文本只给人看、改文案不影响归类；
 //   命中（返回 S2A_LIBPACK_HIT）和「库里没有这一键」（MISS）时是 S2A_LIBPACK_WHY_NONE，只有拒收（REJECT）才带码。
 int s2a_libpack_compute_v1(const struct s2a_libpack *lp, const uint8_t key[8],
                            uint32_t direct_abi, const char *profile_hash, const char *translator_closure,
-                           uint32_t shared_limit,
+                           uint32_t shared_limit, const struct s2a_libpack_gfx *gfx,
                            uint8_t **json, size_t *json_len, char *why, size_t why_size, int *reason);
 
 uint64_t s2a_libpack_hits(void);

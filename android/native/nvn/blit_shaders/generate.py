@@ -29,7 +29,7 @@ def emit(directory, source, name, out, prefix):
 
 
 with tempfile.TemporaryDirectory(prefix='s2a-depth-shaders-') as directory:
-    for source, name in [('fullscreen.vert', 'vs'), ('depth.frag', 'depth'), ('stencil.frag', 'stencil')]:
+    for source, name in [('fullscreen.vert', 'vs'), ('depth.frag', 'depth'), ('stencil.frag', 'stencil'), ('depth_msaa.frag', 'depth_msaa')]:
         emit(directory, source, name, lines, 'k_dsb_')
 (here.parent/'backend_vulkan_depth_blit_spv.h').write_text('\n'.join(lines)+'\n')
 
@@ -56,3 +56,16 @@ with tempfile.TemporaryDirectory(prefix='s2a-drawtex-shaders-') as directory:
     emit(directory, 'draw_tex.vert', 'vs', dtxl, 'k_dtx_')
     emit(directory, 'draw_tex.frag', 'fs', dtxl, 'k_dtx_')
 (here.parent/'backend_vulkan_draw_tex_spv.h').write_text('\n'.join(dtxl)+'\n')
+
+# Three-channel readback shares the original guest RGB bits with host RGBA.
+rgb = ['// SPDX-License-Identifier: Apache-2.0',
+       '// Generated from blit_shaders/rgb_readback.comp by blit_shaders/generate.py.', '#pragma once']
+with tempfile.TemporaryDirectory(prefix='s2a-rgb-readback-') as directory:
+    emit(directory, 'rgb_readback.comp', 'readback', rgb, 'k_rgb_')
+(here.parent/'backend_vulkan_rgb_readback_spv.h').write_text('\n'.join(rgb)+'\n')
+
+wsi = lines[:5]
+wsi[2] = '// Generated from blit_shaders/wsi_rotate.frag by blit_shaders/generate.py.'
+with tempfile.TemporaryDirectory(prefix='s2a-wsi-shader-') as directory:
+    emit(directory, 'wsi_rotate.frag', 'fs', wsi, 'k_wsi_rotate_')
+(here.parent/'nvn_vk_wsi_rotate_spv.h').write_text('\n'.join(wsi)+'\n')

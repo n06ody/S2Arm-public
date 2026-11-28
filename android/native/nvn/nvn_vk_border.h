@@ -1,9 +1,9 @@
-// 采样器边框色在设备没有 VK_EXT_custom_border_color 时的就近替代（backend_vulkan.c 的 nvn_gpu_samp_create 用）。
+// 采样器边框色在设备不能在未知格式下使用自定义颜色时的就近替代（backend_vulkan.c 的 nvn_gpu_samp_create 用）。
 //
 // Vulkan 核心只有三档：0 透明黑 (0,0,0,0)、1 不透明黑 (0,0,0,1)、2 不透明白 (1,1,1,1)，浮点 / 整数各一组同名值。
-// 没有扩展时按 RGBA 欧氏距离取最近的一档（等距取下标小的），建成采样器、不丢绘制；这是近似，调用方按采样器建成次数计 sampler_border_color_nearest、每局首个打一行信息级日志（不是红行）。
+// 按 RGBA 欧氏距离取最近的一档（等距取下标小的），建成采样器、不丢绘制；这是近似，调用方按采样器建成次数计 sampler_border_color_nearest、每局首个打一行信息级日志（不是红行）。
 // 整数视图：先按 samp_border_int 的口径把各分量四舍五入成整数，再在整数三档里取最近。
-// 有扩展时不走这里（原值建自定义边框色）。
+// 支持无格式自定义颜色时使用原值。
 //
 // 纯逻辑、无图形 API 类型；宿主单测见 android/tests/nvk_border_nearest_test.c。
 #pragma once
